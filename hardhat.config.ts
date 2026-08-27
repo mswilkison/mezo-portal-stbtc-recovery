@@ -21,6 +21,13 @@ const MAINNET_PRIVATE_KEY = process.env.MAINNET_PRIVATE_KEY
   ? [process.env.MAINNET_PRIVATE_KEY]
   : []
 
+const MAINNET_FORK_BLOCK_NUMBER = process.env.MAINNET_FORK_BLOCK_NUMBER
+  ? Number(process.env.MAINNET_FORK_BLOCK_NUMBER)
+  : 25849540
+
+const RECOVERY_FORK_ENABLED =
+  process.env.NODE_ENV === "recovery-fork-test" && MAINNET_RPC_URL.length > 0
+
 const SEPOLIA_RPC_URL = process.env.SEPOLIA_RPC_URL
   ? process.env.SEPOLIA_RPC_URL
   : ""
@@ -80,13 +87,21 @@ const config: HardhatUserConfig = {
       accounts: {
         count: 100,
       },
+      ...(RECOVERY_FORK_ENABLED
+        ? {
+            forking: {
+              url: MAINNET_RPC_URL,
+              blockNumber: MAINNET_FORK_BLOCK_NUMBER,
+            },
+          }
+        : {}),
     },
     mainnet_fork: {
       url: MAINNET_RPC_URL,
       chainId: 1,
       forking: {
         url: MAINNET_RPC_URL,
-        blockNumber: 20612408, // solidity/v0.2.0
+        blockNumber: MAINNET_FORK_BLOCK_NUMBER,
       },
     },
   },
