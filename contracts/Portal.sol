@@ -8,6 +8,7 @@ import "./interfaces/IReceiveApproval.sol";
 import "./interfaces/IReceiptToken.sol";
 import "./interfaces/IERC20WithPermit.sol";
 import "./interfaces/IERC20WithDecimals.sol";
+import "./interfaces/IUSDT.sol";
 import "./MezoBridge.sol";
 
 contract Portal is Ownable2StepUpgradeable, IReceiveApproval {
@@ -229,6 +230,11 @@ contract Portal is Ownable2StepUpgradeable, IReceiveApproval {
     //
     // EOF ReentrancyGuard
     //
+
+    /// @dev USDT token address. USDT does not respect approve interface of
+    ///      ERC20 and requires special handling.
+    address internal constant USDT_ADDRESS =
+        0xdAC17F958D2ee523a2206206994597C13D831ec7;
 
     event Deposited(
         address indexed depositor,
@@ -452,6 +458,13 @@ contract Portal is Ownable2StepUpgradeable, IReceiveApproval {
         uint256 amount
     );
 
+    event DepositBridged(
+        address indexed depositor,
+        address indexed token,
+        uint256 indexed depositId,
+        uint256 amount
+    );
+
     /// @notice Event emitted when the WBTC token address used for performing
     ///         checks during auto-bridging of deposits to Mezo was set.
     event WbtcTokenAddressSet(address wbtcToken);
@@ -654,249 +667,6 @@ contract Portal is Ownable2StepUpgradeable, IReceiveApproval {
 
             tokenAbility[token] = ability;
         }
-    }
-
-    /// @notice Add a new supported token and define its ability.
-    /// @dev Only the owner can add a new supported token. Supported token must
-    ///      implement the decimals() method so Portal is able to perform
-    ///      correct calculations.
-    /// @param supportedToken Supported token and its ability
-    function addSupportedToken(
-        SupportedToken calldata supportedToken
-    ) external onlyOwner {
-        address token = supportedToken.token;
-        TokenAbility ability = supportedToken.tokenAbility;
-
-        if (token == address(0)) {
-            revert IncorrectTokenAddress(token);
-        }
-
-        if (ability == TokenAbility.None) {
-            revert IncorrectTokenAbility(ability);
-        }
-
-        if (tokenAbility[token] != TokenAbility.None) {
-            revert TokenAlreadySupported(token, tokenAbility[token]);
-        }
-
-        // Attempt to call decimals() on the token to verify it exists
-        // slither-disable-next-line unused-return
-        try IERC20WithDecimals(token).decimals() {} catch {
-            revert UnknownTokenDecimals(token);
-        }
-
-        tokenAbility[token] = ability;
-
-        emit SupportedTokenAdded(token, ability);
-    }
-
-    /// @notice Set the liquidity treasury multisig address.
-    /// @dev Only the owner can set the liquidity treasury multisig address. It
-    ///      is possible to set the liquidity treasury multisig address to zero
-    ///      in case the liquidity mining should be disabled.
-    /// @param  _liquidityTreasury address of the liquidity treasury multisig
-    function setLiquidityTreasury(
-        address _liquidityTreasury
-    ) external onlyOwner {
-        emit LiquidityTreasuryUpdated(liquidityTreasury, _liquidityTreasury);
-
-        // slither-disable-next-line missing-zero-check
-        liquidityTreasury = _liquidityTreasury;
-    }
-
-    /// @notice Set whether an asset is managed by the liquidity treasury multisig.
-    /// @dev Only the owner can set whether an asset is managed by the liquidity
-    ///      treasury multisig. Only assets which can be locked in the Portal can
-    ///      be managed by the liquidity treasury multisig.
-    /// @param asset address of the asset to be managed by the liquidity treasury
-    /// @param isManaged boolean value to set whether the asset is managed by the
-    ///        liquidity treasury multisig
-    function setAssetAsLiquidityTreasuryManaged(
-        address asset,
-        bool isManaged
-    ) external onlyOwner {
-        TokenAbility ability = tokenAbility[asset];
-
-        if (ability == TokenAbility.None) {
-            revert TokenNotSupported(asset);
-        }
-
-        if (ability != TokenAbility.DepositAndLock) {
-            revert InsufficientTokenAbility(asset, tokenAbility[asset]);
-        }
-
-        if (tbtcMigrations[asset].isAllowed) {
-            revert TbtcMigrationAndLiquidityManagementConflict();
-        }
-
-        liquidityTreasuryManaged[asset] = isManaged;
-
-        emit LiquidityTreasuryManagedAssetUpdated(asset, isManaged);
-    }
-
-    /// @notice Set the tBTC token address. Setting the tBTC token address
-    ///         allows the governance to enable to-tBTC migrations of selected
-    ///         deposited assets.
-    /// @dev Can only be executed one time. Can only be executed by the
-    ///      governance.
-    /// @param _tbtcToken address of the tBTC token
-    function setTbtcTokenAddress(address _tbtcToken) external onlyOwner {
-        if (_tbtcToken == address(0)) {
-            revert IncorrectTokenAddress(_tbtcToken);
-        }
-        if (tbtcToken != address(0)) {
-            revert TbtcTokenAddressAlreadySet();
-        }
-
-        tbtcToken = _tbtcToken;
-
-        emit TbtcTokenAddressSet(_tbtcToken);
-    }
-
-    /// @notice Set the tBTC migration treasury multisig address.
-    /// @dev Only the owner can set the tBTC migration treasury multisig address.
-    ///      It is possible to set the migration treasury address to zero in
-    ///      case the migration should be disabled.
-    /// @param  _tbtcMigrationTreasury the new address of the tBTC migration
-    ///         treasury multisig
-    function setTbtcMigrationTreasury(
-        address _tbtcMigrationTreasury
-    ) external onlyOwner {
-        emit TbtcMigrationTreasuryUpdated(
-            tbtcMigrationTreasury,
-            _tbtcMigrationTreasury
-        );
-
-        // slither-disable-next-line missing-zero-check
-        tbtcMigrationTreasury = _tbtcMigrationTreasury;
-    }
-
-    /// @notice Set whether an asset can be migrated to tBTC by the migration
-    ///         treasury multisig. Only assets that can be deposited in the
-    ///         Portal can be marked as eligible for migration. Only assets that
-    ///         represent Bitcoin and can be mapped 1:1 to tBTC can be marked
-    ///         as eligible for migration.
-    /// @param asset address of the asset to upgrade the to-tBTC migration
-    ///        settings for
-    /// @param isAllowed boolean value indicating whether to-tBTC migration
-    ///        is allowed
-    function setAssetTbtcMigrationAllowed(
-        address asset,
-        bool isAllowed
-    ) external onlyOwner {
-        if (tbtcToken == address(0)) {
-            revert TbtcTokenAddressNotSet();
-        }
-        if (asset == tbtcToken) {
-            revert TbtcCanNotBeMigrated();
-        }
-
-        TokenAbility ability = tokenAbility[asset];
-
-        if (ability == TokenAbility.None) {
-            revert TokenNotSupported(asset);
-        }
-
-        if (liquidityTreasuryManaged[asset]) {
-            revert TbtcMigrationAndLiquidityManagementConflict();
-        }
-
-        tbtcMigrations[asset].isAllowed = isAllowed;
-
-        emit TbtcMigrationAllowedUpdated(asset, isAllowed);
-    }
-
-    /// @notice Set the minimum lock period for deposits.
-    /// @dev Only the owner can update the minimum lock period. The new value
-    ///      must be normalized to weeks, non-zero, and not higher than the
-    ///      maximum lock period.
-    /// @param _minLockPeriod new minimum lock period
-    function setMinLockPeriod(uint32 _minLockPeriod) external onlyOwner {
-        uint32 normalizedLockPeriod = _normalizeLockPeriod(_minLockPeriod);
-
-        if (
-            _minLockPeriod != normalizedLockPeriod ||
-            normalizedLockPeriod == 0 ||
-            _minLockPeriod > maxLockPeriod
-        ) {
-            revert IncorrectLockPeriod(_minLockPeriod);
-        }
-
-        minLockPeriod = _minLockPeriod;
-        emit MinLockPeriodUpdated(_minLockPeriod);
-    }
-
-    /// @notice Set the maximum lock period for deposits. Maximum lock
-    ///      period is used as a limit to prevent users from accidentally
-    ///      locking their deposits for too long.
-    /// @dev Only the owner can update the maximum lock period. The new value
-    ///      must be normalized to weeks and not lower than the minimum lock
-    ///      period.
-    /// @param _maxLockPeriod new maximum lock period
-    function setMaxLockPeriod(uint32 _maxLockPeriod) external onlyOwner {
-        if (
-            _maxLockPeriod != _normalizeLockPeriod(_maxLockPeriod) ||
-            _maxLockPeriod < minLockPeriod
-        ) {
-            revert IncorrectLockPeriod(_maxLockPeriod);
-        }
-
-        maxLockPeriod = _maxLockPeriod;
-        emit MaxLockPeriodUpdated(_maxLockPeriod);
-    }
-
-    /// @notice Set the receipt parameters for a supported deposit token. The
-    ///         receipt token address can be set only one time. All following
-    ///         calls to this function for the same deposit token needs to pass
-    ///         the same address of the receipt token as set initially.
-    /// @dev Only the owner can set the receipt parameters. Receipt token must
-    ///      implement the decimals() method so Portal is able to perform correct
-    ///      calculations for minting receipt tokens.
-    /// @param token deposit token address to set the parameters
-    /// @param annualFee annual fee in percentage for minting the receipt token
-    /// @param mintCap mint cap in percentage for minting the receipt token
-    /// @param receiptToken receipt token address
-    function setReceiptParams(
-        address token,
-        uint8 annualFee,
-        uint8 mintCap,
-        address receiptToken
-    ) external onlyOwner {
-        if (tokenAbility[token] == TokenAbility.None) {
-            revert TokenNotSupported(token);
-        }
-
-        if (annualFee > 100) {
-            revert MaxAnnualFeeExceeded(annualFee);
-        }
-        if (mintCap > 100) {
-            revert MaxReceiptMintCapExceeded(mintCap);
-        }
-        if (receiptToken == address(0)) {
-            revert IncorrectTokenAddress(receiptToken);
-        }
-
-        FeeInfo storage i = feeInfo[token];
-
-        if (i.receiptToken != address(0) && i.receiptToken != receiptToken) {
-            revert ReceiptTokenAlreadyInitialized();
-        }
-
-        uint8 decimals = IERC20WithDecimals(receiptToken).decimals();
-
-        if (decimals != 18) {
-            revert IncorrectReceiptTokenDecimals(receiptToken);
-        }
-
-        _updateFeeIntegral(token);
-
-        i.annualFee = annualFee;
-        i.mintCap = mintCap;
-        i.receiptToken = receiptToken;
-        // solhint-disable-next-line not-rely-on-time
-        i.lastFeeUpdateAt = uint32(block.timestamp);
-
-        emit ReceiptParamsUpdated(token, annualFee, mintCap, receiptToken);
     }
 
     /// @notice Withdraws all deposited tokens.
@@ -1242,63 +1012,6 @@ contract Portal is Ownable2StepUpgradeable, IReceiveApproval {
         IERC20(token).safeTransfer(msg.sender, amount);
     }
 
-    /// @notice Mint a deposit receipt token against an existing deposit.
-    /// @param token the token address related with the deposit
-    /// @param depositId the ID of the deposit
-    /// @param amount amount of the receipt token to mint
-    function mintReceipt(
-        address token,
-        uint256 depositId,
-        uint256 amount
-    ) external {
-        FeeInfo storage fee = feeInfo[token];
-
-        if (fee.receiptToken == address(0)) {
-            revert ReceiptMintingDisabled();
-        }
-
-        if (amount == 0) {
-            revert IncorrectAmount(amount);
-        }
-
-        DepositInfo storage depositInfo = deposits[msg.sender][token][
-            depositId
-        ];
-
-        if (depositInfo.balance == 0) {
-            revert DepositNotFound();
-        }
-
-        _updateFee(depositInfo, token);
-
-        // Normalize deposit balance to match receipt token decimals
-        uint96 normalizedBalance = _adjustTokenDecimals(
-            token,
-            fee.receiptToken,
-            depositInfo.balance
-        );
-
-        uint96 mintLimit = (normalizedBalance * fee.mintCap) / 100;
-
-        if (
-            amount + depositInfo.receiptMinted + depositInfo.feeOwed > mintLimit
-        ) {
-            revert ReceiptMintLimitExceeded(
-                mintLimit,
-                depositInfo.receiptMinted,
-                depositInfo.feeOwed,
-                amount
-            );
-        }
-
-        depositInfo.receiptMinted += uint96(amount);
-        fee.totalMinted += uint96(amount);
-
-        emit ReceiptMinted(msg.sender, token, depositId, amount);
-
-        IReceiptToken(fee.receiptToken).mintReceipt(msg.sender, amount);
-    }
-
     /// @notice Repay the deposit receipt token of a particular deposit.
     /// @param token the token address related with the deposit
     /// @param depositId the ID of the deposit
@@ -1345,121 +1058,6 @@ contract Portal is Ownable2StepUpgradeable, IReceiveApproval {
         );
 
         IReceiptToken(fee.receiptToken).burnReceipt(amount);
-    }
-
-    /// @notice Request the to-tBTC migration for the given deposit. The
-    ///         migration happens asynchronously and is managed by the tBTC
-    ///         migration treasury. The contract gives no guarantees when the
-    ///         migration will be completed.
-    /// @param token deposited token address
-    /// @param depositId id of the deposit
-    function requestTbtcMigration(address token, uint256 depositId) external {
-        DepositInfo storage depositInfo = deposits[msg.sender][token][
-            depositId
-        ];
-
-        TbtcMigrationInfo storage migrationInfo = tbtcMigrations[token];
-        if (!migrationInfo.isAllowed) {
-            revert TbtcMigrationNotAllowed();
-        }
-
-        if (depositInfo.tbtcMigrationState != TbtcMigrationState.NotRequested) {
-            revert UnexpectedTbtcMigrationState(
-                depositId,
-                depositInfo.tbtcMigrationState,
-                TbtcMigrationState.NotRequested
-            );
-        }
-
-        depositInfo.tbtcMigrationState = TbtcMigrationState.Requested;
-
-        emit TbtcMigrationRequested(msg.sender, token, depositId);
-    }
-
-    /// @notice The function requests a to-tBTC conversion for WBTC deposits
-    ///         that did not opt out from auto-bridging to Mezo. The request is
-    ///         made by the coordinator who controls the auto-bridging process.
-    /// @dev Can be called only by the auto-bridge coordinator.
-    ///      A deposit will be skipped if:
-    ///      - the deposit is opting-out from auto-bridging, or
-    ///      - the deposit was withdrawn, or
-    ///      - stBTC was minted for the deposit and not repaid, or
-    ///      - to-tBTC migration was already requested for the deposit.
-    /// @param _deposits list of WBTC deposits to request the conversion for
-    ///        before they can be auto-bridged.
-    function batchRequestWbtcToTbtcMigration(
-        DepositToMigrate[] calldata _deposits
-    ) external onlyAutoBridgeCoordinator {
-        address _wbtc = wbtcToken;
-
-        TbtcMigrationInfo storage migrationInfo = tbtcMigrations[_wbtc];
-        if (!migrationInfo.isAllowed) {
-            revert TbtcMigrationNotAllowed();
-        }
-
-        for (uint256 i = 0; i < _deposits.length; i++) {
-            address depositor = _deposits[i].depositor;
-            uint256 depositId = _deposits[i].depositId;
-
-            DepositInfo storage depositInfo = deposits[depositor][_wbtc][
-                depositId
-            ];
-
-            if (depositInfo.autoBridgingOptOut) {
-                // If the deposit is marked on-chain as opting-out from
-                // auto-bridging skip it.
-                emit OptOutDepositAutoBridgingSkipped(
-                    depositor,
-                    _wbtc,
-                    depositId
-                );
-                continue;
-            }
-
-            if (depositInfo.balance == 0) {
-                // Even though the provided list of deposits to auto-bridge
-                // should be correctly constructed, we should skip a problematic
-                // deposit rather than revert. This helps to avoid a griefing
-                // attack when the attacker would front-run the transaction and
-                // withdraw the deposit.
-                emit WithdrawnDepositAutoBridgingSkipped(
-                    depositor,
-                    _wbtc,
-                    depositId
-                );
-                continue;
-            }
-
-            if (depositInfo.receiptMinted > 0) {
-                // Ignore deposits for which stBTC was minted and not repaid.
-                // We need to keep them locked until the receipt token is
-                // repaid.
-                emit ReceiptMintedDepositAutoBridgingSkipped(
-                    depositor,
-                    _wbtc,
-                    depositId
-                );
-                continue;
-            }
-
-            if (
-                depositInfo.tbtcMigrationState !=
-                TbtcMigrationState.NotRequested
-            ) {
-                // Ignore deposits for which to-tBTC migration was already
-                // requested.
-                emit TbtcMigratingDepositAutoBridgingSkipped(
-                    depositor,
-                    _wbtc,
-                    depositId
-                );
-                continue;
-            }
-
-            depositInfo.tbtcMigrationState = TbtcMigrationState.Requested;
-
-            emit TbtcMigrationRequested(depositor, _wbtc, depositId);
-        }
     }
 
     /// @notice Used by the tBTC migration treasury to withdraw tokens from the
@@ -1795,7 +1393,15 @@ contract Portal is Ownable2StepUpgradeable, IReceiveApproval {
             // slither-disable-start reentrancy-no-eth
             // slither-disable-start calls-loop
 
-            if (!IERC20(token).approve(address(mezoBridge), depositBalance)) {
+            if (token == USDT_ADDRESS) {
+                // Special case for USDT. Per ERC20 spec, approve should return
+                // boolean but USDT ignores the spec and approve returns nothing.
+                // Also, USDT reverts if there is already a non-zero approval.
+                IUSDT(token).approve(address(mezoBridge), 0);
+                IUSDT(token).approve(address(mezoBridge), depositBalance);
+            } else if (
+                !IERC20(token).approve(address(mezoBridge), depositBalance)
+            ) {
                 revert TokenApprovalFailure();
             }
 
@@ -1926,8 +1532,111 @@ contract Portal is Ownable2StepUpgradeable, IReceiveApproval {
 
             mezoBridge.bridgeTBTC(depositBalanceInTbtc, depositor);
 
+            emit DepositAutoBridged(
+                depositor,
+                _wbtc,
+                depositId,
+                depositBalance
+            );
+
             // slither-disable-end reentrancy-no-eth
             // slither-disable-end calls-loop
+        }
+    }
+
+    /// @notice Allows the deposit owner to bridge their deposit to Mezo.
+    ///         An existing deposit can be bridged assuming the receipt token
+    ///         was not minted OR it was fully repaid. If the token is WBTC,
+    ///         the to-tBTC migration must be completed for bridging.
+    // slither-disable-next-line cyclomatic-complexity
+    function bridgeDeposit(address token, uint256 depositId) external {
+        if (wbtcToken == address(0)) {
+            revert IncorrectTokenAddress(wbtcToken);
+        }
+
+        if (tbtcToken == address(0)) {
+            revert IncorrectTokenAddress(tbtcToken);
+        }
+
+        if (address(mezoBridge) == address(0)) {
+            revert IncorrectMezoBridgeAddress(address(mezoBridge));
+        }
+
+        DepositInfo storage selectedDeposit = deposits[msg.sender][token][
+            depositId
+        ];
+        uint96 depositBalance = selectedDeposit.balance;
+
+        if (depositBalance == 0) {
+            revert DepositNotFound();
+        }
+
+        if (selectedDeposit.receiptMinted > 0) {
+            revert ReceiptNotRepaid(selectedDeposit.receiptMinted);
+        }
+
+        if (
+            token == wbtcToken &&
+            selectedDeposit.tbtcMigrationState != TbtcMigrationState.Completed
+        ) {
+            revert TbtcMigrationNotCompleted();
+        } else if (
+            token != wbtcToken &&
+            selectedDeposit.tbtcMigrationState !=
+            TbtcMigrationState.NotRequested
+        ) {
+            revert TbtcMigrationRequestedErr();
+        }
+
+        delete deposits[msg.sender][token][depositId];
+
+        emit DepositBridged(msg.sender, token, depositId, depositBalance);
+
+        //
+        // This is a WBTC token with a to-tBTC migration completed. We need to
+        // adjust the decimals, as the DeposiInfo is still stored for WBTC.
+        // After adjusting decimals, we can bridge it as tBTC.
+        //
+        if (token == wbtcToken) {
+            uint96 depositBalanceInTbtc = _adjustTokenDecimals(
+                token,
+                tbtcToken,
+                depositBalance
+            );
+
+            if (
+                !IERC20(tbtcToken).approve(
+                    address(mezoBridge),
+                    depositBalanceInTbtc
+                )
+            ) {
+                revert TokenApprovalFailure();
+            }
+
+            mezoBridge.bridgeTBTC(depositBalanceInTbtc, msg.sender);
+        } else {
+            //
+            // This is either tBTC or any other ERC20 that had no to-tBTC
+            // migrations requested. We can bridge it without adjusting
+            // decimals.
+            //
+            if (token == USDT_ADDRESS) {
+                // Special case for USDT. Per ERC20 spec, approve should return
+                // boolean but USDT ignores the spec and approve returns nothing.
+                // Also, USDT reverts if there is already a non-zero approval.
+                IUSDT(token).approve(address(mezoBridge), 0);
+                IUSDT(token).approve(address(mezoBridge), depositBalance);
+            } else if (
+                !IERC20(token).approve(address(mezoBridge), depositBalance)
+            ) {
+                revert TokenApprovalFailure();
+            }
+
+            if (token == tbtcToken) {
+                mezoBridge.bridgeTBTC(depositBalance, msg.sender);
+            } else {
+                mezoBridge.bridgeERC20(token, depositBalance, msg.sender);
+            }
         }
     }
 
