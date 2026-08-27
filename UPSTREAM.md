@@ -27,6 +27,9 @@ verified contract currently used by the Ethereum mainnet proxy:
 - Compiler: `v0.8.24+commit.e11b9ed9`
 - Optimizer: enabled, 10,000 runs
 - EVM version: `paris`
+- Runtime bytecode length: `24,440` bytes
+- Runtime bytecode hash:
+  `0x45d9f7bc2be7231b786206cf8c08716af1938f75363d4ec7ab1f3ee7bccb0ba7`
 - `contracts/Portal.sol` SHA-256:
   `dbbdfabbd6520265e0590c8369b28aed578d6e4aa82f50c973b26ec9cf2c2382`
 - `contracts/interfaces/IUSDT.sol` SHA-256:
@@ -35,5 +38,6 @@ verified contract currently used by the Ethereum mainnet proxy:
 The other project-local compilation units used by the verified implementation
 match the npm package byte-for-byte. The verified live implementation is newer
 than the published package's `Portal.sol`, so the recovery work branches from
-this synchronized snapshot.
-
+this synchronized snapshot. Compiling this snapshot with the recorded settings
+produces runtime bytecode exactly equal to the implementation bytecode at the
+pinned block.
