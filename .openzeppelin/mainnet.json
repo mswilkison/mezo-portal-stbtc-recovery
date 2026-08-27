@@ -1,0 +1,1265 @@
+{
+  "manifestVersion": "3.2",
+  "proxies": [
+    {
+      "address": "0xAB13B8eecf5AA2460841d75da5d5D861fD5B8A39",
+      "txHash": "0x3e13a1ece7173342ac0146c63dbfb2fb60b2badfb0991a493a868ff0db55540b",
+      "kind": "transparent"
+    },
+    {
+      "address": "0x1D50D75933b7b7C8AD94dbfb748B5756E3889C24",
+      "txHash": "0xb4850e7df44a28d92a90a04704b138b7de3ff8f2a1803f142048a3d98cb93ac8",
+      "kind": "transparent"
+    },
+    {
+      "address": "0xF6680EA3b480cA2b72D96ea13cCAF2cFd8e6908c",
+      "txHash": "0x0accb979b9191a61553e383d8c513ba9c1611bc4305498f4264c9a03c29b9ddb",
+      "kind": "transparent"
+    }
+  ],
+  "impls": {
+    "d78dfafe0ecdaf2cc18748a52e0c6a11c09b82e61354bee9758c347a2167be72": {
+      "address": "0xeAAf2B9e90aA6400d83e07606F5F2A5432502216",
+      "txHash": "0xeb66bdc8cdafa2a24d8ecc07114a01174d53aaf190f49e77968084829c2ca64c",
+      "layout": {
+        "solcVersion": "0.8.24",
+        "storage": [
+          {
+            "label": "deposits",
+            "offset": 0,
+            "slot": "0",
+            "type": "t_mapping(t_address,t_mapping(t_address,t_mapping(t_uint256,t_struct(DepositInfo)6065_storage)))",
+            "contract": "Portal",
+            "src": "contracts/Portal.sol:41"
+          },
+          {
+            "label": "depositCount",
+            "offset": 0,
+            "slot": "1",
+            "type": "t_uint256",
+            "contract": "Portal",
+            "src": "contracts/Portal.sol:47"
+          },
+          {
+            "label": "tokenAbility",
+            "offset": 0,
+            "slot": "2",
+            "type": "t_mapping(t_address,t_enum(TokenAbility)6052)",
+            "contract": "Portal",
+            "src": "contracts/Portal.sol:50"
+          },
+          {
+            "label": "minLockPeriod",
+            "offset": 0,
+            "slot": "3",
+            "type": "t_uint32",
+            "contract": "Portal",
+            "src": "contracts/Portal.sol:53"
+          },
+          {
+            "label": "maxLockPeriod",
+            "offset": 4,
+            "slot": "3",
+            "type": "t_uint32",
+            "contract": "Portal",
+            "src": "contracts/Portal.sol:56"
+          }
+        ],
+        "types": {
+          "t_address": {
+            "label": "address",
+            "numberOfBytes": "20"
+          },
+          "t_bool": {
+            "label": "bool",
+            "numberOfBytes": "1"
+          },
+          "t_struct(InitializableStorage)543_storage": {
+            "label": "struct Initializable.InitializableStorage",
+            "members": [
+              {
+                "label": "_initialized",
+                "type": "t_uint64",
+                "offset": 0,
+                "slot": "0"
+              },
+              {
+                "label": "_initializing",
+                "type": "t_bool",
+                "offset": 8,
+                "slot": "0"
+              }
+            ],
+            "numberOfBytes": "32"
+          },
+          "t_struct(Ownable2StepStorage)452_storage": {
+            "label": "struct Ownable2StepUpgradeable.Ownable2StepStorage",
+            "members": [
+              {
+                "label": "_pendingOwner",
+                "type": "t_address",
+                "offset": 0,
+                "slot": "0"
+              }
+            ],
+            "numberOfBytes": "32"
+          },
+          "t_struct(OwnableStorage)493_storage": {
+            "label": "struct OwnableUpgradeable.OwnableStorage",
+            "members": [
+              {
+                "label": "_owner",
+                "type": "t_address",
+                "offset": 0,
+                "slot": "0"
+              }
+            ],
+            "numberOfBytes": "32"
+          },
+          "t_uint64": {
+            "label": "uint64",
+            "numberOfBytes": "8"
+          },
+          "t_enum(TokenAbility)6052": {
+            "label": "enum Portal.TokenAbility",
+            "members": ["None", "Deposit", "DepositAndLock"],
+            "numberOfBytes": "1"
+          },
+          "t_mapping(t_address,t_enum(TokenAbility)6052)": {
+            "label": "mapping(address => enum Portal.TokenAbility)",
+            "numberOfBytes": "32"
+          },
+          "t_mapping(t_address,t_mapping(t_address,t_mapping(t_uint256,t_struct(DepositInfo)6065_storage)))": {
+            "label": "mapping(address => mapping(address => mapping(uint256 => struct Portal.DepositInfo)))",
+            "numberOfBytes": "32"
+          },
+          "t_mapping(t_address,t_mapping(t_uint256,t_struct(DepositInfo)6065_storage))": {
+            "label": "mapping(address => mapping(uint256 => struct Portal.DepositInfo))",
+            "numberOfBytes": "32"
+          },
+          "t_mapping(t_uint256,t_struct(DepositInfo)6065_storage)": {
+            "label": "mapping(uint256 => struct Portal.DepositInfo)",
+            "numberOfBytes": "32"
+          },
+          "t_struct(DepositInfo)6065_storage": {
+            "label": "struct Portal.DepositInfo",
+            "members": [
+              {
+                "label": "balance",
+                "type": "t_uint96",
+                "offset": 0,
+                "slot": "0"
+              },
+              {
+                "label": "unlockAt",
+                "type": "t_uint32",
+                "offset": 12,
+                "slot": "0"
+              }
+            ],
+            "numberOfBytes": "32"
+          },
+          "t_uint256": {
+            "label": "uint256",
+            "numberOfBytes": "32"
+          },
+          "t_uint32": {
+            "label": "uint32",
+            "numberOfBytes": "4"
+          },
+          "t_uint96": {
+            "label": "uint96",
+            "numberOfBytes": "12"
+          }
+        },
+        "namespaces": {
+          "erc7201:openzeppelin.storage.Ownable2Step": [
+            {
+              "contract": "Ownable2StepUpgradeable",
+              "label": "_pendingOwner",
+              "type": "t_address",
+              "src": "@openzeppelin/contracts-upgradeable/access/Ownable2StepUpgradeable.sol:23",
+              "offset": 0,
+              "slot": "0"
+            }
+          ],
+          "erc7201:openzeppelin.storage.Ownable": [
+            {
+              "contract": "OwnableUpgradeable",
+              "label": "_owner",
+              "type": "t_address",
+              "src": "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol:24",
+              "offset": 0,
+              "slot": "0"
+            }
+          ],
+          "erc7201:openzeppelin.storage.Initializable": [
+            {
+              "contract": "Initializable",
+              "label": "_initialized",
+              "type": "t_uint64",
+              "src": "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol:69",
+              "offset": 0,
+              "slot": "0"
+            },
+            {
+              "contract": "Initializable",
+              "label": "_initializing",
+              "type": "t_bool",
+              "src": "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol:73",
+              "offset": 8,
+              "slot": "0"
+            }
+          ]
+        }
+      }
+    },
+    "f4bb59f50bf0774179e2984767f47879c18b9bb266b51784b17c7a6fb1163492": {
+      "address": "0x04B94f55780682478c8D8329368AAAfD320F4D32",
+      "txHash": "0x26791511069c2c1e5cb58057e0dd39ffc0d62b9385bae348a0ba4def7a6afe1c",
+      "layout": {
+        "solcVersion": "0.8.24",
+        "storage": [
+          {
+            "label": "bridge",
+            "offset": 0,
+            "slot": "0",
+            "type": "t_contract(IBridge)3081",
+            "contract": "AbstractTBTCDepositor",
+            "src": "@keep-network/tbtc-v2/contracts/integrator/AbstractTBTCDepositor.sol:95"
+          },
+          {
+            "label": "tbtcVault",
+            "offset": 0,
+            "slot": "1",
+            "type": "t_contract(ITBTCVault)3101",
+            "contract": "AbstractTBTCDepositor",
+            "src": "@keep-network/tbtc-v2/contracts/integrator/AbstractTBTCDepositor.sol:96"
+          },
+          {
+            "label": "__gap",
+            "offset": 0,
+            "slot": "2",
+            "type": "t_array(t_uint256)47_storage",
+            "contract": "AbstractTBTCDepositor",
+            "src": "@keep-network/tbtc-v2/contracts/integrator/AbstractTBTCDepositor.sol:111"
+          },
+          {
+            "label": "portal",
+            "offset": 0,
+            "slot": "49",
+            "type": "t_contract(Portal)6962",
+            "contract": "BitcoinDepositor",
+            "src": "contracts/BitcoinDepositor.sol:49"
+          },
+          {
+            "label": "tbtcToken",
+            "offset": 0,
+            "slot": "50",
+            "type": "t_contract(IERC20)5107",
+            "contract": "BitcoinDepositor",
+            "src": "contracts/BitcoinDepositor.sol:52"
+          },
+          {
+            "label": "deposits",
+            "offset": 0,
+            "slot": "51",
+            "type": "t_mapping(t_uint256,t_enum(DepositState)5763)",
+            "contract": "BitcoinDepositor",
+            "src": "contracts/BitcoinDepositor.sol:57"
+          }
+        ],
+        "types": {
+          "t_bool": {
+            "label": "bool",
+            "numberOfBytes": "1"
+          },
+          "t_struct(InitializableStorage)543_storage": {
+            "label": "struct Initializable.InitializableStorage",
+            "members": [
+              {
+                "label": "_initialized",
+                "type": "t_uint64",
+                "offset": 0,
+                "slot": "0"
+              },
+              {
+                "label": "_initializing",
+                "type": "t_bool",
+                "offset": 8,
+                "slot": "0"
+              }
+            ],
+            "numberOfBytes": "32"
+          },
+          "t_uint64": {
+            "label": "uint64",
+            "numberOfBytes": "8"
+          },
+          "t_array(t_uint256)47_storage": {
+            "label": "uint256[47]",
+            "numberOfBytes": "1504"
+          },
+          "t_contract(IBridge)3081": {
+            "label": "contract IBridge",
+            "numberOfBytes": "20"
+          },
+          "t_contract(IERC20)5107": {
+            "label": "contract IERC20",
+            "numberOfBytes": "20"
+          },
+          "t_contract(ITBTCVault)3101": {
+            "label": "contract ITBTCVault",
+            "numberOfBytes": "20"
+          },
+          "t_contract(Portal)6962": {
+            "label": "contract Portal",
+            "numberOfBytes": "20"
+          },
+          "t_enum(DepositState)5763": {
+            "label": "enum BitcoinDepositor.DepositState",
+            "members": ["Unknown", "Initialized", "Finalized"],
+            "numberOfBytes": "1"
+          },
+          "t_mapping(t_uint256,t_enum(DepositState)5763)": {
+            "label": "mapping(uint256 => enum BitcoinDepositor.DepositState)",
+            "numberOfBytes": "32"
+          },
+          "t_uint256": {
+            "label": "uint256",
+            "numberOfBytes": "32"
+          }
+        },
+        "namespaces": {
+          "erc7201:openzeppelin.storage.Initializable": [
+            {
+              "contract": "Initializable",
+              "label": "_initialized",
+              "type": "t_uint64",
+              "src": "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol:69",
+              "offset": 0,
+              "slot": "0"
+            },
+            {
+              "contract": "Initializable",
+              "label": "_initializing",
+              "type": "t_bool",
+              "src": "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol:73",
+              "offset": 8,
+              "slot": "0"
+            }
+          ]
+        }
+      }
+    },
+    "4ed6e166d623ed421be925395d9f2403a9f22c7814118d9296ae8c6ca286761d": {
+      "address": "0xD7097AF27b14e204564C057c636022fae346fE60",
+      "txHash": "0x80891b30a01294e87bb280fc8017d5b95f6a0d84620d012bff86886a4b9535cf",
+      "layout": {
+        "solcVersion": "0.8.24",
+        "storage": [
+          {
+            "label": "deposits",
+            "offset": 0,
+            "slot": "0",
+            "type": "t_mapping(t_address,t_mapping(t_address,t_mapping(t_uint256,t_struct(DepositInfo)6355_storage)))",
+            "contract": "Portal",
+            "src": "contracts/Portal.sol:95"
+          },
+          {
+            "label": "depositCount",
+            "offset": 0,
+            "slot": "1",
+            "type": "t_uint256",
+            "contract": "Portal",
+            "src": "contracts/Portal.sol:101"
+          },
+          {
+            "label": "tokenAbility",
+            "offset": 0,
+            "slot": "2",
+            "type": "t_mapping(t_address,t_enum(TokenAbility)6336)",
+            "contract": "Portal",
+            "src": "contracts/Portal.sol:104"
+          },
+          {
+            "label": "minLockPeriod",
+            "offset": 0,
+            "slot": "3",
+            "type": "t_uint32",
+            "contract": "Portal",
+            "src": "contracts/Portal.sol:107"
+          },
+          {
+            "label": "maxLockPeriod",
+            "offset": 4,
+            "slot": "3",
+            "type": "t_uint32",
+            "contract": "Portal",
+            "src": "contracts/Portal.sol:110"
+          },
+          {
+            "label": "liquidityTreasury",
+            "offset": 8,
+            "slot": "3",
+            "type": "t_address",
+            "contract": "Portal",
+            "src": "contracts/Portal.sol:113"
+          },
+          {
+            "label": "liquidityTreasuryManaged",
+            "offset": 0,
+            "slot": "4",
+            "type": "t_mapping(t_address,t_bool)",
+            "contract": "Portal",
+            "src": "contracts/Portal.sol:117"
+          },
+          {
+            "label": "feeInfo",
+            "offset": 0,
+            "slot": "5",
+            "type": "t_mapping(t_address,t_struct(FeeInfo)6371_storage)",
+            "contract": "Portal",
+            "src": "contracts/Portal.sol:120"
+          }
+        ],
+        "types": {
+          "t_address": {
+            "label": "address",
+            "numberOfBytes": "20"
+          },
+          "t_bool": {
+            "label": "bool",
+            "numberOfBytes": "1"
+          },
+          "t_struct(InitializableStorage)1091_storage": {
+            "label": "struct Initializable.InitializableStorage",
+            "members": [
+              {
+                "label": "_initialized",
+                "type": "t_uint64",
+                "offset": 0,
+                "slot": "0"
+              },
+              {
+                "label": "_initializing",
+                "type": "t_bool",
+                "offset": 8,
+                "slot": "0"
+              }
+            ],
+            "numberOfBytes": "32"
+          },
+          "t_struct(Ownable2StepStorage)963_storage": {
+            "label": "struct Ownable2StepUpgradeable.Ownable2StepStorage",
+            "members": [
+              {
+                "label": "_pendingOwner",
+                "type": "t_address",
+                "offset": 0,
+                "slot": "0"
+              }
+            ],
+            "numberOfBytes": "32"
+          },
+          "t_struct(OwnableStorage)1024_storage": {
+            "label": "struct OwnableUpgradeable.OwnableStorage",
+            "members": [
+              {
+                "label": "_owner",
+                "type": "t_address",
+                "offset": 0,
+                "slot": "0"
+              }
+            ],
+            "numberOfBytes": "32"
+          },
+          "t_uint64": {
+            "label": "uint64",
+            "numberOfBytes": "8"
+          },
+          "t_enum(TokenAbility)6336": {
+            "label": "enum Portal.TokenAbility",
+            "members": ["None", "Deposit", "DepositAndLock"],
+            "numberOfBytes": "1"
+          },
+          "t_mapping(t_address,t_bool)": {
+            "label": "mapping(address => bool)",
+            "numberOfBytes": "32"
+          },
+          "t_mapping(t_address,t_enum(TokenAbility)6336)": {
+            "label": "mapping(address => enum Portal.TokenAbility)",
+            "numberOfBytes": "32"
+          },
+          "t_mapping(t_address,t_mapping(t_address,t_mapping(t_uint256,t_struct(DepositInfo)6355_storage)))": {
+            "label": "mapping(address => mapping(address => mapping(uint256 => struct Portal.DepositInfo)))",
+            "numberOfBytes": "32"
+          },
+          "t_mapping(t_address,t_mapping(t_uint256,t_struct(DepositInfo)6355_storage))": {
+            "label": "mapping(address => mapping(uint256 => struct Portal.DepositInfo))",
+            "numberOfBytes": "32"
+          },
+          "t_mapping(t_address,t_struct(FeeInfo)6371_storage)": {
+            "label": "mapping(address => struct Portal.FeeInfo)",
+            "numberOfBytes": "32"
+          },
+          "t_mapping(t_uint256,t_struct(DepositInfo)6355_storage)": {
+            "label": "mapping(uint256 => struct Portal.DepositInfo)",
+            "numberOfBytes": "32"
+          },
+          "t_struct(DepositInfo)6355_storage": {
+            "label": "struct Portal.DepositInfo",
+            "members": [
+              {
+                "label": "balance",
+                "type": "t_uint96",
+                "offset": 0,
+                "slot": "0"
+              },
+              {
+                "label": "unlockAt",
+                "type": "t_uint32",
+                "offset": 12,
+                "slot": "0"
+              },
+              {
+                "label": "receiptMinted",
+                "type": "t_uint96",
+                "offset": 16,
+                "slot": "0"
+              },
+              {
+                "label": "feeOwed",
+                "type": "t_uint96",
+                "offset": 0,
+                "slot": "1"
+              },
+              {
+                "label": "lastFeeIntegral",
+                "type": "t_uint88",
+                "offset": 12,
+                "slot": "1"
+              }
+            ],
+            "numberOfBytes": "64"
+          },
+          "t_struct(FeeInfo)6371_storage": {
+            "label": "struct Portal.FeeInfo",
+            "members": [
+              {
+                "label": "totalMinted",
+                "type": "t_uint96",
+                "offset": 0,
+                "slot": "0"
+              },
+              {
+                "label": "lastFeeUpdateAt",
+                "type": "t_uint32",
+                "offset": 12,
+                "slot": "0"
+              },
+              {
+                "label": "feeIntegral",
+                "type": "t_uint88",
+                "offset": 16,
+                "slot": "0"
+              },
+              {
+                "label": "annualFee",
+                "type": "t_uint8",
+                "offset": 27,
+                "slot": "0"
+              },
+              {
+                "label": "mintCap",
+                "type": "t_uint8",
+                "offset": 28,
+                "slot": "0"
+              },
+              {
+                "label": "receiptToken",
+                "type": "t_address",
+                "offset": 0,
+                "slot": "1"
+              },
+              {
+                "label": "feeCollected",
+                "type": "t_uint96",
+                "offset": 20,
+                "slot": "1"
+              }
+            ],
+            "numberOfBytes": "64"
+          },
+          "t_uint256": {
+            "label": "uint256",
+            "numberOfBytes": "32"
+          },
+          "t_uint32": {
+            "label": "uint32",
+            "numberOfBytes": "4"
+          },
+          "t_uint8": {
+            "label": "uint8",
+            "numberOfBytes": "1"
+          },
+          "t_uint88": {
+            "label": "uint88",
+            "numberOfBytes": "11"
+          },
+          "t_uint96": {
+            "label": "uint96",
+            "numberOfBytes": "12"
+          }
+        },
+        "namespaces": {
+          "erc7201:openzeppelin.storage.Ownable2Step": [
+            {
+              "contract": "Ownable2StepUpgradeable",
+              "label": "_pendingOwner",
+              "type": "t_address",
+              "src": "@openzeppelin/contracts-upgradeable/access/Ownable2StepUpgradeable.sol:23",
+              "offset": 0,
+              "slot": "0"
+            }
+          ],
+          "erc7201:openzeppelin.storage.Ownable": [
+            {
+              "contract": "OwnableUpgradeable",
+              "label": "_owner",
+              "type": "t_address",
+              "src": "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol:24",
+              "offset": 0,
+              "slot": "0"
+            }
+          ],
+          "erc7201:openzeppelin.storage.Initializable": [
+            {
+              "contract": "Initializable",
+              "label": "_initialized",
+              "type": "t_uint64",
+              "src": "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol:69",
+              "offset": 0,
+              "slot": "0"
+            },
+            {
+              "contract": "Initializable",
+              "label": "_initializing",
+              "type": "t_bool",
+              "src": "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol:73",
+              "offset": 8,
+              "slot": "0"
+            }
+          ]
+        }
+      }
+    },
+    "7036fb397bdf4f2f8b09c407d629c43cfba8fe8f26fa9352f1b1b1b3f352ed02": {
+      "address": "0x2dFdEb833c199ba5D166C90A3B25B0E72288076B",
+      "txHash": "0x9f4bd23ab0bd76ae3634a56fda77a38fbbdcee7402db6a12335053df3e4a2631",
+      "layout": {
+        "solcVersion": "0.8.24",
+        "storage": [
+          {
+            "label": "deposits",
+            "offset": 0,
+            "slot": "0",
+            "type": "t_mapping(t_address,t_mapping(t_address,t_mapping(t_uint256,t_struct(DepositInfo)4737_storage)))",
+            "contract": "Portal",
+            "src": "contracts/Portal.sol:139"
+          },
+          {
+            "label": "depositCount",
+            "offset": 0,
+            "slot": "1",
+            "type": "t_uint256",
+            "contract": "Portal",
+            "src": "contracts/Portal.sol:145"
+          },
+          {
+            "label": "tokenAbility",
+            "offset": 0,
+            "slot": "2",
+            "type": "t_mapping(t_address,t_enum(TokenAbility)4703)",
+            "contract": "Portal",
+            "src": "contracts/Portal.sol:148"
+          },
+          {
+            "label": "minLockPeriod",
+            "offset": 0,
+            "slot": "3",
+            "type": "t_uint32",
+            "contract": "Portal",
+            "src": "contracts/Portal.sol:151"
+          },
+          {
+            "label": "maxLockPeriod",
+            "offset": 4,
+            "slot": "3",
+            "type": "t_uint32",
+            "contract": "Portal",
+            "src": "contracts/Portal.sol:154"
+          },
+          {
+            "label": "liquidityTreasury",
+            "offset": 8,
+            "slot": "3",
+            "type": "t_address",
+            "contract": "Portal",
+            "src": "contracts/Portal.sol:157"
+          },
+          {
+            "label": "liquidityTreasuryManaged",
+            "offset": 0,
+            "slot": "4",
+            "type": "t_mapping(t_address,t_bool)",
+            "contract": "Portal",
+            "src": "contracts/Portal.sol:161"
+          },
+          {
+            "label": "feeInfo",
+            "offset": 0,
+            "slot": "5",
+            "type": "t_mapping(t_address,t_struct(FeeInfo)4759_storage)",
+            "contract": "Portal",
+            "src": "contracts/Portal.sol:165"
+          },
+          {
+            "label": "tbtcToken",
+            "offset": 0,
+            "slot": "6",
+            "type": "t_address",
+            "contract": "Portal",
+            "src": "contracts/Portal.sol:170"
+          },
+          {
+            "label": "tbtcMigrationTreasury",
+            "offset": 0,
+            "slot": "7",
+            "type": "t_address",
+            "contract": "Portal",
+            "src": "contracts/Portal.sol:176"
+          },
+          {
+            "label": "tbtcMigrations",
+            "offset": 0,
+            "slot": "8",
+            "type": "t_mapping(t_address,t_struct(TbtcMigrationInfo)4743_storage)",
+            "contract": "Portal",
+            "src": "contracts/Portal.sol:182"
+          }
+        ],
+        "types": {
+          "t_address": {
+            "label": "address",
+            "numberOfBytes": "20"
+          },
+          "t_bool": {
+            "label": "bool",
+            "numberOfBytes": "1"
+          },
+          "t_struct(InitializableStorage)1091_storage": {
+            "label": "struct Initializable.InitializableStorage",
+            "members": [
+              {
+                "label": "_initialized",
+                "type": "t_uint64",
+                "offset": 0,
+                "slot": "0"
+              },
+              {
+                "label": "_initializing",
+                "type": "t_bool",
+                "offset": 8,
+                "slot": "0"
+              }
+            ],
+            "numberOfBytes": "32"
+          },
+          "t_struct(Ownable2StepStorage)963_storage": {
+            "label": "struct Ownable2StepUpgradeable.Ownable2StepStorage",
+            "members": [
+              {
+                "label": "_pendingOwner",
+                "type": "t_address",
+                "offset": 0,
+                "slot": "0"
+              }
+            ],
+            "numberOfBytes": "32"
+          },
+          "t_struct(OwnableStorage)1024_storage": {
+            "label": "struct OwnableUpgradeable.OwnableStorage",
+            "members": [
+              {
+                "label": "_owner",
+                "type": "t_address",
+                "offset": 0,
+                "slot": "0"
+              }
+            ],
+            "numberOfBytes": "32"
+          },
+          "t_uint64": {
+            "label": "uint64",
+            "numberOfBytes": "8"
+          },
+          "t_enum(TbtcMigrationState)4709": {
+            "label": "enum Portal.TbtcMigrationState",
+            "members": ["NotRequested", "Requested", "InProgress", "Completed"],
+            "numberOfBytes": "1"
+          },
+          "t_enum(TokenAbility)4703": {
+            "label": "enum Portal.TokenAbility",
+            "members": ["None", "Deposit", "DepositAndLock"],
+            "numberOfBytes": "1"
+          },
+          "t_mapping(t_address,t_bool)": {
+            "label": "mapping(address => bool)",
+            "numberOfBytes": "32"
+          },
+          "t_mapping(t_address,t_enum(TokenAbility)4703)": {
+            "label": "mapping(address => enum Portal.TokenAbility)",
+            "numberOfBytes": "32"
+          },
+          "t_mapping(t_address,t_mapping(t_address,t_mapping(t_uint256,t_struct(DepositInfo)4737_storage)))": {
+            "label": "mapping(address => mapping(address => mapping(uint256 => struct Portal.DepositInfo)))",
+            "numberOfBytes": "32"
+          },
+          "t_mapping(t_address,t_mapping(t_uint256,t_struct(DepositInfo)4737_storage))": {
+            "label": "mapping(address => mapping(uint256 => struct Portal.DepositInfo))",
+            "numberOfBytes": "32"
+          },
+          "t_mapping(t_address,t_struct(FeeInfo)4759_storage)": {
+            "label": "mapping(address => struct Portal.FeeInfo)",
+            "numberOfBytes": "32"
+          },
+          "t_mapping(t_address,t_struct(TbtcMigrationInfo)4743_storage)": {
+            "label": "mapping(address => struct Portal.TbtcMigrationInfo)",
+            "numberOfBytes": "32"
+          },
+          "t_mapping(t_uint256,t_struct(DepositInfo)4737_storage)": {
+            "label": "mapping(uint256 => struct Portal.DepositInfo)",
+            "numberOfBytes": "32"
+          },
+          "t_struct(DepositInfo)4737_storage": {
+            "label": "struct Portal.DepositInfo",
+            "members": [
+              {
+                "label": "balance",
+                "type": "t_uint96",
+                "offset": 0,
+                "slot": "0"
+              },
+              {
+                "label": "unlockAt",
+                "type": "t_uint32",
+                "offset": 12,
+                "slot": "0"
+              },
+              {
+                "label": "receiptMinted",
+                "type": "t_uint96",
+                "offset": 16,
+                "slot": "0"
+              },
+              {
+                "label": "feeOwed",
+                "type": "t_uint96",
+                "offset": 0,
+                "slot": "1"
+              },
+              {
+                "label": "lastFeeIntegral",
+                "type": "t_uint88",
+                "offset": 12,
+                "slot": "1"
+              },
+              {
+                "label": "tbtcMigrationState",
+                "type": "t_enum(TbtcMigrationState)4709",
+                "offset": 23,
+                "slot": "1"
+              }
+            ],
+            "numberOfBytes": "64"
+          },
+          "t_struct(FeeInfo)4759_storage": {
+            "label": "struct Portal.FeeInfo",
+            "members": [
+              {
+                "label": "totalMinted",
+                "type": "t_uint96",
+                "offset": 0,
+                "slot": "0"
+              },
+              {
+                "label": "lastFeeUpdateAt",
+                "type": "t_uint32",
+                "offset": 12,
+                "slot": "0"
+              },
+              {
+                "label": "feeIntegral",
+                "type": "t_uint88",
+                "offset": 16,
+                "slot": "0"
+              },
+              {
+                "label": "annualFee",
+                "type": "t_uint8",
+                "offset": 27,
+                "slot": "0"
+              },
+              {
+                "label": "mintCap",
+                "type": "t_uint8",
+                "offset": 28,
+                "slot": "0"
+              },
+              {
+                "label": "receiptToken",
+                "type": "t_address",
+                "offset": 0,
+                "slot": "1"
+              },
+              {
+                "label": "feeCollected",
+                "type": "t_uint96",
+                "offset": 20,
+                "slot": "1"
+              }
+            ],
+            "numberOfBytes": "64"
+          },
+          "t_struct(TbtcMigrationInfo)4743_storage": {
+            "label": "struct Portal.TbtcMigrationInfo",
+            "members": [
+              {
+                "label": "isAllowed",
+                "type": "t_bool",
+                "offset": 0,
+                "slot": "0"
+              },
+              {
+                "label": "totalMigrating",
+                "type": "t_uint96",
+                "offset": 1,
+                "slot": "0"
+              }
+            ],
+            "numberOfBytes": "32"
+          },
+          "t_uint256": {
+            "label": "uint256",
+            "numberOfBytes": "32"
+          },
+          "t_uint32": {
+            "label": "uint32",
+            "numberOfBytes": "4"
+          },
+          "t_uint8": {
+            "label": "uint8",
+            "numberOfBytes": "1"
+          },
+          "t_uint88": {
+            "label": "uint88",
+            "numberOfBytes": "11"
+          },
+          "t_uint96": {
+            "label": "uint96",
+            "numberOfBytes": "12"
+          }
+        },
+        "namespaces": {
+          "erc7201:openzeppelin.storage.Ownable2Step": [
+            {
+              "contract": "Ownable2StepUpgradeable",
+              "label": "_pendingOwner",
+              "type": "t_address",
+              "src": "@openzeppelin/contracts-upgradeable/access/Ownable2StepUpgradeable.sol:23",
+              "offset": 0,
+              "slot": "0"
+            }
+          ],
+          "erc7201:openzeppelin.storage.Ownable": [
+            {
+              "contract": "OwnableUpgradeable",
+              "label": "_owner",
+              "type": "t_address",
+              "src": "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol:24",
+              "offset": 0,
+              "slot": "0"
+            }
+          ],
+          "erc7201:openzeppelin.storage.Initializable": [
+            {
+              "contract": "Initializable",
+              "label": "_initialized",
+              "type": "t_uint64",
+              "src": "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol:69",
+              "offset": 0,
+              "slot": "0"
+            },
+            {
+              "contract": "Initializable",
+              "label": "_initializing",
+              "type": "t_bool",
+              "src": "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol:73",
+              "offset": 8,
+              "slot": "0"
+            }
+          ]
+        }
+      }
+    },
+    "e9adaef4de7c0ba94c4254b89597c0816068a7cc383b144afcf2de013ead8f20": {
+      "address": "0x3D282Cc0d69e27fBd4aa59DfD08D6a72B45Ce889",
+      "txHash": "0xe591cc0720c48d204c625f4fda9eb3ee85799112354af8862fd4eca8d2c7f693",
+      "layout": {
+        "solcVersion": "0.8.24",
+        "storage": [
+          {
+            "label": "bridge",
+            "offset": 0,
+            "slot": "0",
+            "type": "t_contract(IBridge)3081",
+            "contract": "AbstractTBTCDepositor",
+            "src": "@keep-network/tbtc-v2/contracts/integrator/AbstractTBTCDepositor.sol:95"
+          },
+          {
+            "label": "tbtcVault",
+            "offset": 0,
+            "slot": "1",
+            "type": "t_contract(ITBTCVault)3101",
+            "contract": "AbstractTBTCDepositor",
+            "src": "@keep-network/tbtc-v2/contracts/integrator/AbstractTBTCDepositor.sol:96"
+          },
+          {
+            "label": "__gap",
+            "offset": 0,
+            "slot": "2",
+            "type": "t_array(t_uint256)47_storage",
+            "contract": "AbstractTBTCDepositor",
+            "src": "@keep-network/tbtc-v2/contracts/integrator/AbstractTBTCDepositor.sol:111"
+          },
+          {
+            "label": "tbtcToken",
+            "offset": 0,
+            "slot": "49",
+            "type": "t_address",
+            "contract": "BitcoinBridge",
+            "src": "contracts/BitcoinBridge.sol:43"
+          },
+          {
+            "label": "btcDeposits",
+            "offset": 0,
+            "slot": "50",
+            "type": "t_mapping(t_uint256,t_enum(BTCDepositState)8036)",
+            "contract": "BitcoinBridge",
+            "src": "contracts/BitcoinBridge.sol:48"
+          },
+          {
+            "label": "minTBTCAmount",
+            "offset": 0,
+            "slot": "51",
+            "type": "t_uint256",
+            "contract": "BitcoinBridge",
+            "src": "contracts/BitcoinBridge.sol:56"
+          },
+          {
+            "label": "__gap",
+            "offset": 0,
+            "slot": "52",
+            "type": "t_array(t_uint256)47_storage",
+            "contract": "BitcoinBridge",
+            "src": "contracts/BitcoinBridge.sol:64"
+          },
+          {
+            "label": "ERC20TokensCount",
+            "offset": 0,
+            "slot": "99",
+            "type": "t_uint256",
+            "contract": "ERC20Bridge",
+            "src": "contracts/ERC20Bridge.sol:25"
+          },
+          {
+            "label": "ERC20Tokens",
+            "offset": 0,
+            "slot": "100",
+            "type": "t_mapping(t_address,t_uint256)",
+            "contract": "ERC20Bridge",
+            "src": "contracts/ERC20Bridge.sol:29"
+          },
+          {
+            "label": "__gap",
+            "offset": 0,
+            "slot": "101",
+            "type": "t_array(t_uint256)48_storage",
+            "contract": "ERC20Bridge",
+            "src": "contracts/ERC20Bridge.sol:37"
+          },
+          {
+            "label": "sequence",
+            "offset": 0,
+            "slot": "149",
+            "type": "t_uint256",
+            "contract": "MezoBridge",
+            "src": "contracts/MezoBridge.sol:18"
+          }
+        ],
+        "types": {
+          "t_address": {
+            "label": "address",
+            "numberOfBytes": "20"
+          },
+          "t_bool": {
+            "label": "bool",
+            "numberOfBytes": "1"
+          },
+          "t_struct(InitializableStorage)467_storage": {
+            "label": "struct Initializable.InitializableStorage",
+            "members": [
+              {
+                "label": "_initialized",
+                "type": "t_uint64",
+                "offset": 0,
+                "slot": "0"
+              },
+              {
+                "label": "_initializing",
+                "type": "t_bool",
+                "offset": 8,
+                "slot": "0"
+              }
+            ],
+            "numberOfBytes": "32"
+          },
+          "t_struct(Ownable2StepStorage)376_storage": {
+            "label": "struct Ownable2StepUpgradeable.Ownable2StepStorage",
+            "members": [
+              {
+                "label": "_pendingOwner",
+                "type": "t_address",
+                "offset": 0,
+                "slot": "0"
+              }
+            ],
+            "numberOfBytes": "32"
+          },
+          "t_struct(OwnableStorage)417_storage": {
+            "label": "struct OwnableUpgradeable.OwnableStorage",
+            "members": [
+              {
+                "label": "_owner",
+                "type": "t_address",
+                "offset": 0,
+                "slot": "0"
+              }
+            ],
+            "numberOfBytes": "32"
+          },
+          "t_struct(ReentrancyGuardStorage)539_storage": {
+            "label": "struct ReentrancyGuardUpgradeable.ReentrancyGuardStorage",
+            "members": [
+              {
+                "label": "_status",
+                "type": "t_uint256",
+                "offset": 0,
+                "slot": "0"
+              }
+            ],
+            "numberOfBytes": "32"
+          },
+          "t_uint256": {
+            "label": "uint256",
+            "numberOfBytes": "32"
+          },
+          "t_uint64": {
+            "label": "uint64",
+            "numberOfBytes": "8"
+          },
+          "t_array(t_uint256)47_storage": {
+            "label": "uint256[47]",
+            "numberOfBytes": "1504"
+          },
+          "t_array(t_uint256)48_storage": {
+            "label": "uint256[48]",
+            "numberOfBytes": "1536"
+          },
+          "t_contract(IBridge)3081": {
+            "label": "contract IBridge",
+            "numberOfBytes": "20"
+          },
+          "t_contract(ITBTCVault)3101": {
+            "label": "contract ITBTCVault",
+            "numberOfBytes": "20"
+          },
+          "t_enum(BTCDepositState)8036": {
+            "label": "enum BitcoinBridge.BTCDepositState",
+            "members": ["Unknown", "Initialized", "Finalized"],
+            "numberOfBytes": "1"
+          },
+          "t_mapping(t_address,t_uint256)": {
+            "label": "mapping(address => uint256)",
+            "numberOfBytes": "32"
+          },
+          "t_mapping(t_uint256,t_enum(BTCDepositState)8036)": {
+            "label": "mapping(uint256 => enum BitcoinBridge.BTCDepositState)",
+            "numberOfBytes": "32"
+          }
+        },
+        "namespaces": {
+          "erc7201:openzeppelin.storage.ReentrancyGuard": [
+            {
+              "contract": "ReentrancyGuardUpgradeable",
+              "label": "_status",
+              "type": "t_uint256",
+              "src": "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol:40",
+              "offset": 0,
+              "slot": "0"
+            }
+          ],
+          "erc7201:openzeppelin.storage.Ownable2Step": [
+            {
+              "contract": "Ownable2StepUpgradeable",
+              "label": "_pendingOwner",
+              "type": "t_address",
+              "src": "@openzeppelin/contracts-upgradeable/access/Ownable2StepUpgradeable.sol:23",
+              "offset": 0,
+              "slot": "0"
+            }
+          ],
+          "erc7201:openzeppelin.storage.Ownable": [
+            {
+              "contract": "OwnableUpgradeable",
+              "label": "_owner",
+              "type": "t_address",
+              "src": "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol:24",
+              "offset": 0,
+              "slot": "0"
+            }
+          ],
+          "erc7201:openzeppelin.storage.Initializable": [
+            {
+              "contract": "Initializable",
+              "label": "_initialized",
+              "type": "t_uint64",
+              "src": "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol:69",
+              "offset": 0,
+              "slot": "0"
+            },
+            {
+              "contract": "Initializable",
+              "label": "_initializing",
+              "type": "t_bool",
+              "src": "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol:73",
+              "offset": 8,
+              "slot": "0"
+            }
+          ]
+        }
+      }
+    }
+  }
+}
