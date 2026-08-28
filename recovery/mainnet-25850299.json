@@ -38,7 +38,7 @@
       "depositor": "0x950D988208628F1dDb6C63aC6b1F867EC8ED6a1E",
       "stbtcBalanceWei": "387610329704770866",
       "activeDebtWei": "384455402254823538",
-      "depositIds": ["108", "113", "114", "105"]
+      "depositIds": ["105", "108", "113", "114"]
     },
     {
       "depositor": "0x6EA70C9805a8b4C7A782caD2641D35f238Ef3513",

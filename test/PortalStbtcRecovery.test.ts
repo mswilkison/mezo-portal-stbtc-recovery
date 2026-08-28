@@ -31,6 +31,7 @@ const SKIP_REASON_DEPOSIT_NOT_FOUND = 0
 const SKIP_REASON_DEPOSIT_MIGRATING = 1
 const SKIP_REASON_DEBT_ALREADY_REPAID = 2
 const SKIP_REASON_UNDERCOLLATERALIZED = 3
+const SKIP_REASON_RECEIPT_HOLDER_WOULD_BE_STRANDED = 4
 
 const abiCoder = ethers.AbiCoder.defaultAbiCoder()
 
@@ -190,7 +191,9 @@ async function deployFixture() {
 
   await tbtc.transfer(portalAddress, FIRST_BALANCE + SECOND_BALANCE)
 
-  await stbtc.updateDebtAllowance(portalAddress, TOTAL_DEBT)
+  // Headroom above TOTAL_DEBT lets tests mint extra stBTC to model a
+  // depositor acquiring receipt tokens before execution.
+  await stbtc.updateDebtAllowance(portalAddress, TOTAL_DEBT * 2n)
   await network.provider.send("hardhat_setBalance", [
     portalAddress,
     ethers.toBeHex(ethers.parseEther("1")),
@@ -209,17 +212,23 @@ async function deployFixture() {
 
   await stbtc.connect(receiptPayer).approve(portalAddress, RECOVERY_AMOUNT)
 
+  const depositorAddress = await depositor.getAddress()
   const settlements = [
     {
-      depositor: await depositor.getAddress(),
+      depositor: depositorAddress,
       depositId: 1n,
       amount: FIRST_DEBT,
     },
     {
-      depositor: await depositor.getAddress(),
+      depositor: depositorAddress,
       depositId: 2n,
       amount: SECOND_SETTLEMENT,
     },
+  ]
+  // The reviewed active-deposit context for the stranding guard, mirroring
+  // the manifest's depositorActiveDepositIds.
+  const depositorContexts = [
+    { depositor: depositorAddress, activeDepositIds: [1n, 2n] },
   ]
 
   const Recovery = await ethers.getContractFactory("PortalStbtcRecovery")
@@ -266,12 +275,15 @@ async function deployFixture() {
     recoveryImplementation,
     proxyAdminInterface,
     settlements,
+    depositorContexts,
   }
 }
 
 type Fixture = Awaited<ReturnType<typeof deployFixture>>
 
 type Settlements = Fixture["settlements"]
+
+type DepositorContexts = Fixture["depositorContexts"]
 
 async function recoveryImmutableValues(
   fixture: Fixture,
@@ -283,8 +295,26 @@ async function recoveryImmutableValues(
     COLLATERAL_RECIPIENT: await fixture.collateralRecipient.getAddress(),
     EXPECTED_TBTC: fixture.tbtcAddress,
     EXPECTED_RECEIPT_TOKEN: fixture.stbtcAddress,
-    EXPECTED_RECOVERY_AMOUNT: RECOVERY_AMOUNT,
+    EXPECTED_MAX_RECOVERY_AMOUNT: RECOVERY_AMOUNT,
   }
+}
+
+// Mints extra stBTC to an address the way the Portal would, modelling a
+// depositor acquiring receipt tokens (or receiving a donation) between
+// manifest review and batch execution.
+async function mintStbtcTo(
+  fixture: Fixture,
+  recipient: string,
+  amount: bigint,
+): Promise<void> {
+  await network.provider.send("hardhat_impersonateAccount", [
+    fixture.portalAddress,
+  ])
+  const portalSigner = await ethers.getSigner(fixture.portalAddress)
+  await fixture.stbtc.connect(portalSigner).mintReceipt(recipient, amount)
+  await network.provider.send("hardhat_stopImpersonatingAccount", [
+    fixture.portalAddress,
+  ])
 }
 
 async function scheduleRecovery(
@@ -292,10 +322,11 @@ async function scheduleRecovery(
   settlements: Settlements,
   salt: string,
   implementation?: string,
+  depositorContexts?: DepositorContexts,
 ) {
   const recoveryCall = fixture.Recovery.interface.encodeFunctionData(
     "recoverTbtc",
-    [settlements],
+    [settlements, depositorContexts ?? fixture.depositorContexts],
   )
   const installAndRecover = fixture.proxyAdminInterface.encodeFunctionData(
     "upgradeAndCall",
@@ -469,34 +500,29 @@ describe("PortalStbtcRecovery", () => {
       )
     })
 
-    it("atomically preserves debt when a selected depositor receives stBTC", async () => {
+    it("absorbs a small stBTC acquisition into the owner's unsettled debt", async () => {
       const fixture = await loadFixture(deployFixture)
       const payer = await fixture.receiptPayer.getAddress()
       const recipient = await fixture.collateralRecipient.getAddress()
       const depositor = await fixture.depositor.getAddress()
-      const racedBalance = ethers.parseEther("0.1")
-      const recoveredAmount = RECOVERY_AMOUNT - racedBalance
+      const acquired = ethers.parseEther("0.1")
 
-      // Models a transfer after the execute-stage preflight but before the
-      // governance batch is mined. The contract must enforce the bound using
-      // the balance in the execution transaction itself.
-      await fixture.stbtc
-        .connect(fixture.otherHolder)
-        .transfer(depositor, racedBalance)
+      // The owner's total debt (1.3) minus the requested settlement (1.0)
+      // leaves 0.3 of unsettled debt — more than the acquired balance, so
+      // the per-owner guard must not clamp anything. (A per-entry guard
+      // would wrongly deduct the balance from each deposit independently.)
+      await mintStbtcTo(fixture, depositor, acquired)
 
       const recoveryAtPortal = fixture.Recovery.attach(fixture.portalAddress)
       const transaction = await scheduleRecovery(
         fixture,
         fixture.settlements,
-        ethers.id("live-no-stranding-stbtc-recovery"),
+        ethers.id("absorbed-acquisition-stbtc-recovery"),
       )
 
       await expect(transaction)
-        .to.emit(recoveryAtPortal, "ReceiptDebtSettled")
-        .withArgs(depositor, fixture.tbtcAddress, 1n, FIRST_DEBT - racedBalance)
-      await expect(transaction)
         .to.emit(recoveryAtPortal, "StbtcRecoveryCompleted")
-        .withArgs(payer, recipient, recoveredAmount)
+        .withArgs(payer, recipient, RECOVERY_AMOUNT)
 
       const firstDeposit = await fixture.portal.deposits(
         depositor,
@@ -510,21 +536,121 @@ describe("PortalStbtcRecovery", () => {
       )
       const remainingDebt =
         BigInt(firstDeposit.receiptMinted) + BigInt(secondDeposit.receiptMinted)
+      expect(remainingDebt).to.equal(TOTAL_DEBT - RECOVERY_AMOUNT)
+      expect(remainingDebt).to.be.greaterThanOrEqual(acquired)
+      expect(await fixture.stbtc.balanceOf(depositor)).to.equal(acquired)
+      expect(await fixture.tbtc.balanceOf(recipient)).to.equal(RECOVERY_AMOUNT)
+    })
 
-      expect(await fixture.stbtc.balanceOf(depositor)).to.equal(racedBalance)
-      expect(remainingDebt).to.be.greaterThanOrEqual(racedBalance)
-      expect(firstDeposit.receiptMinted).to.equal(racedBalance)
-      expect(secondDeposit.receiptMinted).to.equal(
-        SECOND_DEBT - SECOND_SETTLEMENT,
+    it("clamps per owner, not per entry, when holdings exceed the unsettled debt", async () => {
+      const fixture = await loadFixture(deployFixture)
+      const payer = await fixture.receiptPayer.getAddress()
+      const recipient = await fixture.collateralRecipient.getAddress()
+      const depositor = await fixture.depositor.getAddress()
+      const acquired = ethers.parseEther("0.4")
+      // Owner capacity = total debt (1.3) - balance (0.4) = 0.9: deposit 1
+      // settles in full (0.7) and deposit 2 is clamped once, to 0.2. A
+      // per-entry guard would instead deduct 0.4 from both entries and
+      // settle only 0.6 — an under-recovery amplification.
+      const expectedSettled = TOTAL_DEBT - acquired
+
+      await mintStbtcTo(fixture, depositor, acquired)
+
+      const recoveryAtPortal = fixture.Recovery.attach(fixture.portalAddress)
+      const transaction = await scheduleRecovery(
+        fixture,
+        fixture.settlements,
+        ethers.id("owner-clamped-stbtc-recovery"),
       )
-      expect(await fixture.stbtc.balanceOf(payer)).to.equal(racedBalance)
-      expect(await fixture.tbtc.balanceOf(recipient)).to.equal(recoveredAmount)
-      expect(
-        await fixture.stbtc.allowance(payer, fixture.portalAddress),
-      ).to.equal(racedBalance)
+
+      await expect(transaction)
+        .to.emit(recoveryAtPortal, "ReceiptDebtSettled")
+        .withArgs(depositor, fixture.tbtcAddress, 1n, FIRST_DEBT)
+      await expect(transaction)
+        .to.emit(recoveryAtPortal, "ReceiptDebtSettled")
+        .withArgs(
+          depositor,
+          fixture.tbtcAddress,
+          2n,
+          expectedSettled - FIRST_DEBT,
+        )
+      await expect(transaction)
+        .to.emit(recoveryAtPortal, "StbtcRecoveryCompleted")
+        .withArgs(payer, recipient, expectedSettled)
+
+      const firstDeposit = await fixture.portal.deposits(
+        depositor,
+        fixture.tbtcAddress,
+        1n,
+      )
+      const secondDeposit = await fixture.portal.deposits(
+        depositor,
+        fixture.tbtcAddress,
+        2n,
+      )
+      const remainingDebt =
+        BigInt(firstDeposit.receiptMinted) + BigInt(secondDeposit.receiptMinted)
+      // The guard's invariant is exact: remaining debt equals the owner's
+      // holdings, so every token they hold stays redeemable.
+      expect(remainingDebt).to.equal(acquired)
+      expect(await fixture.stbtc.balanceOf(depositor)).to.equal(acquired)
+      expect(await fixture.stbtc.balanceOf(payer)).to.equal(
+        RECOVERY_AMOUNT - expectedSettled,
+      )
+      expect(await fixture.tbtc.balanceOf(recipient)).to.equal(expectedSettled)
       expect(
         await upgrades.erc1967.getImplementationAddress(fixture.portalAddress),
       ).to.equal(fixture.originalImplementation)
+    })
+
+    it("emits the stranding skip when the owner's capacity is exhausted", async () => {
+      const fixture = await loadFixture(deployFixture)
+      const payer = await fixture.receiptPayer.getAddress()
+      const recipient = await fixture.collateralRecipient.getAddress()
+      const depositor = await fixture.depositor.getAddress()
+      // Capacity = total debt (1.3) - holdings (0.6) = 0.7: deposit 1
+      // consumes all of it and deposit 2 must be skipped with the dedicated
+      // stranding reason, not silently dropped or mislabeled.
+      const acquired = ethers.parseEther("0.6")
+
+      await mintStbtcTo(fixture, depositor, acquired)
+
+      const recoveryAtPortal = fixture.Recovery.attach(fixture.portalAddress)
+      const transaction = await scheduleRecovery(
+        fixture,
+        fixture.settlements,
+        ethers.id("stranding-skip-stbtc-recovery"),
+      )
+
+      await expect(transaction)
+        .to.emit(recoveryAtPortal, "ReceiptDebtSettled")
+        .withArgs(depositor, fixture.tbtcAddress, 1n, FIRST_DEBT)
+      await expect(transaction)
+        .to.emit(recoveryAtPortal, "ReceiptDebtSettlementSkipped")
+        .withArgs(
+          depositor,
+          fixture.tbtcAddress,
+          2n,
+          SKIP_REASON_RECEIPT_HOLDER_WOULD_BE_STRANDED,
+        )
+      await expect(transaction)
+        .to.emit(recoveryAtPortal, "StbtcRecoveryCompleted")
+        .withArgs(payer, recipient, FIRST_DEBT)
+
+      const firstDeposit = await fixture.portal.deposits(
+        depositor,
+        fixture.tbtcAddress,
+        1n,
+      )
+      const secondDeposit = await fixture.portal.deposits(
+        depositor,
+        fixture.tbtcAddress,
+        2n,
+      )
+      const remainingDebt =
+        BigInt(firstDeposit.receiptMinted) + BigInt(secondDeposit.receiptMinted)
+      expect(remainingDebt).to.equal(acquired)
+      expect(await fixture.stbtc.balanceOf(depositor)).to.equal(acquired)
     })
 
     it("skips a deposit repaid in full and settles the remainder", async () => {
@@ -689,16 +815,55 @@ describe("PortalStbtcRecovery", () => {
       expect(secondDeposit.receiptMinted).to.equal(SECOND_DEBT)
       expect(secondDeposit.balance).to.equal(SECOND_DEBT - 1n)
     })
+
+    it("settles a smaller reviewed round below the immutable maximum", async () => {
+      const fixture = await loadFixture(deployFixture)
+      const payer = await fixture.receiptPayer.getAddress()
+      const recipient = await fixture.collateralRecipient.getAddress()
+      const depositor = await fixture.depositor.getAddress()
+
+      // A residual round reuses the deployed implementation with fresh,
+      // smaller calldata; the immutable amount is an upper bound, not an
+      // exact total.
+      const settlements = [fixture.settlements[0]]
+
+      const recoveryAtPortal = fixture.Recovery.attach(fixture.portalAddress)
+      const transaction = await scheduleRecovery(
+        fixture,
+        settlements,
+        ethers.id("residual-round-stbtc-recovery"),
+      )
+
+      await expect(transaction)
+        .to.emit(recoveryAtPortal, "StbtcRecoveryCompleted")
+        .withArgs(payer, recipient, FIRST_DEBT)
+
+      expect(await fixture.tbtc.balanceOf(recipient)).to.equal(FIRST_DEBT)
+      expect(await fixture.stbtc.balanceOf(payer)).to.equal(
+        RECOVERY_AMOUNT - FIRST_DEBT,
+      )
+      // The unused approval remains for the payer to revoke or roll into a
+      // follow-up round.
+      expect(
+        await fixture.stbtc.allowance(payer, fixture.portalAddress),
+      ).to.equal(RECOVERY_AMOUNT - FIRST_DEBT)
+      const secondDeposit = await fixture.portal.deposits(
+        depositor,
+        fixture.tbtcAddress,
+        2n,
+      )
+      expect(secondDeposit.receiptMinted).to.equal(SECOND_DEBT)
+    })
   })
 
   describe("atomic failure", () => {
-    it("rolls back the upgrade and all state if the requested total is wrong", async () => {
+    it("rolls back everything if the requested total exceeds the maximum", async () => {
       const fixture = await loadFixture(deployFixture)
       const badSettlements = [
         fixture.settlements[0],
         {
           ...fixture.settlements[1],
-          amount: SECOND_SETTLEMENT - 1n,
+          amount: SECOND_SETTLEMENT + 1n,
         },
       ]
 
@@ -710,7 +875,7 @@ describe("PortalStbtcRecovery", () => {
 
       await expect(transaction).to.be.revertedWithCustomError(
         fixture.Recovery,
-        "IncorrectSettlementAmount",
+        "SettlementTotalExceedsMaximum",
       )
 
       expect(
@@ -763,6 +928,35 @@ describe("PortalStbtcRecovery", () => {
       ).to.equal(RECOVERY_AMOUNT)
     })
 
+    it("reverts when holdings cover every selected owner's entire debt", async () => {
+      const fixture = await loadFixture(deployFixture)
+      const depositor = await fixture.depositor.getAddress()
+
+      // The owner holds as much stBTC as their whole active debt: settling
+      // anything would strand them, so every entry skips and the batch
+      // reverts rather than settling zero. The operation stays retryable
+      // and the depositor retains full self-repayment capacity.
+      await mintStbtcTo(fixture, depositor, TOTAL_DEBT)
+
+      const transaction = scheduleRecovery(
+        fixture,
+        fixture.settlements,
+        ethers.id("fully-held-stbtc-recovery"),
+      )
+
+      await expect(transaction).to.be.revertedWithCustomError(
+        fixture.Recovery,
+        "NothingSettled",
+      )
+      expect(
+        await upgrades.erc1967.getImplementationAddress(fixture.portalAddress),
+      ).to.equal(fixture.originalImplementation)
+      expect(await fixture.stbtc.balanceOf(depositor)).to.equal(TOTAL_DEBT)
+      expect(
+        await fixture.stbtc.balanceOf(await fixture.receiptPayer.getAddress()),
+      ).to.equal(RECOVERY_AMOUNT)
+    })
+
     it("reverts on an empty settlement list", async () => {
       const fixture = await loadFixture(deployFixture)
 
@@ -781,6 +975,71 @@ describe("PortalStbtcRecovery", () => {
       await expect(
         scheduleRecovery(fixture, settlements, ethers.id("zero-amount")),
       ).to.be.revertedWithCustomError(fixture.Recovery, "ZeroSettlementAmount")
+    })
+
+    it("reverts when a settlement has no depositor context", async () => {
+      const fixture = await loadFixture(deployFixture)
+
+      await expect(
+        scheduleRecovery(
+          fixture,
+          fixture.settlements,
+          ethers.id("missing-context-stbtc-recovery"),
+          undefined,
+          [],
+        ),
+      ).to.be.revertedWithCustomError(
+        fixture.Recovery,
+        "MissingDepositorContext",
+      )
+    })
+
+    it("reverts on duplicated depositor contexts", async () => {
+      const fixture = await loadFixture(deployFixture)
+
+      await expect(
+        scheduleRecovery(
+          fixture,
+          fixture.settlements,
+          ethers.id("duplicate-context-stbtc-recovery"),
+          undefined,
+          [fixture.depositorContexts[0], fixture.depositorContexts[0]],
+        ),
+      ).to.be.revertedWithCustomError(
+        fixture.Recovery,
+        "DuplicateDepositorContext",
+      )
+    })
+
+    it("reverts on unsorted or empty context deposit ids", async () => {
+      const fixture = await loadFixture(deployFixture)
+      const depositor = await fixture.depositor.getAddress()
+
+      await expect(
+        scheduleRecovery(
+          fixture,
+          fixture.settlements,
+          ethers.id("unsorted-context-stbtc-recovery"),
+          undefined,
+          [{ depositor, activeDepositIds: [2n, 1n] }],
+        ),
+      ).to.be.revertedWithCustomError(
+        fixture.Recovery,
+        "InvalidDepositorContext",
+      )
+
+      await expect(
+        scheduleRecovery(
+          fixture,
+          fixture.settlements,
+          ethers.id("empty-context-stbtc-recovery"),
+          undefined,
+          [{ depositor, activeDepositIds: [] }],
+        ),
+      ).to.be.revertedWithCustomError(
+        fixture.Recovery,
+        "InvalidDepositorContext",
+      )
     })
 
     it("blocks reentrancy from the receipt token", async () => {
@@ -844,7 +1103,7 @@ describe("PortalStbtcRecovery", () => {
       const standalone = fixture.Recovery.attach(fixture.recoveryImplementation)
 
       await expect(
-        standalone.recoverTbtc(fixture.settlements),
+        standalone.recoverTbtc(fixture.settlements, fixture.depositorContexts),
       ).to.be.revertedWithCustomError(fixture.Recovery, "UnexpectedPortal")
     })
 
@@ -876,7 +1135,7 @@ describe("PortalStbtcRecovery", () => {
       await expect(
         recoveryAtPortal
           .connect(fixture.governance)
-          .recoverTbtc(fixture.settlements),
+          .recoverTbtc(fixture.settlements, fixture.depositorContexts),
       ).to.be.revertedWithCustomError(
         fixture.Recovery,
         "UnauthorizedRecoveryCaller",

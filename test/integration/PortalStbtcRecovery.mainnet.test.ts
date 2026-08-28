@@ -2,7 +2,10 @@ import { expect } from "chai"
 import { ethers, network, upgrades } from "hardhat"
 import { time } from "@nomicfoundation/hardhat-network-helpers"
 import { recoveryManifest as manifest } from "../../helpers/recovery-manifest"
-import { recomputeActiveReceiptDebt } from "../../helpers/recovery-preflight"
+import {
+  buildRecoveryBatchPayloads,
+  recomputeActiveReceiptDebt,
+} from "../../helpers/recovery-preflight"
 
 const describeFn =
   process.env.NODE_ENV === "recovery-fork-test" ? describe : describe.skip
@@ -81,11 +84,12 @@ describeFn("PortalStbtcRecovery - mainnet fork", function () {
     expect(await stbtc.balanceOf(addresses.receiptPayer)).to.equal(
       recoveryAmount,
     )
-    const feeInfoObserved = (
-      manifest.observedState as { feeInfo: { totalMintedWei: string } }
-    ).feeInfo
+    expect(
+      manifest.observedState?.feeInfo?.totalMintedWei,
+      "manifest is missing observedState.feeInfo.totalMintedWei",
+    ).to.be.a("string")
     expect(feeBefore.totalMinted).to.equal(
-      BigInt(feeInfoObserved.totalMintedWei),
+      BigInt(manifest.observedState.feeInfo.totalMintedWei),
     )
 
     // The settlement must not strand a third-party depositor: nobody whose
@@ -126,11 +130,17 @@ describeFn("PortalStbtcRecovery - mainnet fork", function () {
         const holderBalance = BigInt(await stbtc.balanceOf(depositor))
         const { totalDebt: liveActiveDebt } = await recomputeActiveReceiptDebt(
           entry.activeDepositIds,
-          async (depositId) =>
-            BigInt(
-              (await portal.deposits(depositor, addresses.tbtc, depositId))
-                .receiptMinted,
-            ),
+          async (depositId) => {
+            const deposit = await portal.deposits(
+              depositor,
+              addresses.tbtc,
+              depositId,
+            )
+            return {
+              receiptMintedWei: BigInt(deposit.receiptMinted),
+              migrating: Number(deposit.tbtcMigrationState) !== 0,
+            }
+          },
         )
 
         expect(holderBalance, `${depositor} stBTC balance`).to.equal(
@@ -172,26 +182,23 @@ describeFn("PortalStbtcRecovery - mainnet fork", function () {
     const recoveryCode = await ethers.provider.getCode(recoveryImplementation)
     expect(ethers.dataLength(recoveryCode)).to.be.lessThanOrEqual(24_576)
 
+    // The reviewed per-owner context for the contract's stranding guard,
+    // straight from the manifest's active-deposit id lists.
+    const depositorContexts = depositorEntries.map(([depositor, entry]) => ({
+      depositor,
+      activeDepositIds: entry.activeDepositIds.map((id) => BigInt(id)),
+    }))
     const recoveryCall = Recovery.interface.encodeFunctionData("recoverTbtc", [
       settlements,
+      depositorContexts,
     ])
-    const proxyAdminInterface = new ethers.Interface([
-      "function upgradeAndCall(address proxy,address implementation,bytes data) payable",
-    ])
-    const targets = [addresses.proxyAdmin, addresses.proxyAdmin]
-    const values = [0, 0]
-    const payloads = [
-      proxyAdminInterface.encodeFunctionData("upgradeAndCall", [
-        addresses.portal,
-        recoveryImplementation,
-        recoveryCall,
-      ]),
-      proxyAdminInterface.encodeFunctionData("upgradeAndCall", [
-        addresses.portal,
-        addresses.originalImplementation,
-        "0x",
-      ]),
-    ]
+    const { targets, values, payloads } = buildRecoveryBatchPayloads({
+      portal: addresses.portal,
+      proxyAdmin: addresses.proxyAdmin,
+      recoveryImplementation,
+      originalImplementation: addresses.originalImplementation,
+      recoverCalldata: recoveryCall,
+    })
     const predecessor = ethers.ZeroHash
     const salt = ethers.id("threshold-stbtc-recovery-mainnet-fork")
 
@@ -287,11 +294,17 @@ describeFn("PortalStbtcRecovery - mainnet fork", function () {
         const holderBalance = BigInt(await stbtc.balanceOf(depositor))
         const { totalDebt: liveDebtAfter } = await recomputeActiveReceiptDebt(
           entry.activeDepositIds,
-          async (depositId) =>
-            BigInt(
-              (await portal.deposits(depositor, addresses.tbtc, depositId))
-                .receiptMinted,
-            ),
+          async (depositId) => {
+            const deposit = await portal.deposits(
+              depositor,
+              addresses.tbtc,
+              depositId,
+            )
+            return {
+              receiptMintedWei: BigInt(deposit.receiptMinted),
+              migrating: Number(deposit.tbtcMigrationState) !== 0,
+            }
+          },
         )
         expect(
           holderBalance,

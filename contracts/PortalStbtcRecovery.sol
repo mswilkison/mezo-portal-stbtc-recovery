@@ -64,6 +64,18 @@ contract PortalStbtcRecovery is Ownable2StepUpgradeable {
         uint96 amount;
     }
 
+    /// @notice The reviewed set of deposits with nonzero receipt debt for one
+    ///         settled depositor. The stranding guard sums this depositor's
+    ///         live debt over these ids, so every stBTC token they hold stays
+    ///         redeemable against debt they actually retain. Ids must be
+    ///         strictly increasing. An id that no longer carries debt simply
+    ///         contributes zero, and an omitted id only makes the guard more
+    ///         conservative.
+    struct DepositorContext {
+        address depositor;
+        uint256[] activeDepositIds;
+    }
+
     /// @notice Reason a manifest settlement entry was skipped instead of
     ///         settled. Entries are skipped, not reverted, so that ordinary
     ///         third-party deposit activity between manifest review and
@@ -110,7 +122,13 @@ contract PortalStbtcRecovery is Ownable2StepUpgradeable {
     address public immutable COLLATERAL_RECIPIENT;
     address public immutable EXPECTED_TBTC;
     address public immutable EXPECTED_RECEIPT_TOKEN;
-    uint96 public immutable EXPECTED_RECOVERY_AMOUNT;
+    /// @notice Upper bound on the total receipt debt one `recoverTbtc` call
+    ///         may request. The reviewed calldata fixes each round's exact
+    ///         entries; capping (rather than pinning) the total lets a
+    ///         residual round — after drift clamped an earlier round — reuse
+    ///         this same reviewed implementation with fresh calldata instead
+    ///         of redeploying for every residue.
+    uint96 public immutable EXPECTED_MAX_RECOVERY_AMOUNT;
 
     uint256 private constant NOT_ENTERED = 0;
     uint256 private constant ENTERED = 1;
@@ -142,8 +160,11 @@ contract PortalStbtcRecovery is Ownable2StepUpgradeable {
     error UnexpectedReceiptToken(address token);
     error UnexpectedTokenDecimals(uint8 tbtcDecimals, uint8 receiptDecimals);
     error EmptySettlements();
-    error IncorrectSettlementAmount(uint256 expected, uint256 actual);
+    error SettlementTotalExceedsMaximum(uint256 maximum, uint256 requested);
     error ZeroSettlementAmount(address depositor, uint256 depositId);
+    error MissingDepositorContext(address depositor);
+    error DuplicateDepositorContext(address depositor);
+    error InvalidDepositorContext(address depositor);
     error NothingSettled();
     error ReentrancyGuardReentrantCall();
 
@@ -165,7 +186,7 @@ contract PortalStbtcRecovery is Ownable2StepUpgradeable {
         address collateralRecipient,
         address expectedTbtc,
         address expectedReceiptToken,
-        uint96 expectedRecoveryAmount
+        uint96 expectedMaxRecoveryAmount
     ) {
         if (
             expectedPortal == address(0) ||
@@ -174,7 +195,7 @@ contract PortalStbtcRecovery is Ownable2StepUpgradeable {
             collateralRecipient == address(0) ||
             expectedTbtc == address(0) ||
             expectedReceiptToken == address(0) ||
-            expectedRecoveryAmount == 0
+            expectedMaxRecoveryAmount == 0
         ) {
             revert ZeroConfigurationValue();
         }
@@ -185,34 +206,44 @@ contract PortalStbtcRecovery is Ownable2StepUpgradeable {
         COLLATERAL_RECIPIENT = collateralRecipient;
         EXPECTED_TBTC = expectedTbtc;
         EXPECTED_RECEIPT_TOKEN = expectedReceiptToken;
-        EXPECTED_RECOVERY_AMOUNT = expectedRecoveryAmount;
+        EXPECTED_MAX_RECOVERY_AMOUNT = expectedMaxRecoveryAmount;
 
         _disableInitializers();
     }
 
-    /// @notice Burns up to the configured stBTC amount, releases the same
-    ///         amount of tBTC, and reduces selected deposits' collateral and
-    ///         receipt debt one-for-one.
+    /// @notice Burns up to the configured maximum stBTC amount, releases the
+    ///         same amount of tBTC, and reduces selected deposits' collateral
+    ///         and receipt debt one-for-one.
     /// @dev Can only run as the call embedded in ProxyAdmin.upgradeAndCall.
-    ///      The stBTC holder must first approve the Portal proxy for exactly
-    ///      the configured recovery amount. Every state change and token
-    ///      transfer reverts together if any check fails.
+    ///      The stBTC holder must first approve the Portal proxy for the
+    ///      round's settlement total. Every state change and token transfer
+    ///      reverts together if any check fails.
     ///
-    ///      The requested settlement entries must total exactly the immutable
-    ///      recovery amount, so the reviewed calldata cannot change. Execution
-    ///      is drift-tolerant within that reviewed selection: a deposit whose
+    ///      The requested settlement entries may not total more than the
+    ///      immutable maximum, and the timelock batch commits their exact
+    ///      contents, so only reviewed calldata can execute. Execution is
+    ///      drift-tolerant within that reviewed selection: a deposit whose
     ///      state moved between review and execution (repaid, withdrawn,
     ///      migrating, or under-collateralized) is skipped or settled up to
     ///      its remaining debt rather than reverting the batch, because a
     ///      revert here would let any third-party depositor veto the whole
-    ///      timelock operation with a 1 wei repayment. The amount pulled,
-    ///      burned, and released always equals the debt actually settled and
-    ///      never exceeds the immutable recovery amount. Each deposit also
-    ///      retains at least its owner's live stBTC balance, so a receipt-token
-    ///      transfer immediately before execution can clamp the recovery but
-    ///      cannot strand that owner without debt they can repay.
+    ///      timelock operation with a 1 wei repayment.
+    ///
+    ///      Stranding guard: the normal Portal repayment path is keyed to the
+    ///      deposit owner, so every stBTC token an owner holds needs matching
+    ///      receipt debt somewhere in their deposits to stay redeemable. For
+    ///      each settled owner, this call reads their live stBTC balance once
+    ///      and their live debt across the reviewed `depositorContexts` id
+    ///      list, and caps that owner's total settlement at debt minus
+    ///      balance. A receipt-token transfer to a selected owner immediately
+    ///      before execution can therefore only reduce the recovered amount —
+    ///      first absorbed by the owner's unselected debt, never multiplied
+    ///      per entry — and cannot leave the owner with unredeemable stBTC.
+    ///      The amount pulled, burned, and released always equals the debt
+    ///      actually settled and never exceeds the immutable maximum.
     function recoverTbtc(
-        ReceiptDebtSettlement[] calldata settlements
+        ReceiptDebtSettlement[] calldata settlements,
+        DepositorContext[] calldata depositorContexts
     ) external nonReentrant returns (uint256 totalSettled) {
         if (address(this) != EXPECTED_PORTAL) {
             revert UnexpectedPortal(address(this));
@@ -243,6 +274,12 @@ contract PortalStbtcRecovery is Ownable2StepUpgradeable {
             revert UnexpectedTokenDecimals(tbtcDecimals, receiptDecimals);
         }
 
+        uint256[] memory ownerSettleable = _computeOwnerSettleable(
+            depositorContexts,
+            token,
+            receiptToken
+        );
+
         uint256 requestedTotal = 0;
         for (uint256 i = 0; i < settlements.length; i++) {
             ReceiptDebtSettlement calldata settlement = settlements[i];
@@ -254,6 +291,11 @@ contract PortalStbtcRecovery is Ownable2StepUpgradeable {
                 );
             }
             requestedTotal += settlement.amount;
+
+            uint256 contextIndex = _findDepositorContext(
+                depositorContexts,
+                settlement.depositor
+            );
 
             DepositInfo storage deposit = deposits[settlement.depositor][token][
                 settlement.depositId
@@ -291,11 +333,9 @@ contract PortalStbtcRecovery is Ownable2StepUpgradeable {
 
             _updateFee(deposit, token);
 
-            uint96 feeReserve = _adjustTokenDecimals(
-                receiptDecimals,
-                tbtcDecimals,
-                deposit.feeOwed
-            );
+            // tBTC and the receipt token are verified above to share
+            // decimals, so the owed fee reserves collateral one-for-one.
+            uint96 feeReserve = deposit.feeOwed;
 
             if (uint256(deposit.receiptMinted) + feeReserve > deposit.balance) {
                 emit ReceiptDebtSettlementSkipped(
@@ -307,25 +347,20 @@ contract PortalStbtcRecovery is Ownable2StepUpgradeable {
                 continue;
             }
 
-            // Settle up to the deposit's remaining debt. The skip check above
-            // guarantees receiptMinted + feeReserve <= balance, so the deposit
-            // stays fully collateralized (including its accrued fees) after
-            // both reductions.
+            // Settle up to the deposit's remaining debt and up to the owner's
+            // remaining non-stranding capacity. The skip check above
+            // guarantees receiptMinted + feeReserve <= balance, so the
+            // deposit stays fully collateralized (including its accrued
+            // fees) after both reductions.
             uint96 settleAmount = settlement.amount;
             if (settleAmount > deposit.receiptMinted) {
                 settleAmount = deposit.receiptMinted;
             }
+            if (settleAmount > ownerSettleable[contextIndex]) {
+                settleAmount = uint96(ownerSettleable[contextIndex]);
+            }
 
-            // The normal Portal repayment path is keyed by msg.sender, so an
-            // owner needs enough debt in one of their deposits to redeem every
-            // stBTC token they currently hold. This live balance check closes
-            // the preflight-to-execution race atomically. Reserving the full
-            // balance in each selected deposit is intentionally conservative:
-            // it does not rely on enumerating the owner's other deposits.
-            uint256 depositorReceiptBalance = IERC20(receiptToken).balanceOf(
-                settlement.depositor
-            );
-            if (depositorReceiptBalance >= deposit.receiptMinted) {
+            if (settleAmount == 0) {
                 emit ReceiptDebtSettlementSkipped(
                     settlement.depositor,
                     token,
@@ -335,11 +370,7 @@ contract PortalStbtcRecovery is Ownable2StepUpgradeable {
                 continue;
             }
 
-            uint96 maxNonStrandingSettlement = deposit.receiptMinted -
-                uint96(depositorReceiptBalance);
-            if (settleAmount > maxNonStrandingSettlement) {
-                settleAmount = maxNonStrandingSettlement;
-            }
+            ownerSettleable[contextIndex] -= settleAmount;
 
             deposit.balance -= settleAmount;
             deposit.receiptMinted -= settleAmount;
@@ -354,9 +385,9 @@ contract PortalStbtcRecovery is Ownable2StepUpgradeable {
             );
         }
 
-        if (requestedTotal != EXPECTED_RECOVERY_AMOUNT) {
-            revert IncorrectSettlementAmount(
-                EXPECTED_RECOVERY_AMOUNT,
+        if (requestedTotal > EXPECTED_MAX_RECOVERY_AMOUNT) {
+            revert SettlementTotalExceedsMaximum(
+                EXPECTED_MAX_RECOVERY_AMOUNT,
                 requestedTotal
             );
         }
@@ -378,6 +409,78 @@ contract PortalStbtcRecovery is Ownable2StepUpgradeable {
             COLLATERAL_RECIPIENT,
             totalSettled
         );
+    }
+
+    /// @dev For each reviewed depositor context, computes how much receipt
+    ///      debt may be settled for that owner without leaving their live
+    ///      stBTC balance unredeemable: the owner's live debt summed over
+    ///      their reviewed active deposit ids, minus their live receipt-token
+    ///      balance (floored at zero). Each owner's balance is read exactly
+    ///      once. Settling any of the owner's deposits reduces their total
+    ///      debt one-for-one, so decrementing this capacity per settlement
+    ///      keeps the invariant `remaining debt >= balance` exact. Debt on a
+    ///      deposit that entered tBTC migration is excluded, conservatively
+    ///      treating it as not repayable through the normal path.
+    function _computeOwnerSettleable(
+        DepositorContext[] calldata depositorContexts,
+        address token,
+        address receiptToken
+    ) internal view returns (uint256[] memory ownerSettleable) {
+        ownerSettleable = new uint256[](depositorContexts.length);
+
+        for (uint256 i = 0; i < depositorContexts.length; i++) {
+            DepositorContext calldata context = depositorContexts[i];
+
+            if (
+                context.depositor == address(0) ||
+                context.activeDepositIds.length == 0
+            ) {
+                revert InvalidDepositorContext(context.depositor);
+            }
+            for (uint256 j = 0; j < i; j++) {
+                if (depositorContexts[j].depositor == context.depositor) {
+                    revert DuplicateDepositorContext(context.depositor);
+                }
+            }
+
+            uint256 liveDebt = 0;
+            uint256 previousId = 0;
+            for (uint256 j = 0; j < context.activeDepositIds.length; j++) {
+                uint256 depositId = context.activeDepositIds[j];
+                if (j > 0 && depositId <= previousId) {
+                    revert InvalidDepositorContext(context.depositor);
+                }
+                previousId = depositId;
+
+                DepositInfo storage deposit = deposits[context.depositor][
+                    token
+                ][depositId];
+                if (
+                    deposit.tbtcMigrationState ==
+                    TbtcMigrationState.NotRequested
+                ) {
+                    liveDebt += deposit.receiptMinted;
+                }
+            }
+
+            uint256 balance = IERC20(receiptToken).balanceOf(context.depositor);
+            ownerSettleable[i] = liveDebt > balance ? liveDebt - balance : 0;
+        }
+    }
+
+    /// @dev Every settlement entry's depositor must have exactly one reviewed
+    ///      context; a missing context is a calldata construction error and
+    ///      reverts the batch.
+    function _findDepositorContext(
+        DepositorContext[] calldata depositorContexts,
+        address depositor
+    ) internal pure returns (uint256) {
+        for (uint256 i = 0; i < depositorContexts.length; i++) {
+            if (depositorContexts[i].depositor == depositor) {
+                return i;
+            }
+        }
+        revert MissingDepositorContext(depositor);
     }
 
     function _updateFee(DepositInfo storage deposit, address token) internal {
@@ -408,21 +511,5 @@ contract PortalStbtcRecovery is Ownable2StepUpgradeable {
     ) internal pure returns (uint96) {
         return
             uint96((uint256(integralDiff) * uint256(mintedAmount)) / 10 ** 18);
-    }
-
-    function _adjustTokenDecimals(
-        uint8 sourceDecimals,
-        uint8 targetDecimals,
-        uint96 amount
-    ) internal pure returns (uint96) {
-        if (sourceDecimals < targetDecimals) {
-            return uint96(amount * (10 ** (targetDecimals - sourceDecimals)));
-        }
-
-        if (sourceDecimals > targetDecimals) {
-            return uint96(amount / (10 ** (sourceDecimals - targetDecimals)));
-        }
-
-        return amount;
     }
 }

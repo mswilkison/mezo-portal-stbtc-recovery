@@ -16,7 +16,7 @@ export type RecoveryImmutableValues = {
   COLLATERAL_RECIPIENT: string
   EXPECTED_TBTC: string
   EXPECTED_RECEIPT_TOKEN: string
-  EXPECTED_RECOVERY_AMOUNT: bigint
+  EXPECTED_MAX_RECOVERY_AMOUNT: bigint
 }
 
 const IMMUTABLE_ABI_TYPES: Record<keyof RecoveryImmutableValues, string> = {
@@ -26,7 +26,7 @@ const IMMUTABLE_ABI_TYPES: Record<keyof RecoveryImmutableValues, string> = {
   COLLATERAL_RECIPIENT: "address",
   EXPECTED_TBTC: "address",
   EXPECTED_RECEIPT_TOKEN: "address",
-  EXPECTED_RECOVERY_AMOUNT: "uint96",
+  EXPECTED_MAX_RECOVERY_AMOUNT: "uint96",
 }
 
 /// Verifies that the runtime bytecode deployed at `address` is byte-for-byte
@@ -57,6 +57,19 @@ export async function verifyRecoveryBytecode(
   ].PortalStbtcRecovery.evm.deployedBytecode as {
     object: string
     immutableReferences?: Record<string, { start: number; length: number }[]>
+  }
+
+  // The immutable byte ranges come from the build info while the reference
+  // bytes come from the artifact; a desynced artifacts/ directory would
+  // shift the masked windows, so the two must be the same compilation.
+  if (
+    artifact.deployedBytecode.toLowerCase() !==
+    `0x${deployedBytecodeOutput.object}`.toLowerCase()
+  ) {
+    throw new Error(
+      "artifact deployedBytecode does not match its build info; artifacts/ " +
+        "is out of sync — run `npm run clean && npm run build`",
+    )
   }
 
   const expected = ethers.getBytes(artifact.deployedBytecode)

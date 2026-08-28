@@ -4,7 +4,19 @@ import { join } from "path"
 // config, the preflight script, and the fork test must all import the
 // manifest from here so that re-pinning to a new snapshot only ever touches
 // this file and the manifest it points at.
-import manifestJson from "../recovery/mainnet-25850299.json"
+//
+// The filename below is the ONLY place the pin appears: the parsed object,
+// the resolved path (used for the operation-salt and provenance hashes), and
+// the exported filename all derive from this one constant, so they can never
+// disagree about which manifest is being validated, hashed, and encoded.
+export const recoveryManifestFile = "mainnet-25850299.json"
+
+export const recoveryManifestPath = join(
+  __dirname,
+  "..",
+  "recovery",
+  recoveryManifestFile,
+)
 
 export type ManifestSettlementPreState = {
   balanceWei: string
@@ -28,9 +40,10 @@ export type ManifestSettlement = {
   depositorStbtcBalanceWei: string
   depositorActiveDebtWei: string
   // Every deposit that had nonzero receipt debt for this depositor at the
-  // snapshot. Current preflight reads these records again at its pinned block
-  // instead of trusting the stale aggregate. Newly active records omitted from
-  // this snapshot only make the recomputed total conservative.
+  // snapshot, sorted ascending. The preflight re-reads these records at its
+  // pinned block, and the recovery contract itself sums live debt over this
+  // reviewed list for its stranding guard. Newly active records omitted from
+  // this snapshot only make both recomputations conservative.
   depositorActiveDepositIds: string[]
   preState: ManifestSettlementPreState
 }
@@ -40,6 +53,24 @@ export type StrandingExclusion = {
   stbtcBalanceWei: string
   activeDebtWei: string
   depositIds: string[]
+}
+
+export type ManifestObservedState = {
+  receiptPayerStbtcBalanceWei: string
+  portalTbtcBalanceWei: string
+  portalStbtcDebtWei: string
+  depositCount: string
+  activeTbtcDepositCount: number
+  activeTbtcReceiptDebtWei: string
+  feeInfo: {
+    totalMintedWei: string
+    lastFeeUpdateAt: number
+    feeIntegral: string
+    annualFeePercent: number
+    mintCapPercent: number
+    receiptToken: string
+    feeCollectedWei: string
+  }
 }
 
 export type RecoveryManifest = {
@@ -60,20 +91,14 @@ export type RecoveryManifest = {
   }
   implementationRuntimeHash: string
   recoveryAmountWei: string
-  observedState?: Record<string, unknown>
+  observedState: ManifestObservedState
   // Depositors excluded from settlement because they still hold stBTC they
   // could redeem against their own debt through the normal repayment path.
   strandingExclusions?: StrandingExclusion[]
   settlements: ManifestSettlement[]
 }
 
-export const recoveryManifestFile = "mainnet-25850299.json"
+// eslint-disable-next-line @typescript-eslint/no-var-requires, import/no-dynamic-require, global-require
+const manifestJson = require(`../recovery/${recoveryManifestFile}`)
 
-export const recoveryManifestPath = join(
-  __dirname,
-  "..",
-  "recovery",
-  recoveryManifestFile,
-)
-
-export const recoveryManifest = manifestJson as unknown as RecoveryManifest
+export const recoveryManifest = manifestJson as RecoveryManifest

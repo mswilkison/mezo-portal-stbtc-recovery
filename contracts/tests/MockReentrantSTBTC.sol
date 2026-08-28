@@ -11,8 +11,14 @@ interface IPortalStbtcRecoveryReentry {
         uint96 amount;
     }
 
+    struct DepositorContext {
+        address depositor;
+        uint256[] activeDepositIds;
+    }
+
     function recoverTbtc(
-        ReceiptDebtSettlement[] calldata settlements
+        ReceiptDebtSettlement[] calldata settlements,
+        DepositorContext[] calldata depositorContexts
     ) external returns (uint256);
 }
 
@@ -46,7 +52,8 @@ contract MockReentrantSTBTC is ERC20, IReceiptToken {
             // msg.sender is the Portal proxy running the recovery
             // implementation; the nested call must hit the guard.
             IPortalStbtcRecoveryReentry(msg.sender).recoverTbtc(
-                new IPortalStbtcRecoveryReentry.ReceiptDebtSettlement[](0)
+                new IPortalStbtcRecoveryReentry.ReceiptDebtSettlement[](0),
+                new IPortalStbtcRecoveryReentry.DepositorContext[](0)
             );
         }
 

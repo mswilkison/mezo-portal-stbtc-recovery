@@ -2,6 +2,12 @@ import { writeFileSync } from "fs"
 import { join } from "path"
 import { artifacts, ethers } from "hardhat"
 import { recoveryManifest as currentManifest } from "../helpers/recovery-manifest"
+import {
+  ADMIN_SLOT,
+  FEE_PRECISION,
+  IMPLEMENTATION_SLOT,
+  ONE_YEAR,
+} from "../helpers/recovery-preflight"
 
 // Regenerates the recovery manifest from chain state so a re-pin is a
 // reproducible, reviewable operation instead of a hand-edit. Usage:
@@ -23,13 +29,6 @@ import { recoveryManifest as currentManifest } from "../helpers/recovery-manifes
 // recreating for them the exact stranded position this recovery cures for
 // Threshold. Excluded depositors are recorded in the manifest for review.
 
-const IMPLEMENTATION_SLOT =
-  "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc"
-const ADMIN_SLOT =
-  "0xb53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d6103"
-const ONE_YEAR = 365n * 24n * 60n * 60n
-const FEE_PRECISION = 10n ** 18n
-
 const RECEIPT_MINTED_TOPIC = ethers.id(
   "ReceiptMinted(address,address,uint256,uint256)",
 )
@@ -48,6 +47,34 @@ type ActiveDeposit = {
 
 function fail(message: string): never {
   throw new Error(`Manifest generation failed: ${message}`)
+}
+
+function envPositiveInteger(name: string, fallback: number): number {
+  const raw = process.env[name]
+  if (raw === undefined || raw === "") {
+    return fallback
+  }
+  const value = Number(raw)
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    fail(`${name}="${raw}" is not a positive integer`)
+  }
+  return value
+}
+
+function envWeiAmount(name: string, fallback: bigint): bigint {
+  const raw = process.env[name]
+  if (raw === undefined || raw === "") {
+    return fallback
+  }
+  try {
+    const value = BigInt(raw)
+    if (value < 0n) {
+      throw new Error("negative")
+    }
+    return value
+  } catch {
+    return fail(`${name}="${raw}" is not a non-negative wei amount`)
+  }
 }
 
 function log(message: string): void {
@@ -132,16 +159,10 @@ async function main() {
   }
 
   const head = await ethers.provider.getBlockNumber()
-  const pinBlock = process.env.MANIFEST_BLOCK
-    ? Number(process.env.MANIFEST_BLOCK)
-    : head - 5
-  const scanStart = process.env.SCAN_START_BLOCK
-    ? Number(process.env.SCAN_START_BLOCK)
-    : 19000000
-  const scanChunk = process.env.SCAN_CHUNK
-    ? Number(process.env.SCAN_CHUNK)
-    : 50000
-  const dustWei = BigInt(process.env.STRANDING_DUST_WEI ?? "1000000000000")
+  const pinBlock = envPositiveInteger("MANIFEST_BLOCK", head - 5)
+  const scanStart = envPositiveInteger("SCAN_START_BLOCK", 19000000)
+  const scanChunk = envPositiveInteger("SCAN_CHUNK", 50000)
+  const dustWei = envWeiAmount("STRANDING_DUST_WEI", 1000000000000n)
 
   const block = await ethers.provider.getBlock(pinBlock)
   if (!block) {
@@ -349,11 +370,29 @@ async function main() {
       activeDebtWei: activeDebtByDepositor.get(depositor)!.toString(),
       depositIds: active
         .filter((deposit) => deposit.depositor === depositor)
-        .map((deposit) => deposit.depositId.toString()),
+        .map((deposit) => deposit.depositId)
+        .sort((a, b) => {
+          if (a === b) {
+            return 0
+          }
+          return a < b ? -1 : 1
+        })
+        .map((depositId) => depositId.toString()),
     }))
-    .sort((a, b) =>
-      BigInt(b.activeDebtWei) > BigInt(a.activeDebtWei) ? 1 : -1,
-    )
+    // Deterministic order regardless of the JS engine's sort: largest active
+    // debt first, ties broken by depositor address, and a 0 return for equal
+    // elements so identical chain state always emits identical bytes.
+    .sort((a, b) => {
+      const debtA = BigInt(a.activeDebtWei)
+      const debtB = BigInt(b.activeDebtWei)
+      if (debtA !== debtB) {
+        return debtB > debtA ? 1 : -1
+      }
+      if (a.depositor === b.depositor) {
+        return 0
+      }
+      return a.depositor.toLowerCase() < b.depositor.toLowerCase() ? -1 : 1
+    })
 
   const eligible = active
     .filter(
