@@ -64,6 +64,18 @@ contract PortalStbtcRecovery is Ownable2StepUpgradeable {
         uint96 amount;
     }
 
+    /// @notice Reason a manifest settlement entry was skipped instead of
+    ///         settled. Entries are skipped, not reverted, so that ordinary
+    ///         third-party deposit activity between manifest review and
+    ///         timelock execution (repayments, withdrawals, migrations)
+    ///         cannot veto the whole recovery batch.
+    enum SettlementSkipReason {
+        DepositNotFound,
+        DepositMigrating,
+        DebtAlreadyRepaid,
+        Undercollateralized
+    }
+
     // ---------------------------------------------------------------------
     // Portal storage. Do not add, remove, reorder, or change these fields.
     // ---------------------------------------------------------------------
@@ -109,6 +121,13 @@ contract PortalStbtcRecovery is Ownable2StepUpgradeable {
         uint256 amount
     );
 
+    event ReceiptDebtSettlementSkipped(
+        address indexed depositor,
+        address indexed token,
+        uint256 indexed depositId,
+        SettlementSkipReason reason
+    );
+
     event StbtcRecoveryCompleted(
         address indexed receiptPayer,
         address indexed collateralRecipient,
@@ -123,25 +142,8 @@ contract PortalStbtcRecovery is Ownable2StepUpgradeable {
     error UnexpectedTokenDecimals(uint8 tbtcDecimals, uint8 receiptDecimals);
     error EmptySettlements();
     error IncorrectSettlementAmount(uint256 expected, uint256 actual);
-    error DepositNotFound(address depositor, uint256 depositId);
-    error UnexpectedMigrationState(
-        address depositor,
-        uint256 depositId,
-        TbtcMigrationState state
-    );
-    error SettlementExceedsDebt(
-        address depositor,
-        uint256 depositId,
-        uint96 debt,
-        uint96 amount
-    );
-    error DepositUnderCollateralized(
-        address depositor,
-        uint256 depositId,
-        uint96 collateral,
-        uint96 receiptDebt,
-        uint96 feeReserve
-    );
+    error ZeroSettlementAmount(address depositor, uint256 depositId);
+    error NothingSettled();
     error ReentrancyGuardReentrantCall();
 
     modifier nonReentrant() {
@@ -187,13 +189,24 @@ contract PortalStbtcRecovery is Ownable2StepUpgradeable {
         _disableInitializers();
     }
 
-    /// @notice Burns the configured stBTC amount, releases the same amount of
-    ///         tBTC, and reduces selected deposits' collateral and receipt debt
-    ///         one-for-one.
+    /// @notice Burns up to the configured stBTC amount, releases the same
+    ///         amount of tBTC, and reduces selected deposits' collateral and
+    ///         receipt debt one-for-one.
     /// @dev Can only run as the call embedded in ProxyAdmin.upgradeAndCall.
-    ///      The stBTC holder must first approve the Portal proxy for exactly the
-    ///      configured recovery amount. Every state change and token transfer
-    ///      reverts together if any check fails.
+    ///      The stBTC holder must first approve the Portal proxy for exactly
+    ///      the configured recovery amount. Every state change and token
+    ///      transfer reverts together if any check fails.
+    ///
+    ///      The requested settlement entries must total exactly the immutable
+    ///      recovery amount, so the reviewed calldata cannot change. Execution
+    ///      is drift-tolerant within that reviewed selection: a deposit whose
+    ///      state moved between review and execution (repaid, withdrawn,
+    ///      migrating, or under-collateralized) is skipped or settled up to
+    ///      its remaining debt rather than reverting the batch, because a
+    ///      revert here would let any third-party depositor veto the whole
+    ///      timelock operation with a 1 wei repayment. The amount pulled,
+    ///      burned, and released always equals the debt actually settled and
+    ///      never exceeds the immutable recovery amount.
     function recoverTbtc(
         ReceiptDebtSettlement[] calldata settlements
     ) external nonReentrant returns (uint256 totalSettled) {
@@ -226,37 +239,50 @@ contract PortalStbtcRecovery is Ownable2StepUpgradeable {
             revert UnexpectedTokenDecimals(tbtcDecimals, receiptDecimals);
         }
 
+        uint256 requestedTotal = 0;
         for (uint256 i = 0; i < settlements.length; i++) {
             ReceiptDebtSettlement calldata settlement = settlements[i];
+
+            if (settlement.amount == 0) {
+                revert ZeroSettlementAmount(
+                    settlement.depositor,
+                    settlement.depositId
+                );
+            }
+            requestedTotal += settlement.amount;
+
             DepositInfo storage deposit = deposits[settlement.depositor][token][
                 settlement.depositId
             ];
 
             if (deposit.balance == 0) {
-                revert DepositNotFound(
+                emit ReceiptDebtSettlementSkipped(
                     settlement.depositor,
-                    settlement.depositId
+                    token,
+                    settlement.depositId,
+                    SettlementSkipReason.DepositNotFound
                 );
+                continue;
             }
 
             if (deposit.tbtcMigrationState != TbtcMigrationState.NotRequested) {
-                revert UnexpectedMigrationState(
+                emit ReceiptDebtSettlementSkipped(
                     settlement.depositor,
+                    token,
                     settlement.depositId,
-                    deposit.tbtcMigrationState
+                    SettlementSkipReason.DepositMigrating
                 );
+                continue;
             }
 
-            if (
-                settlement.amount == 0 ||
-                settlement.amount > deposit.receiptMinted
-            ) {
-                revert SettlementExceedsDebt(
+            if (deposit.receiptMinted == 0) {
+                emit ReceiptDebtSettlementSkipped(
                     settlement.depositor,
+                    token,
                     settlement.depositId,
-                    deposit.receiptMinted,
-                    settlement.amount
+                    SettlementSkipReason.DebtAlreadyRepaid
                 );
+                continue;
             }
 
             _updateFee(deposit, token);
@@ -268,33 +294,46 @@ contract PortalStbtcRecovery is Ownable2StepUpgradeable {
             );
 
             if (uint256(deposit.receiptMinted) + feeReserve > deposit.balance) {
-                revert DepositUnderCollateralized(
+                emit ReceiptDebtSettlementSkipped(
                     settlement.depositor,
+                    token,
                     settlement.depositId,
-                    deposit.balance,
-                    deposit.receiptMinted,
-                    feeReserve
+                    SettlementSkipReason.Undercollateralized
                 );
+                continue;
             }
 
-            deposit.balance -= settlement.amount;
-            deposit.receiptMinted -= settlement.amount;
-            fee.totalMinted -= settlement.amount;
-            totalSettled += settlement.amount;
+            // Settle up to the deposit's remaining debt. The skip check above
+            // guarantees receiptMinted + feeReserve <= balance, so the deposit
+            // stays fully collateralized (including its accrued fees) after
+            // both reductions.
+            uint96 settleAmount = settlement.amount;
+            if (settleAmount > deposit.receiptMinted) {
+                settleAmount = deposit.receiptMinted;
+            }
+
+            deposit.balance -= settleAmount;
+            deposit.receiptMinted -= settleAmount;
+            fee.totalMinted -= settleAmount;
+            totalSettled += settleAmount;
 
             emit ReceiptDebtSettled(
                 settlement.depositor,
                 token,
                 settlement.depositId,
-                settlement.amount
+                settleAmount
             );
         }
 
-        if (totalSettled != EXPECTED_RECOVERY_AMOUNT) {
+        if (requestedTotal != EXPECTED_RECOVERY_AMOUNT) {
             revert IncorrectSettlementAmount(
                 EXPECTED_RECOVERY_AMOUNT,
-                totalSettled
+                requestedTotal
             );
+        }
+
+        if (totalSettled == 0) {
+            revert NothingSettled();
         }
 
         IERC20(receiptToken).safeTransferFrom(
