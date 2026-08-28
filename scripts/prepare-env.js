@@ -22,7 +22,11 @@ const example = fs.readFileSync(examplePath, "utf8")
 
 if (!fs.existsSync(envPath)) {
   fs.writeFileSync(envPath, example)
-  process.exit(0)
+  // `return` rather than process.exit: this module is also required from
+  // hardhat.config.ts so that `npx hardhat ...` and `npm run build` get the
+  // same reconciliation as the npm scripts that chain prepare:env.
+  module.exports = {}
+  return
 }
 
 const env = fs.readFileSync(envPath, "utf8")

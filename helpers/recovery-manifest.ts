@@ -100,6 +100,85 @@ export type RecoveryManifest = {
 
 let cachedManifest: RecoveryManifest | undefined
 
+// The manifest is JSON cast to a type, so nothing enforces its shape at
+// runtime. That matters most for the numeric fields: the preflight decides
+// whether to apply its fatal snapshot-block checks with a strict `===`
+// against snapshotBlock, so a quoted "25850299" would silently demote nine
+// hard checks to warnings and still print a green run. Validate the shape
+// where a wrong type changes behavior rather than merely crashing.
+function validateManifestShape(manifest: RecoveryManifest): void {
+  const problems: string[] = []
+  const requireInteger = (label: string, value: unknown) => {
+    if (typeof value !== "number" || !Number.isInteger(value)) {
+      problems.push(`${label} must be a JSON number, got ${typeof value}`)
+    }
+  }
+  const requireDecimalString = (label: string, value: unknown) => {
+    if (typeof value !== "string" || !/^\d+$/.test(value)) {
+      problems.push(
+        `${label} must be a decimal wei string, got ${typeof value}`,
+      )
+    }
+  }
+
+  requireInteger("chainId", manifest.chainId)
+  requireInteger("snapshotBlock", manifest.snapshotBlock)
+  requireDecimalString("recoveryAmountWei", manifest.recoveryAmountWei)
+
+  if (
+    !Array.isArray(manifest.settlements) ||
+    manifest.settlements.length === 0
+  ) {
+    problems.push("settlements must be a non-empty array")
+  } else {
+    manifest.settlements.forEach((settlement, index) => {
+      const at = `settlements[${index}]`
+      requireDecimalString(`${at}.amountWei`, settlement.amountWei)
+      requireDecimalString(`${at}.depositId`, settlement.depositId)
+      requireDecimalString(
+        `${at}.depositorStbtcBalanceWei`,
+        settlement.depositorStbtcBalanceWei,
+      )
+      requireDecimalString(
+        `${at}.depositorActiveDebtWei`,
+        settlement.depositorActiveDebtWei,
+      )
+      requireInteger(
+        `${at}.preState.migrationState`,
+        settlement.preState?.migrationState,
+      )
+      if (
+        !Array.isArray(settlement.depositorActiveDepositIds) ||
+        settlement.depositorActiveDepositIds.length === 0
+      ) {
+        problems.push(
+          `${at}.depositorActiveDepositIds must be a non-empty array`,
+        )
+      }
+    })
+  }
+
+  // Optional in the type only so older manifests parse; the preflight and
+  // fork test both rely on these, so a manifest missing them is rejected
+  // rather than silently skipping the checks built on them.
+  if (!Array.isArray(manifest.strandingExclusions)) {
+    problems.push(
+      "strandingExclusions must be present (use [] when nothing was excluded)",
+    )
+  }
+  if (!manifest.observedState?.feeInfo) {
+    problems.push("observedState.feeInfo must be present")
+  }
+
+  if (problems.length > 0) {
+    throw new Error(
+      `recovery manifest ${recoveryManifestFile} is malformed:\n  - ${problems.join(
+        "\n  - ",
+      )}`,
+    )
+  }
+}
+
 // Loads the pinned manifest, failing with a message that names the pin and
 // the fix instead of a bare MODULE_NOT_FOUND. Scripts and tests that cannot
 // work without the manifest should call this and let it throw.
@@ -118,6 +197,7 @@ export function loadRecoveryManifest(): RecoveryManifest {
           "recovery/",
       )
     }
+    validateManifestShape(cachedManifest)
   }
   return cachedManifest
 }

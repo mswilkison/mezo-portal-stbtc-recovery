@@ -1,5 +1,6 @@
 import { readFileSync } from "fs"
 import { artifacts, ethers } from "hardhat"
+import * as anchors from "../helpers/recovery-anchors"
 import {
   loadRecoveryManifest,
   recoveryManifestPath,
@@ -179,15 +180,47 @@ async function main() {
     }),
   ) as RecoveryManifestAddresses
 
+  // The manifest is not its own authority. Values that cannot be derived
+  // from chain state — above all the tBTC destination, which nothing on
+  // chain anchors — must match the separately reviewed constants, so a
+  // corrupted manifest cannot be "verified" against itself.
+  expectEqual(
+    "manifest collateralRecipient vs reviewed anchor (helpers/recovery-anchors.ts)",
+    addresses.collateralRecipient,
+    anchors.COLLATERAL_RECIPIENT,
+  )
+  expectEqual(
+    "manifest receiptPayer vs reviewed anchor",
+    addresses.receiptPayer,
+    anchors.RECEIPT_PAYER,
+  )
+  expectEqual(
+    "manifest portal vs reviewed anchor",
+    addresses.portal,
+    anchors.PORTAL,
+  )
+  expectEqual(
+    "manifest originalImplementation vs reviewed anchor",
+    addresses.originalImplementation,
+    anchors.ORIGINAL_IMPLEMENTATION,
+  )
+  expectEqual(
+    "manifest implementationRuntimeHash vs reviewed anchor (UPSTREAM.md)",
+    manifest.implementationRuntimeHash,
+    anchors.IMPLEMENTATION_RUNTIME_HASH,
+  )
+
   // Compile-time provenance: the Portal source reconstructed in this
   // repository must compile to exactly the runtime bytecode the proxy points
-  // at. This is the review gate RECOVERY.md step 1 relies on.
+  // at. This is the review gate RECOVERY.md step 1 relies on. Anchored to
+  // UPSTREAM.md's reviewed constant (via the check above) so the gate cannot
+  // silently re-anchor itself when the live implementation moves.
   const portalArtifact = await artifacts.readArtifact("Portal")
   const compiledPortalHash = ethers.keccak256(portalArtifact.deployedBytecode)
   expectEqual(
     "compiled Portal runtime hash (run `npm run build`; requires evmVersion paris)",
     compiledPortalHash,
-    manifest.implementationRuntimeHash,
+    anchors.IMPLEMENTATION_RUNTIME_HASH,
   )
 
   const implementation = addressFromStorageWord(
@@ -316,10 +349,56 @@ async function main() {
       `${addresses.portalLogicOwner} does not hold EXECUTOR_ROLE on the timelock`,
     )
   }
+  // CANCELLER is the documented escape hatch for a batch that must not
+  // execute, so losing it between scheduling and execution is exactly as
+  // consequential as losing EXECUTOR. Hard-fail at the execute stage rather
+  // than only warning.
+  if (STAGE === "execute" && !senderHasCancellerRole) {
+    fail(
+      `${addresses.portalLogicOwner} does not hold CANCELLER_ROLE on the ` +
+        "timelock; the documented cancel-on-drift/abort path would be " +
+        "unavailable if this run has to be aborted",
+    )
+  }
   if (!senderHasCancellerRole) {
     warn(
       `${addresses.portalLogicOwner} does not hold CANCELLER_ROLE on the ` +
         "timelock; the documented cancel-on-drift/abort path needs a canceller",
+    )
+  }
+  // These roles are checked for the manifest-pinned governance account. This
+  // script is read-only and has no signer, so it CANNOT know which of the
+  // timelock's several role holders will actually submit the transaction.
+  // RECOVERY_EXPECTED_SENDER lets an operator name that account so the roles
+  // are verified for the address that will really sign.
+  const expectedSender = process.env.RECOVERY_EXPECTED_SENDER
+  let expectedSenderRoles: Record<string, boolean> | undefined
+  if (expectedSender) {
+    const sender = ethers.getAddress(expectedSender)
+    const [senderProposer, senderExecutor, senderCanceller] = await Promise.all(
+      [
+        timelock.hasRole(PROPOSER_ROLE, sender, callOverrides),
+        timelock.hasRole(EXECUTOR_ROLE, sender, callOverrides),
+        timelock.hasRole(CANCELLER_ROLE, sender, callOverrides),
+      ],
+    )
+    expectedSenderRoles = {
+      account: sender,
+      proposer: senderProposer,
+      executor: senderExecutor,
+      canceller: senderCanceller,
+    } as unknown as Record<string, boolean>
+    if (STAGE === "prepare" && !senderProposer) {
+      fail(`RECOVERY_EXPECTED_SENDER ${sender} does not hold PROPOSER_ROLE`)
+    }
+    if (STAGE === "execute" && !senderExecutor) {
+      fail(`RECOVERY_EXPECTED_SENDER ${sender} does not hold EXECUTOR_ROLE`)
+    }
+  } else {
+    warn(
+      "RECOVERY_EXPECTED_SENDER is unset: timelock roles were verified for " +
+        `the manifest-pinned ${addresses.portalLogicOwner} only, which says ` +
+        "nothing about the account that will actually submit the transaction",
     )
   }
 
@@ -351,6 +430,19 @@ async function main() {
       fail(message)
     }
     warn(`${message} (expected while preparing; required before execution)`)
+  } else if (STAGE === "prepare") {
+    // The allowance is already in place at the prepare stage, which means it
+    // was granted before the delay elapsed — the ordering RECOVERY.md warns
+    // against, because it leaves Threshold's entire holding approved to an
+    // upgradeable proxy for longer than necessary. Previously this produced
+    // no output at all, since the check only fired on inequality.
+    warn(
+      "the exact recovery allowance is ALREADY granted to the Portal proxy " +
+        "before scheduling; RECOVERY.md step 8 places this after the timelock " +
+        "delay to minimize how long Threshold's holding is approved to an " +
+        "upgradeable proxy. Revoke with approve(portal, 0) and re-grant " +
+        "after the delay unless governance has accepted the exposure",
+    )
   }
 
   const feeState = {
@@ -460,6 +552,7 @@ async function main() {
         depositId: BigInt(settlement.depositId),
         amount,
         depositorActiveDebtWei: settlement.depositorActiveDebtWei,
+        depositorStbtcBalanceWei: settlement.depositorStbtcBalanceWei,
         depositorActiveDepositIds: settlement.depositorActiveDepositIds,
         currentBalanceWei: BigInt(deposit.balance),
         currentDebtWei: BigInt(deposit.receiptMinted),
@@ -482,6 +575,7 @@ async function main() {
     {
       settled: bigint
       manifestActiveDebt: bigint
+      manifestStbtcBalance: bigint
       activeDepositIds: string[]
     }
   >()
@@ -509,10 +603,12 @@ async function main() {
     }
 
     const manifestActiveDebt = BigInt(settlement.depositorActiveDebtWei)
+    const manifestStbtcBalance = BigInt(settlement.depositorStbtcBalanceWei)
     const existing = byDepositor.get(settlement.depositor)
     if (
       existing &&
       (existing.manifestActiveDebt !== manifestActiveDebt ||
+        existing.manifestStbtcBalance !== manifestStbtcBalance ||
         existing.activeDepositIds.join(",") !== activeDepositIds.join(","))
     ) {
       fail(
@@ -524,6 +620,7 @@ async function main() {
     const entry = existing ?? {
       settled: 0n,
       manifestActiveDebt,
+      manifestStbtcBalance,
       activeDepositIds,
     }
     entry.settled += settlement.amount
@@ -559,6 +656,23 @@ async function main() {
       const stbtcBalance = BigInt(
         await stbtc.balanceOf(depositor, callOverrides),
       )
+      // The manifest's recorded holdings are what reviewers do the
+      // no-stranding arithmetic on, so re-derive them rather than trusting
+      // the file. (Previously only the fork test checked this, despite the
+      // field's own comment claiming the preflight did.)
+      const manifestBalance = BigInt(entry.manifestStbtcBalance)
+      if (atSnapshotBlock) {
+        expectEqual(
+          `depositor ${depositor} recorded stBTC balance at snapshot`,
+          stbtcBalance,
+          manifestBalance,
+        )
+      } else if (stbtcBalance !== manifestBalance) {
+        driftMessages.push(
+          `depositor ${depositor} stBTC balance: manifest ` +
+            `${manifestBalance.toString()}, live ${stbtcBalance.toString()}`,
+        )
+      }
       const capacity =
         liveActiveDebt > stbtcBalance ? liveActiveDebt - stbtcBalance : 0n
       ownerCapacity.set(depositor, capacity)
@@ -568,6 +682,34 @@ async function main() {
         liveActiveDebtWei: liveActiveDebt,
         requestedSettlementWei: entry.settled,
         strandingCapacityWei: capacity,
+      }
+    }),
+  )
+
+  // The exclusions are the other half of the reviewed selection story: they
+  // are why capacity that exists was not used. Re-derive them so a manifest
+  // whose exclusions were trimmed or falsified cannot pass review.
+  const exclusionReports = await Promise.all(
+    (manifest.strandingExclusions ?? []).map(async (exclusion) => {
+      const depositor = ethers.getAddress(exclusion.depositor)
+      const liveBalance = BigInt(
+        await stbtc.balanceOf(depositor, callOverrides),
+      )
+      if (atSnapshotBlock) {
+        expectEqual(
+          `excluded depositor ${depositor} recorded stBTC balance`,
+          liveBalance,
+          exclusion.stbtcBalanceWei,
+        )
+      }
+      if (byDepositor.has(depositor)) {
+        fail(`${depositor} appears in both settlements and strandingExclusions`)
+      }
+      return {
+        depositor,
+        recordedStbtcBalanceWei: BigInt(exclusion.stbtcBalanceWei),
+        liveStbtcBalanceWei: liveBalance,
+        recordedActiveDebtWei: BigInt(exclusion.activeDebtWei),
       }
     }),
   )
@@ -596,25 +738,38 @@ async function main() {
   )
   const projectedResidualWei = manifestTotal - projectedTotalWei
 
-  // Sufficiency checks against what will actually be settled (the contract
-  // pulls, burns, and releases exactly totalSettled, never the original
-  // round amount). Anchoring these to the round amount would let ordinary
-  // third-party repayments veto a valid partial execution.
-  if (BigInt(portalTbtcBalance) < projectedTotalWei) {
-    fail("Portal does not hold enough tBTC for the projected settlement")
-  }
-  if (BigInt(receiptPayerBalance) < projectedTotalWei) {
-    fail("receipt payer does not hold the projected settlement amount")
-  }
-  if (BigInt(portalStbtcDebt) < projectedTotalWei) {
+  // Sufficiency is checked against the REQUESTED round total, not the
+  // projection. The projection is deliberately conservative — it pads fees
+  // by an hour and reads owner capacity at this block — so it is a LOWER
+  // bound on what the contract pulls: a padded-boundary deposit can settle
+  // in full, and owner capacity rises if a selected owner's balance drops
+  // before execution. Gating on the projection would therefore let a green
+  // execute-stage run be followed by a revert inside safeTransferFrom. The
+  // requested total is the true upper bound on what recoverTbtc can pull,
+  // and gating on it is veto-free here because these are balances only
+  // Threshold and the Portal control, not third-party depositors.
+  if (BigInt(portalTbtcBalance) < manifestTotal) {
     fail(
-      "Portal does not have enough stBTC debt to burn the projected settlement",
+      `Portal holds ${portalTbtcBalance.toString()} tBTC, below this round's ` +
+        `requested total ${manifestTotal.toString()}`,
     )
   }
-  if (BigInt(fee.totalMinted) < projectedTotalWei) {
+  if (BigInt(receiptPayerBalance) < manifestTotal) {
     fail(
-      "Portal does not have enough tBTC-specific receipt debt for the " +
-        "projected settlement",
+      `receipt payer holds ${receiptPayerBalance.toString()} stBTC, below ` +
+        `this round's requested total ${manifestTotal.toString()}`,
+    )
+  }
+  if (BigInt(portalStbtcDebt) < manifestTotal) {
+    fail(
+      "Portal does not have enough stBTC debt to burn this round's requested " +
+        "total",
+    )
+  }
+  if (BigInt(fee.totalMinted) < manifestTotal) {
+    fail(
+      "Portal does not have enough tBTC-specific receipt debt for this " +
+        "round's requested total",
     )
   }
 
@@ -663,6 +818,11 @@ async function main() {
       fail(`${message}. ${remedy}`)
     }
     warn(message)
+    warn(
+      "after execution the receipt payer must revoke the residual allowance " +
+        `with approve(${addresses.portal}, 0) — the round consumes only the ` +
+        "settled amount and the remainder stays approved to the proxy",
+    )
   }
 
   const recoveryFactory = await ethers.getContractFactory("PortalStbtcRecovery")
@@ -720,7 +880,12 @@ async function main() {
         proposer: senderHasProposerRole,
         executor: senderHasExecutorRole,
         canceller: senderHasCancellerRole,
+        note:
+          "roles of the manifest-pinned governance account; the timelock has " +
+          "several role holders and this script cannot know which will sign",
       },
+      expectedSenderRoles:
+        expectedSenderRoles ?? "unset (RECOVERY_EXPECTED_SENDER)",
       portalTbtcBalanceWei: portalTbtcBalance,
       portalStbtcDebtWei: portalStbtcDebt,
       tbtcReceiptDebtWei: fee.totalMinted,
@@ -735,9 +900,13 @@ async function main() {
       manifestTotalWei: manifestTotal,
       projectedTotalWei,
       projectedResidualWei,
+      note:
+        "the projection is a conservative LOWER bound (fees padded, capacity " +
+        "read at this block); sufficiency is checked against manifestTotalWei",
       owners: ownerReports,
       entries: projected,
     },
+    strandingExclusions: exclusionReports,
     receiptPayerApproval: {
       from: addresses.receiptPayer,
       target: addresses.stbtc,

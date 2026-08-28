@@ -81,8 +81,25 @@ reviewed active-deposit list carried in the calldata, and caps that owner's
 total settlement at debt minus balance. A receipt-token transfer to a
 selected owner after the preflight is therefore first absorbed by the
 owner's unselected debt and at worst reduces the recovered amount once per
-owner — never multiplied per deposit — and can never leave the recipient
-holding unredeemable stBTC. The selection is reproducible:
+owner — never multiplied per deposit — and cannot leave the recipient
+holding unredeemable stBTC **in the wallet the guard can see**.
+
+That last qualifier is a real limit, not boilerplate. The on-chain guard can
+only price `balanceOf(depositor)`. stBTC the same party holds indirectly —
+in the Curve stBTC/tBTC pool, a vault, or a second address — is invisible to
+it, and so is invisible to the selection policy, which uses the same
+measure. This is precisely the case that matters: Threshold's own stranded
+balance came from exiting that Curve pool, so a selected depositor with a
+pool position is exactly the party this recovery could strand. Screening for
+it is therefore a mandatory review step, not something the contract can
+enforce: `npm run check:external-stbtc` replays every settled depositor's
+stBTC transfer history, reports where their minted receipt tokens went, and
+fails if any of them still holds a claim on a venue holding stBTC. If a
+depositor is flagged, prefer reducing their settlement by the externally
+held amount over excluding them outright — exclusion forfeits far more
+recovery capacity than the holding justifies.
+
+The selection is reproducible:
 `npm run generate:recovery-manifest` rebuilds the manifest from chain state
 at any block, so reviewers can regenerate and diff it instead of trusting
 the committed file; the generator reserves each selected owner's own
@@ -113,6 +130,18 @@ stranding guard described above. The amount pulled from Threshold, burned,
 and released always equals the debt actually settled and never exceeds the
 approved amount.
 
+The settlement emits `ReceiptDebtSettled` and `StbtcRecoveryCompleted`, not
+the Portal's canonical `ReceiptRepaid` and `Withdrawn`. That is deliberate:
+the tBTC goes to Threshold's Safe rather than the depositor, so `Withdrawn`
+would be factually wrong, and no depositor repaid anything, so
+`ReceiptRepaid` would misattribute the repayment. The consequence is that
+any consumer deriving Portal balances from event handlers — a subgraph, a
+dapp deposit view, reconciliation monitoring — will not see these
+reductions and will desync for the settled deposits until it re-reads live
+state. Notify those consumers before execution; the recovery's event topics
+are not part of any published Portal ABI, because the temporary
+implementation is installed and removed within one transaction.
+
 Without this, any depositor named in the manifest could veto the whole
 recovery — a 1 wei repayment during the timelock delay would revert the
 batch, forcing a new manifest, review, schedule, and delay each time. If
@@ -136,7 +165,12 @@ bind it to:
 - the live Portal proxy and ProxyAdmin;
 - the live tBTC and stBTC contracts;
 - Threshold's stBTC payer and tBTC recipient;
-- the exact recovery amount.
+- the maximum receipt debt any single `recoverTbtc` call may request
+  (`EXPECTED_MAX_RECOVERY_AMOUNT`). This is a per-call **upper bound**, not a
+  lifetime total: the deployed implementation can be re-invoked with fresh
+  reviewed calldata, which is what makes a residual round cheap. What pins a
+  given round to specific deposits and amounts is the timelock's commitment
+  to the exact calldata, not the immutable.
 
 The call additionally requires:
 
@@ -191,27 +225,60 @@ reduced projection (beyond wei-level noise) requires the same explicit
 execute stage the alternative is cancelling with the printed calldata — so
 drift discovered after scheduling cannot silently execute a smaller round
 than governance signed off on. Structural checks — implementation, proxy
-administration, tokens, roles, runtime hash — are hard failures at every
-stage, while balance and debt sufficiency are checked against the projected
-settlement (the amount the contract actually pulls), never the original
-round total. Boundary classification pads fee accrual by an hour so a
-deposit crossing its collateral margin between preflight and execution is
-conservatively projected as skipped; a flip past that padding still reverts
-atomically and harmlessly. Each run resolves its block once and pins every
-subsequent storage read, code read, and contract call to that same block.
+administration, tokens, runtime hash, and the reviewed anchors — are hard
+failures at every stage.
+
+Balance and debt sufficiency are checked against the round's **requested**
+total, not the projection. The projection is deliberately conservative (fees
+padded by an hour, owner capacity read at the preflight block), which makes
+it a _lower_ bound on what the contract pulls: a padded-boundary deposit can
+settle in full, and owner capacity rises if a selected owner's balance drops
+before execution. Gating sufficiency on the projection would therefore let a
+green execute-stage run be followed by a revert inside the transfer. The
+requested total is the true upper bound, and gating on it is veto-free
+because those balances are controlled by Threshold and the Portal, not by
+third-party depositors.
+
+Timelock role checks are a weaker assurance than the rest, and the runbook
+should not be read as claiming otherwise: the preflight is read-only and has
+no signer, so by default it can only report the roles held by the
+manifest-pinned governance account while the timelock has several role
+holders. Set `RECOVERY_EXPECTED_SENDER` to the account that will actually
+submit the transaction so the roles are verified for it; without it the run
+prints an explicit warning. `CANCELLER_ROLE` is a hard failure at the
+execute stage, because losing the documented abort path matters exactly when
+a scheduled batch must not execute.
+
+Each run resolves its block once and pins every subsequent storage read,
+code read, and contract call to that same block.
 
 1. Thesis rebases this feature commit onto the exact canonical commit backing
    the live implementation. `npm run test:recovery` includes a provenance
    test asserting the reconstructed `Portal.sol` compiles byte-for-byte to
    the live runtime hash recorded in [UPSTREAM.md](./UPSTREAM.md) (this
    requires the `evmVersion: "paris"` compiler setting pinned in
-   `hardhat.config.ts`).
+   `hardhat.config.ts`). That hash, the Portal proxy, the implementation
+   address, and both Threshold counterparties are duplicated as reviewed
+   constants in [`helpers/recovery-anchors.ts`](./helpers/recovery-anchors.ts);
+   the preflight hard-fails if the manifest disagrees with them. Confirm
+   `COLLATERAL_RECIPIENT` there against a source outside this repository —
+   it is the destination of every released tBTC and nothing on chain
+   anchors it, so a wrong-but-valid address would otherwise be carried
+   forward by the generator and "verified" against itself.
 2. Review/audit `PortalStbtcRecovery.sol`, the settlement entries, the
    stranding exclusions, and the one-for-one accounting policy. Optionally
    regenerate the manifest (`npm run generate:recovery-manifest`) and diff it
    against the committed one.
-3. Run the unit, upgrade-layout, and pinned mainnet-fork tests.
-4. Run the preflight against a current archive RPC. It intentionally aborts
+3. Run the unit, upgrade-layout, and pinned mainnet-fork tests
+   (`npm run test:recovery` covers the first two — the storage-layout test
+   is included there and is deliberately skipped by `npm run test:upgrades`,
+   which runs against a remote network that cannot sign local deployments).
+4. Screen the selected depositors for externally held stBTC:
+   `MAINNET_RPC_URL=<archive rpc> npm run check:external-stbtc`. This is the
+   review step the on-chain guard structurally cannot perform (see the
+   selection section above); it must report every settled depositor CLEAN
+   before the manifest is approved.
+5. Run the preflight against a current archive RPC. It intentionally aborts
    if the implementation, proxy administration, token configuration, timelock
    roles, or runtime hash differs from the reviewed manifest. It re-reads
    every active deposit listed for each selected owner, computes current
@@ -221,16 +288,16 @@ subsequent storage read, code read, and contract call to that same block.
    aborts with instructions to regenerate the manifest, unless governance
    explicitly accepts recovering less this round with
    `RECOVERY_ACCEPT_REDUCED_RECOVERY=1`.
-5. Deploy and verify `PortalStbtcRecovery` using the constructor arguments
+6. Deploy and verify `PortalStbtcRecovery` using the constructor arguments
    printed by the preflight.
-6. Rerun the preflight with `RECOVERY_IMPLEMENTATION` set. It verifies the
+7. Rerun the preflight with `RECOVERY_IMPLEMENTATION` set. It verifies the
    deployed runtime bytecode byte-for-byte against the local artifact. Before
    masking immutable ranges for the comparison, it verifies every occurrence
    against the expected constructor value; getter readbacks alone are not
    sufficient. It then reports the timelock operation's state and prints the
    exact Threshold approval plus Timelock schedule, execute, and cancel
    calldata.
-7. Mezo governance schedules the printed two-call batch. From this point
+8. Mezo governance schedules the printed two-call batch. From this point
    until execution or cancellation, no other governance action may touch the
    Portal, its ProxyAdmin, or the timelock's Portal-related roles: the
    batch's second call restores the implementation address captured in the
@@ -241,15 +308,15 @@ subsequent storage read, code read, and contract call to that same block.
    live implementation immediately before `executeBatch`, and executors must
    not skip or race it. If anything must change, cancel first (calldata is
    printed in step 6), then re-pin.
-8. After the configured delay elapses, Threshold approves the Portal—not
+9. After the configured delay elapses, Threshold approves the Portal—not
    Thesis or the recovery implementation—for exactly the recovery amount.
    Approving before or during the delay would leave a standing allowance to
    an upgradeable proxy for longer than necessary.
-9. Governance reruns the preflight with `RECOVERY_STAGE=execute` (against
-   latest state — it requires the exact allowance, a ready operation, a
-   nonzero projected settlement, and explicit acknowledgment of any
-   material reduction) and executes the batch.
-10. Verify the `StbtcRecoveryCompleted` event and any
+10. Governance reruns the preflight with `RECOVERY_STAGE=execute` (against
+    latest state — it requires the exact allowance, a ready operation, a
+    nonzero projected settlement, and explicit acknowledgment of any
+    material reduction) and executes the batch.
+11. Verify the `StbtcRecoveryCompleted` event and any
     `ReceiptDebtSettlementSkipped` events, the Threshold Safe tBTC increase,
     the stBTC burn, debt and collateral changes, and restoration of
     implementation `0xb3696cdDDEaa764FEF98Dc109ECe3dEfABaB64d8`. If any

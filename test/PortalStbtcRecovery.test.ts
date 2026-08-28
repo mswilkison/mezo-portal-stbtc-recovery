@@ -703,6 +703,8 @@ describe("PortalStbtcRecovery", () => {
       const recipient = await fixture.collateralRecipient.getAddress()
       const depositor = await fixture.depositor.getAddress()
 
+      // Deposit 99 was in the reviewed context but has since been withdrawn
+      // entirely (balance 0), which is the drift this skip reason exists for.
       const settlements = [
         fixture.settlements[0],
         { ...fixture.settlements[1], depositId: 99n },
@@ -713,6 +715,8 @@ describe("PortalStbtcRecovery", () => {
         fixture,
         settlements,
         ethers.id("skip-missing-stbtc-recovery"),
+        undefined,
+        [{ depositor, activeDepositIds: [1n, 2n, 99n] }],
       )
 
       await expect(transaction)
@@ -987,6 +991,27 @@ describe("PortalStbtcRecovery", () => {
       ).to.be.revertedWithCustomError(
         fixture.Recovery,
         "MissingDepositorContext",
+      )
+    })
+
+    it("reverts when a settled deposit is not in the reviewed context", async () => {
+      const fixture = await loadFixture(deployFixture)
+      const depositor = await fixture.depositor.getAddress()
+
+      // Deposit 2 exists and is settleable, but the reviewed context lists
+      // only deposit 1 — calldata the preflight would refuse to print must
+      // not execute on-chain either.
+      await expect(
+        scheduleRecovery(
+          fixture,
+          fixture.settlements,
+          ethers.id("unlisted-deposit-stbtc-recovery"),
+          undefined,
+          [{ depositor, activeDepositIds: [1n] }],
+        ),
+      ).to.be.revertedWithCustomError(
+        fixture.Recovery,
+        "DepositNotInDepositorContext",
       )
     })
 

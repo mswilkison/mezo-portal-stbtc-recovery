@@ -66,11 +66,18 @@ contract PortalStbtcRecovery is Ownable2StepUpgradeable {
 
     /// @notice The reviewed set of deposits with nonzero receipt debt for one
     ///         settled depositor. The stranding guard sums this depositor's
-    ///         live debt over these ids, so every stBTC token they hold stays
-    ///         redeemable against debt they actually retain. Ids must be
-    ///         strictly increasing. An id that no longer carries debt simply
-    ///         contributes zero, and an omitted id only makes the guard more
-    ///         conservative.
+    ///         live debt over these ids, so every stBTC token they hold IN
+    ///         THIS WALLET stays redeemable against debt they actually
+    ///         retain. Ids must be strictly increasing. An id that no longer
+    ///         carries debt simply contributes zero, and an omitted id only
+    ///         makes the guard more conservative.
+    ///
+    ///         Scope limit: the guard can only price `balanceOf(depositor)`.
+    ///         stBTC the same party holds indirectly — in an AMM pool, a
+    ///         vault, or another address — is invisible to it, so the guard
+    ///         is a floor, not a proof. Screening selected depositors for
+    ///         externally-held stBTC is an off-chain review step
+    ///         (scripts/check-external-stbtc.ts); see RECOVERY.md.
     struct DepositorContext {
         address depositor;
         uint256[] activeDepositIds;
@@ -163,6 +170,7 @@ contract PortalStbtcRecovery is Ownable2StepUpgradeable {
     error SettlementTotalExceedsMaximum(uint256 maximum, uint256 requested);
     error ZeroSettlementAmount(address depositor, uint256 depositId);
     error MissingDepositorContext(address depositor);
+    error DepositNotInDepositorContext(address depositor, uint256 depositId);
     error DuplicateDepositorContext(address depositor);
     error InvalidDepositorContext(address depositor);
     error NothingSettled();
@@ -238,7 +246,10 @@ contract PortalStbtcRecovery is Ownable2StepUpgradeable {
     ///      balance. A receipt-token transfer to a selected owner immediately
     ///      before execution can therefore only reduce the recovered amount —
     ///      first absorbed by the owner's unselected debt, never multiplied
-    ///      per entry — and cannot leave the owner with unredeemable stBTC.
+    ///      per entry — and cannot leave the owner holding unredeemable stBTC
+    ///      in the wallet this guard can see. Externally-held stBTC (AMM,
+    ///      vault, another address) is outside its view; screening for that
+    ///      is an off-chain review step described in RECOVERY.md.
     ///      The amount pulled, burned, and released always equals the debt
     ///      actually settled and never exceeds the immutable maximum.
     function recoverTbtc(
@@ -294,7 +305,8 @@ contract PortalStbtcRecovery is Ownable2StepUpgradeable {
 
             uint256 contextIndex = _findDepositorContext(
                 depositorContexts,
-                settlement.depositor
+                settlement.depositor,
+                settlement.depositId
             );
 
             DepositInfo storage deposit = deposits[settlement.depositor][token][
@@ -469,15 +481,25 @@ contract PortalStbtcRecovery is Ownable2StepUpgradeable {
     }
 
     /// @dev Every settlement entry's depositor must have exactly one reviewed
-    ///      context; a missing context is a calldata construction error and
-    ///      reverts the batch.
+    ///      context, and the settled deposit must appear in that context's
+    ///      reviewed id list. Both are calldata construction errors and revert
+    ///      the batch: without the membership check the contract would accept
+    ///      settling a deposit the reviewed context never listed, which the
+    ///      off-chain preflight refuses to even print.
     function _findDepositorContext(
         DepositorContext[] calldata depositorContexts,
-        address depositor
+        address depositor,
+        uint256 depositId
     ) internal pure returns (uint256) {
         for (uint256 i = 0; i < depositorContexts.length; i++) {
             if (depositorContexts[i].depositor == depositor) {
-                return i;
+                uint256[] calldata ids = depositorContexts[i].activeDepositIds;
+                for (uint256 j = 0; j < ids.length; j++) {
+                    if (ids[j] == depositId) {
+                        return i;
+                    }
+                }
+                revert DepositNotInDepositorContext(depositor, depositId);
             }
         }
         revert MissingDepositorContext(depositor);

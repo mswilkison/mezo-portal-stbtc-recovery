@@ -9,6 +9,15 @@ import "hardhat-gas-reporter"
 import dotenv from "dotenv-safer"
 import { tryLoadRecoveryManifest } from "./helpers/recovery-manifest"
 
+// dotenv-safer throws if any key present in the example file is absent from
+// .env, and it runs before hardhat parses anything — so adding a key to the
+// example would break EVERY hardhat invocation for anyone with an older
+// .env, including `npx hardhat run` and `npm run build`, which do not go
+// through the prepare:env npm script. Reconcile .env here so the guarantee
+// holds no matter how hardhat was invoked.
+// eslint-disable-next-line @typescript-eslint/no-var-requires, global-require
+require("./scripts/prepare-env")
+
 dotenv.config({
   allowEmptyValues: true,
   example: process.env.CI ? ".env.ci.example" : ".env.example",

@@ -1,6 +1,7 @@
 import { writeFileSync } from "fs"
 import { join } from "path"
 import { artifacts, ethers } from "hardhat"
+import * as anchors from "../helpers/recovery-anchors"
 import { loadRecoveryManifest } from "../helpers/recovery-manifest"
 import {
   ADMIN_SLOT,
@@ -172,15 +173,18 @@ async function main() {
   }
   const blockTag = { blockTag: pinBlock }
 
+  // Counterparties come from the reviewed anchors, NOT from the previous
+  // manifest. Copying them forward made the manifest its own authority for
+  // the one value nothing on chain anchors (the tBTC destination), so a
+  // corrupted address would survive regeneration and be "verified" against
+  // itself by the bytecode verifier.
   const addresses = {
-    portal: ethers.getAddress(currentManifest.addresses.portal),
+    portal: ethers.getAddress(anchors.PORTAL),
     portalLogicOwner: ethers.getAddress(
       currentManifest.addresses.portalLogicOwner,
     ),
-    receiptPayer: ethers.getAddress(currentManifest.addresses.receiptPayer),
-    collateralRecipient: ethers.getAddress(
-      currentManifest.addresses.collateralRecipient,
-    ),
+    receiptPayer: ethers.getAddress(anchors.RECEIPT_PAYER),
+    collateralRecipient: ethers.getAddress(anchors.COLLATERAL_RECIPIENT),
   }
 
   log(`Pinning manifest at block ${pinBlock} (${block.timestamp})`)
@@ -211,11 +215,27 @@ async function main() {
   const implementationRuntimeHash = ethers.keccak256(implementationCode)
   const portalArtifact = await artifacts.readArtifact("Portal")
   const compiledHash = ethers.keccak256(portalArtifact.deployedBytecode)
-  if (compiledHash !== implementationRuntimeHash) {
-    log(
-      `WARNING: compiled Portal runtime hash ${compiledHash} does not match ` +
-        `the live implementation ${implementationRuntimeHash}; the source ` +
-        "reconstruction no longer matches the deployed Portal",
+  // Hard failure, not a warning. A mismatch means this repository's Portal
+  // reconstruction no longer describes the live implementation, so the
+  // storage-layout review the whole recovery rests on is void. Emitting a
+  // manifest anyway would silently re-anchor the provenance gate to whatever
+  // is live, since the gate compares the artifact against the manifest.
+  if (compiledHash !== anchors.IMPLEMENTATION_RUNTIME_HASH) {
+    fail(
+      `compiled Portal runtime hash ${compiledHash} does not match the ` +
+        `reviewed anchor ${anchors.IMPLEMENTATION_RUNTIME_HASH} ` +
+        "(helpers/recovery-anchors.ts / UPSTREAM.md); rebuild with " +
+        "evmVersion paris or re-review the reconstruction",
+    )
+  }
+  if (implementationRuntimeHash !== anchors.IMPLEMENTATION_RUNTIME_HASH) {
+    fail(
+      `the live Portal implementation (${originalImplementation}, runtime ` +
+        `hash ${implementationRuntimeHash}) is not the reviewed anchor ` +
+        `${anchors.ORIGINAL_IMPLEMENTATION}. The Portal has been upgraded: ` +
+        "re-sync Portal.sol, re-audit the storage mirror in " +
+        "PortalStbtcRecovery.sol, and update helpers/recovery-anchors.ts in " +
+        "a reviewed commit before re-pinning",
     )
   }
 

@@ -17,11 +17,13 @@
     "preflight:recovery": "npm run prepare:env && hardhat run scripts/prepare-stbtc-recovery.ts --network mainnet",
     "generate:recovery-manifest": "npm run prepare:env && hardhat run scripts/generate-stbtc-recovery-manifest.ts --network mainnet",
     "test": "npm run prepare:env && hardhat test",
-    "test:recovery": "npm run prepare:env && hardhat test test/Portal.provenance.test.ts test/RecoveryPreflight.test.ts test/PortalStbtcRecovery.test.ts test/upgrades/PortalStbtcRecovery.upgrades.test.ts",
+    "test:recovery": "npm run prepare:env && hardhat test test/Portal.provenance.test.ts test/RecoveryPreflight.test.ts test/DriftParity.test.ts test/PortalStbtcRecovery.test.ts test/upgrades/PortalStbtcRecovery.upgrades.test.ts",
     "test:recovery:fork": "npm run prepare:env && NODE_ENV=recovery-fork-test hardhat test test/integration/PortalStbtcRecovery.mainnet.test.ts --network hardhat",
     "test:upgrades": "npm run prepare:env && NODE_ENV=upgrades-test hardhat test ./test/upgrades/*.test.ts --network mainnet_fork",
     "node": "hardhat node",
-    "deploy": "npm run prepare:env && hardhat deploy"
+    "deploy": "npm run prepare:env && hardhat deploy",
+    "check:external-stbtc": "npm run prepare:env && hardhat run scripts/check-external-stbtc.ts --network mainnet",
+    "import:portal-layout": "npm run prepare:env && hardhat run scripts/import-portal-layout.ts --network mainnet"
   },
   "devDependencies": {
     "@keep-network/hardhat-helpers": "0.7.2",
