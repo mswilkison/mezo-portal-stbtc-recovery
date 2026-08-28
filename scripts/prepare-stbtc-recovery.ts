@@ -5,8 +5,15 @@ import {
   recoveryManifestPath,
 } from "../helpers/recovery-manifest"
 import {
+  ADMIN_SLOT,
+  FEE_PRECISION,
+  IMPLEMENTATION_SLOT,
+  ONE_YEAR,
+  SettlementProjectionInput,
+  buildRecoveryBatchPayloads,
   hasExactRecoveryAllowance,
   pinnedBlockContext,
+  projectSettlementOutcome,
   recomputeActiveReceiptDebt,
 } from "../helpers/recovery-preflight"
 import {
@@ -14,22 +21,21 @@ import {
   verifyRecoveryBytecode,
 } from "../helpers/verify-recovery-bytecode"
 
-const IMPLEMENTATION_SLOT =
-  "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc"
-const ADMIN_SLOT =
-  "0xb53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d6103"
-const ONE_YEAR = 365n * 24n * 60n * 60n
-const FEE_PRECISION = 10n ** 18n
-
 const PROPOSER_ROLE = ethers.id("PROPOSER_ROLE")
 const EXECUTOR_ROLE = ethers.id("EXECUTOR_ROLE")
 const CANCELLER_ROLE = ethers.id("CANCELLER_ROLE")
 
-// RECOVERY_STAGE=prepare (default) validates state and prints calldata while
-// the Threshold approval is still expected to be outstanding.
+// RECOVERY_STAGE=prepare (default) validates the manifest against a chosen
+// block (RECOVERY_BLOCK or latest) and prints calldata while the Threshold
+// approval is still expected to be outstanding. Selected-deposit state must
+// match the manifest exactly at the snapshot block; at other blocks drift is
+// reported and the clamped execution outcome is projected instead, because
+// the contract tolerates drift by design — a hard failure here would hand
+// third parties a process-level veto the contract itself does not have.
 // RECOVERY_STAGE=execute is the mandatory rerun immediately before
-// `executeBatch`: it additionally requires the exact stBTC allowance to be in
-// place and the scheduled timelock operation to be ready.
+// `executeBatch`: it always runs against latest state and additionally
+// requires the exact stBTC allowance, a ready timelock operation, and a
+// nonzero projected settlement.
 const STAGE = process.env.RECOVERY_STAGE ?? "prepare"
 
 function fail(message: string): never {
@@ -109,6 +115,13 @@ async function main() {
   const requestedBlock = process.env.RECOVERY_BLOCK
     ? Number(process.env.RECOVERY_BLOCK)
     : undefined
+  // A historical block would make every "green means executeBatch cannot
+  // revert" guarantee meaningless, so the execute stage refuses one.
+  if (STAGE === "execute" && requestedBlock !== undefined) {
+    fail(
+      "RECOVERY_STAGE=execute must validate latest state; unset RECOVERY_BLOCK",
+    )
+  }
   const block = await ethers.provider.getBlock(requestedBlock ?? "latest")
   if (!block) {
     fail(`block ${requestedBlock ?? "latest"} was not found`)
@@ -119,6 +132,29 @@ async function main() {
   const { rpcBlockTag: blockTag, callOverrides } = pinnedBlockContext(
     block.number,
   )
+  const atSnapshotBlock = block.number === manifest.snapshotBlock
+
+  // Selected-deposit drift handling: a mismatch against the reviewed
+  // manifest is fatal at the snapshot block (the manifest itself would be
+  // wrong) but only reported elsewhere — the projection below computes what
+  // the drift-tolerant contract would actually settle.
+  const driftMessages: string[] = []
+  function expectMatch(
+    label: string,
+    actual: bigint | number | string,
+    expected: bigint | number | string,
+  ): void {
+    if (actual.toString().toLowerCase() !== expected.toString().toLowerCase()) {
+      if (atSnapshotBlock) {
+        fail(
+          `${label}: expected ${expected.toString()}, got ${actual.toString()}`,
+        )
+      }
+      driftMessages.push(
+        `${label}: manifest ${expected.toString()}, live ${actual.toString()}`,
+      )
+    }
+  }
 
   // Full EIP-55 checksum validation. The manifest must carry checksummed
   // addresses; a single corrupted character (collateralRecipient is the one
@@ -280,38 +316,36 @@ async function main() {
     )
   }
 
-  const recoveryAmount = BigInt(manifest.recoveryAmountWei)
+  const roundAmount = BigInt(manifest.recoveryAmountWei)
   const manifestTotal = manifest.settlements.reduce(
     (total, settlement) => total + BigInt(settlement.amountWei),
     0n,
   )
-  expectEqual("manifest settlement total", manifestTotal, recoveryAmount)
+  expectEqual("manifest settlement total", manifestTotal, roundAmount)
 
-  if (BigInt(portalTbtcBalance) < recoveryAmount) {
+  if (BigInt(portalTbtcBalance) < roundAmount) {
     fail("Portal does not hold enough tBTC")
   }
-  if (BigInt(receiptPayerBalance) < recoveryAmount) {
+  if (BigInt(receiptPayerBalance) < roundAmount) {
     fail("receipt payer does not hold the configured stBTC amount")
   }
-  if (BigInt(portalStbtcDebt) < recoveryAmount) {
+  if (BigInt(portalStbtcDebt) < roundAmount) {
     fail("Portal does not have enough stBTC debt to burn the recovery amount")
   }
-  if (BigInt(fee.totalMinted) < recoveryAmount) {
+  if (BigInt(fee.totalMinted) < roundAmount) {
     fail("Portal does not have enough tBTC-specific receipt debt")
   }
 
   // Threshold's one on-chain action. In the execute-stage rerun this is a
   // hard requirement — a green preflight must guarantee executeBatch cannot
   // revert inside safeTransferFrom.
-  if (
-    !hasExactRecoveryAllowance(BigInt(receiptPayerAllowance), recoveryAmount)
-  ) {
+  if (!hasExactRecoveryAllowance(BigInt(receiptPayerAllowance), roundAmount)) {
     const message =
       "receipt payer allowance to the Portal proxy is " +
       `${receiptPayerAllowance.toString()} but must equal exactly ` +
-      `${recoveryAmount.toString()}; Threshold must approve the Portal ` +
+      `${roundAmount.toString()}; Threshold must approve the Portal ` +
       `proxy (${addresses.portal}) — not the recovery implementation — ` +
-      "for exactly the recovery amount"
+      "for exactly this round's settlement total"
     if (STAGE === "execute") {
       fail(message)
     }
@@ -333,36 +367,44 @@ async function main() {
         callOverrides,
       )
 
-      expectEqual(
+      expectMatch(
         `deposit ${settlement.depositor}/${settlement.depositId} balance`,
         deposit.balance,
         settlement.preState.balanceWei,
       )
-      expectEqual(
+      expectMatch(
         `deposit ${settlement.depositor}/${settlement.depositId} debt`,
         deposit.receiptMinted,
         settlement.preState.receiptDebtWei,
       )
-      expectEqual(
+      expectMatch(
         `deposit ${settlement.depositor}/${settlement.depositId} fee owed`,
         deposit.feeOwed,
         settlement.preState.feeOwedWei,
       )
-      expectEqual(
+      expectMatch(
         `deposit ${settlement.depositor}/${settlement.depositId} fee integral`,
         deposit.lastFeeIntegral,
         settlement.preState.lastFeeIntegral,
       )
-      expectEqual(
+      expectMatch(
         `deposit ${settlement.depositor}/${settlement.depositId} migration state`,
         deposit.tbtcMigrationState,
         settlement.preState.migrationState,
       )
 
       const amount = BigInt(settlement.amountWei)
-      if (amount === 0n || amount > BigInt(deposit.receiptMinted)) {
+      // Manifest integrity, not drift: a zero or debt-exceeding amount at
+      // the snapshot block means the selection itself is wrong.
+      if (amount === 0n) {
         fail(
-          `invalid amount for deposit ${settlement.depositor}/${settlement.depositId}`,
+          `zero amount for deposit ${settlement.depositor}/${settlement.depositId}`,
+        )
+      }
+      if (atSnapshotBlock && amount > BigInt(deposit.receiptMinted)) {
+        fail(
+          "amount exceeds snapshot debt for deposit " +
+            `${settlement.depositor}/${settlement.depositId}`,
         )
       }
 
@@ -373,13 +415,13 @@ async function main() {
           FEE_PRECISION
       const collateralMargin =
         BigInt(deposit.balance) - BigInt(deposit.receiptMinted) - projectedFee
-      if (collateralMargin < 0n) {
+      if (atSnapshotBlock && collateralMargin < 0n) {
         fail(
           `deposit ${settlement.depositor}/${settlement.depositId} is undercollateralized`,
         )
       }
 
-      if (block.number === manifest.snapshotBlock) {
+      if (atSnapshotBlock) {
         expectEqual(
           `deposit ${settlement.depositor}/${settlement.depositId} snapshot fee`,
           projectedFee,
@@ -400,20 +442,19 @@ async function main() {
         depositorActiveDepositIds: settlement.depositorActiveDepositIds,
         currentBalanceWei: BigInt(deposit.balance),
         currentDebtWei: BigInt(deposit.receiptMinted),
+        migrating: Number(deposit.tbtcMigrationState) !== 0,
         projectedFeeWei: projectedFee,
         collateralMarginWei: collateralMargin,
       }
     }),
   )
 
-  // Stranding check: settling a deposit burns down debt the depositor could
-  // otherwise repay themselves. A depositor left holding more stBTC than
-  // their remaining receipt debt has no repayment path for the excess — the
-  // exact condition this recovery exists to cure for Threshold must not be
-  // recreated for a third party. The manifest supplies the complete set of
-  // deposit ids that were active for each selected owner at the snapshot, but
-  // their debt is read again at this preflight's pinned block. A newly active
-  // id omitted from the snapshot can only make this recomputation conservative.
+  // Stranding capacity per selected owner, mirroring the contract's guard:
+  // live non-migrating receipt debt summed over the reviewed active deposit
+  // ids, minus the owner's live stBTC balance. The manifest supplies the id
+  // lists (sorted, as the contract requires); their debt is read again at
+  // this preflight's pinned block. A newly active id omitted from the
+  // snapshot only makes the recomputation conservative.
   const byDepositor = new Map<
     string,
     {
@@ -453,78 +494,111 @@ async function main() {
     byDepositor.set(settlement.depositor, entry)
   })
 
-  const strandingCheck = await Promise.all(
+  const ownerCapacity = new Map<string, bigint>()
+  const ownerReports = await Promise.all(
     Array.from(byDepositor.entries()).map(async ([depositor, entry]) => {
-      const { depositIds, totalDebt: debtBefore } =
-        await recomputeActiveReceiptDebt(
-          entry.activeDepositIds,
-          async (depositId) =>
-            BigInt(
-              (
-                await portal.deposits(
-                  depositor,
-                  addresses.tbtc,
-                  depositId,
-                  callOverrides,
-                )
-              ).receiptMinted,
-            ),
-        )
-      if (block.number === manifest.snapshotBlock) {
+      const { totalDebt: liveActiveDebt } = await recomputeActiveReceiptDebt(
+        entry.activeDepositIds,
+        async (depositId) => {
+          const deposit = await portal.deposits(
+            depositor,
+            addresses.tbtc,
+            depositId,
+            callOverrides,
+          )
+          return {
+            receiptMintedWei: BigInt(deposit.receiptMinted),
+            migrating: Number(deposit.tbtcMigrationState) !== 0,
+          }
+        },
+      )
+      if (atSnapshotBlock) {
         expectEqual(
           `depositor ${depositor} active debt at snapshot`,
-          debtBefore,
+          liveActiveDebt,
           entry.manifestActiveDebt,
-        )
-      }
-      if (entry.settled > debtBefore) {
-        fail(
-          `settlements for ${depositor} exceed live active debt ` +
-            `(${entry.settled.toString()} > ${debtBefore.toString()})`,
         )
       }
 
       const stbtcBalance = BigInt(
         await stbtc.balanceOf(depositor, callOverrides),
       )
-      const debtAfter = debtBefore - entry.settled
+      const capacity =
+        liveActiveDebt > stbtcBalance ? liveActiveDebt - stbtcBalance : 0n
+      ownerCapacity.set(depositor, capacity)
       return {
         depositor,
-        activeDepositIds: depositIds,
         stbtcBalanceWei: stbtcBalance,
-        manifestReceiptDebtWei: entry.manifestActiveDebt,
-        receiptDebtBeforeWei: debtBefore,
-        receiptDebtAfterWei: debtAfter,
-        strandedExcessWei:
-          stbtcBalance > debtAfter ? stbtcBalance - debtAfter : 0n,
+        liveActiveDebtWei: liveActiveDebt,
+        requestedSettlementWei: entry.settled,
+        strandingCapacityWei: capacity,
       }
     }),
   )
 
-  const strandedDepositors = strandingCheck.filter(
-    (entry) => entry.strandedExcessWei > 0n,
+  // Project the clamped execution outcome the contract will produce. The
+  // contract enforces the stranding guard atomically, so preflight's job is
+  // to predict the settled amount, not to re-block what the contract already
+  // handles safely (a hard failure on a wei-level donation would recreate
+  // the process-layer veto).
+  const projectionInputs: SettlementProjectionInput[] = checkedSettlements.map(
+    (settlement) => ({
+      depositor: settlement.depositor,
+      depositId: settlement.depositId,
+      amountWei: settlement.amount,
+      deposit: {
+        balanceWei: settlement.currentBalanceWei,
+        receiptMintedWei: settlement.currentDebtWei,
+        migrating: settlement.migrating,
+        projectedFeeWei: settlement.projectedFeeWei,
+      },
+    }),
   )
-  if (strandedDepositors.length > 0) {
-    const details = strandedDepositors
-      .map(
-        (entry) =>
-          `${entry.depositor} holds ${entry.stbtcBalanceWei.toString()} stBTC ` +
-          `but would retain only ${entry.receiptDebtAfterWei.toString()} ` +
-          `receipt debt (${entry.strandedExcessWei.toString()} unredeemable)`,
-      )
-      .join("; ")
-    if (process.env.RECOVERY_ACKNOWLEDGE_STRANDING === "1") {
-      warn(
-        `stranding acknowledged by RECOVERY_ACKNOWLEDGE_STRANDING: ${details}`,
-      )
-    } else {
+  const { projected, projectedTotalWei } = projectSettlementOutcome(
+    projectionInputs,
+    ownerCapacity,
+  )
+  const projectedResidualWei = manifestTotal - projectedTotalWei
+
+  if (driftMessages.length > 0) {
+    warn(
+      "selected deposit state drifted from the manifest (execution will " +
+        `clamp accordingly):\n  - ${driftMessages.join("\n  - ")}`,
+    )
+  }
+
+  if (projectedTotalWei === 0n) {
+    fail(
+      "no settlement would apply at the current state — executeBatch would " +
+        "revert with NothingSettled; cancel the operation and re-pin the " +
+        "manifest",
+    )
+  }
+
+  if (projectedResidualWei > 0n) {
+    const message =
+      `projected settlement is ${projectedTotalWei.toString()} of the ` +
+      `reviewed ${manifestTotal.toString()} ` +
+      `(${projectedResidualWei.toString()} residual would remain with the ` +
+      "receipt payer for a follow-up round)"
+    // At the prepare stage a materially reduced projection means the
+    // selection should be regenerated instead of scheduled. Wei-level noise
+    // (up to the generator's dust threshold per selected owner) is
+    // tolerated; anything larger needs an explicit governance decision.
+    const reductionTolerance = 1000000000000n * BigInt(ownerReports.length)
+    if (
+      STAGE === "prepare" &&
+      projectedResidualWei > reductionTolerance &&
+      process.env.RECOVERY_ACCEPT_REDUCED_RECOVERY !== "1"
+    ) {
       fail(
-        `settlement would strand third-party stBTC holders: ${details}. ` +
-          "Regenerate the manifest with a balance-aware selection " +
+        `${message}. Regenerate the manifest ` +
           "(scripts/generate-stbtc-recovery-manifest.ts) or, if governance " +
-          "explicitly accepts this, set RECOVERY_ACKNOWLEDGE_STRANDING=1",
+          "accepts recovering less in this round, set " +
+          "RECOVERY_ACCEPT_REDUCED_RECOVERY=1",
       )
     }
+    warn(message)
   }
 
   const recoveryFactory = await ethers.getContractFactory("PortalStbtcRecovery")
@@ -535,17 +609,14 @@ async function main() {
     addresses.collateralRecipient,
     addresses.tbtc,
     addresses.stbtc,
-    recoveryAmount,
+    roundAmount,
   ] as const
-  const expectedRecoveryImmutables: RecoveryImmutableValues = {
-    EXPECTED_PORTAL: addresses.portal,
-    RECOVERY_AUTHORITY: addresses.proxyAdmin,
-    RECEIPT_PAYER: addresses.receiptPayer,
-    COLLATERAL_RECIPIENT: addresses.collateralRecipient,
-    EXPECTED_TBTC: addresses.tbtc,
-    EXPECTED_RECEIPT_TOKEN: addresses.stbtc,
-    EXPECTED_RECOVERY_AMOUNT: recoveryAmount,
-  }
+  const depositorContexts = Array.from(byDepositor.entries()).map(
+    ([depositor, entry]) => ({
+      depositor,
+      activeDepositIds: entry.activeDepositIds.map((id) => BigInt(id)),
+    }),
+  )
   const recoveryCall = recoveryFactory.interface.encodeFunctionData(
     "recoverTbtc",
     [
@@ -554,11 +625,12 @@ async function main() {
         depositId,
         amount,
       })),
+      depositorContexts,
     ],
   )
   const approvalCall = new ethers.Interface([
     "function approve(address spender,uint256 amount) returns (bool)",
-  ]).encodeFunctionData("approve", [addresses.portal, recoveryAmount])
+  ]).encodeFunctionData("approve", [addresses.portal, roundAmount])
 
   const manifestHash = ethers.keccak256(readFileSync(recoveryManifestPath))
 
@@ -595,7 +667,13 @@ async function main() {
       receiptPayerStbtcBalanceWei: receiptPayerBalance,
       receiptPayerAllowanceWei: receiptPayerAllowance,
     },
-    strandingCheck,
+    settlementProjection: {
+      manifestTotalWei: manifestTotal,
+      projectedTotalWei,
+      projectedResidualWei,
+      owners: ownerReports,
+      entries: projected,
+    },
     receiptPayerApproval: {
       from: addresses.receiptPayer,
       target: addresses.stbtc,
@@ -624,38 +702,81 @@ async function main() {
       fail(`no code at RECOVERY_IMPLEMENTATION ${recoveryAddress}`)
     }
 
-    // The deployed implementation must be byte-for-byte the compiled local
-    // artifact. Every immutable occurrence is checked against its expected
-    // constructor value before the ranges are masked for the remaining-code
-    // comparison; checking only the seven getters is insufficient because
-    // custom initcode can patch separate occurrences differently.
-    const bytecodeVerification = await verifyRecoveryBytecode(
-      ethers.provider,
-      recoveryAddress,
-      expectedRecoveryImmutables,
-      block.number,
-    )
-
     const configuredRecovery = new ethers.Contract(
       recoveryAddress,
       recoveryFactory.interface,
       ethers.provider,
     )
-    const immutableValues = await Promise.all([
+    const [
+      deployedPortal,
+      deployedAuthority,
+      deployedPayer,
+      deployedRecipient,
+      deployedTbtc,
+      deployedReceiptToken,
+      deployedMaxAmount,
+    ] = await Promise.all([
       configuredRecovery.EXPECTED_PORTAL(callOverrides),
       configuredRecovery.RECOVERY_AUTHORITY(callOverrides),
       configuredRecovery.RECEIPT_PAYER(callOverrides),
       configuredRecovery.COLLATERAL_RECIPIENT(callOverrides),
       configuredRecovery.EXPECTED_TBTC(callOverrides),
       configuredRecovery.EXPECTED_RECEIPT_TOKEN(callOverrides),
-      configuredRecovery.EXPECTED_RECOVERY_AMOUNT(callOverrides),
+      configuredRecovery.EXPECTED_MAX_RECOVERY_AMOUNT(callOverrides),
     ])
-    constructorArgs.forEach((expected, index) =>
-      expectEqual(
-        `recovery immutable ${index}`,
-        immutableValues[index],
-        expected,
-      ),
+    expectEqual("recovery EXPECTED_PORTAL", deployedPortal, addresses.portal)
+    expectEqual(
+      "recovery RECOVERY_AUTHORITY",
+      deployedAuthority,
+      addresses.proxyAdmin,
+    )
+    expectEqual("recovery RECEIPT_PAYER", deployedPayer, addresses.receiptPayer)
+    expectEqual(
+      "recovery COLLATERAL_RECIPIENT",
+      deployedRecipient,
+      addresses.collateralRecipient,
+    )
+    expectEqual("recovery EXPECTED_TBTC", deployedTbtc, addresses.tbtc)
+    expectEqual(
+      "recovery EXPECTED_RECEIPT_TOKEN",
+      deployedReceiptToken,
+      addresses.stbtc,
+    )
+    // The immutable is an upper bound so a residual round can reuse this
+    // deployed, reviewed implementation with a smaller fresh manifest.
+    if (BigInt(deployedMaxAmount) < manifestTotal) {
+      fail(
+        `recovery EXPECTED_MAX_RECOVERY_AMOUNT ${deployedMaxAmount} is below ` +
+          `this round's settlement total ${manifestTotal.toString()}`,
+      )
+    }
+    if (BigInt(deployedMaxAmount) > manifestTotal) {
+      warn(
+        `deployed EXPECTED_MAX_RECOVERY_AMOUNT ${deployedMaxAmount} exceeds ` +
+          `this round's total ${manifestTotal.toString()} (expected for a ` +
+          "residual round reusing the original deployment)",
+      )
+    }
+
+    // The deployed implementation must be byte-for-byte the compiled local
+    // artifact. Every immutable occurrence is checked against the deployed
+    // getter values before the ranges are masked for the remaining-code
+    // comparison; checking only the seven getters is insufficient because
+    // custom initcode can patch separate occurrences differently.
+    const expectedRecoveryImmutables: RecoveryImmutableValues = {
+      EXPECTED_PORTAL: addresses.portal,
+      RECOVERY_AUTHORITY: addresses.proxyAdmin,
+      RECEIPT_PAYER: addresses.receiptPayer,
+      COLLATERAL_RECIPIENT: addresses.collateralRecipient,
+      EXPECTED_TBTC: addresses.tbtc,
+      EXPECTED_RECEIPT_TOKEN: addresses.stbtc,
+      EXPECTED_MAX_RECOVERY_AMOUNT: BigInt(deployedMaxAmount),
+    }
+    const bytecodeVerification = await verifyRecoveryBytecode(
+      ethers.provider,
+      recoveryAddress,
+      expectedRecoveryImmutables,
+      block.number,
     )
 
     const misdirectedAllowance = BigInt(
@@ -674,20 +795,13 @@ async function main() {
       )
     }
 
-    const proxyAdminInterface = new ethers.Interface([
-      "function upgradeAndCall(address proxy,address implementation,bytes data) payable",
-    ])
-    const installAndRecover = proxyAdminInterface.encodeFunctionData(
-      "upgradeAndCall",
-      [addresses.portal, recoveryAddress, recoveryCall],
-    )
-    const restorePortal = proxyAdminInterface.encodeFunctionData(
-      "upgradeAndCall",
-      [addresses.portal, addresses.originalImplementation, "0x"],
-    )
-    const targets = [addresses.proxyAdmin, addresses.proxyAdmin]
-    const values = [0n, 0n]
-    const payloads = [installAndRecover, restorePortal]
+    const { targets, values, payloads } = buildRecoveryBatchPayloads({
+      portal: addresses.portal,
+      proxyAdmin: addresses.proxyAdmin,
+      recoveryImplementation: recoveryAddress,
+      originalImplementation: addresses.originalImplementation,
+      recoverCalldata: recoveryCall,
+    })
     const predecessor = ethers.ZeroHash
     const { salt, derivation } = operationSalt(manifestHash)
     const operationId = await timelock.hashOperationBatch(
@@ -742,6 +856,7 @@ async function main() {
       recoveryImplementationRuntimeHash:
         bytecodeVerification.deployedRuntimeHash,
       recoveryArtifactRuntimeHash: bytecodeVerification.artifactRuntimeHash,
+      recoveryMaxAmountWei: deployedMaxAmount,
       bytecodeVerified: true,
       operationId,
       operationState,
