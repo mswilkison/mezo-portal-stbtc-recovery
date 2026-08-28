@@ -319,13 +319,25 @@ async function main() {
     balanceEntries.map(({ depositor, balance }) => [depositor, balance]),
   )
   const activeDebtByDepositor = new Map<string, bigint>()
+  const activeDepositIdsByDepositor = new Map<string, bigint[]>()
   active.forEach((deposit) => {
     activeDebtByDepositor.set(
       deposit.depositor,
       (activeDebtByDepositor.get(deposit.depositor) ?? 0n) +
         deposit.receiptMinted,
     )
+    const depositIds = activeDepositIdsByDepositor.get(deposit.depositor) ?? []
+    depositIds.push(deposit.depositId)
+    activeDepositIdsByDepositor.set(deposit.depositor, depositIds)
   })
+  activeDepositIdsByDepositor.forEach((depositIds) =>
+    depositIds.sort((a, b) => {
+      if (a === b) {
+        return 0
+      }
+      return a < b ? -1 : 1
+    }),
+  )
 
   const excludedDepositors = new Set(
     depositors.filter((depositor) => stbtcBalances.get(depositor)! > dustWei),
@@ -443,6 +455,9 @@ async function main() {
       depositorActiveDebtWei: activeDebtByDepositor
         .get(deposit.depositor)!
         .toString(),
+      depositorActiveDepositIds: activeDepositIdsByDepositor
+        .get(deposit.depositor)!
+        .map((depositId) => depositId.toString()),
       preState: {
         balanceWei: deposit.balance.toString(),
         receiptDebtWei: deposit.receiptMinted.toString(),

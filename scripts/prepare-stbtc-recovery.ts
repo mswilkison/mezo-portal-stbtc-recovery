@@ -4,7 +4,15 @@ import {
   recoveryManifest as manifest,
   recoveryManifestPath,
 } from "../helpers/recovery-manifest"
-import { verifyRecoveryBytecode } from "../helpers/verify-recovery-bytecode"
+import {
+  hasExactRecoveryAllowance,
+  pinnedBlockContext,
+  recomputeActiveReceiptDebt,
+} from "../helpers/recovery-preflight"
+import {
+  RecoveryImmutableValues,
+  verifyRecoveryBytecode,
+} from "../helpers/verify-recovery-bytecode"
 
 const IMPLEMENTATION_SLOT =
   "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc"
@@ -101,11 +109,16 @@ async function main() {
   const requestedBlock = process.env.RECOVERY_BLOCK
     ? Number(process.env.RECOVERY_BLOCK)
     : undefined
-  const blockTag = requestedBlock ? ethers.toQuantity(requestedBlock) : "latest"
   const block = await ethers.provider.getBlock(requestedBlock ?? "latest")
   if (!block) {
     fail(`block ${requestedBlock ?? "latest"} was not found`)
   }
+  // Resolve `latest` exactly once. Every subsequent storage read, eth_call,
+  // code read, fee calculation, and operation-state check is pinned to this
+  // block so a slow preflight can never mix state from adjacent blocks.
+  const { rpcBlockTag: blockTag, callOverrides } = pinnedBlockContext(
+    block.number,
+  )
 
   // Full EIP-55 checksum validation. The manifest must carry checksummed
   // addresses; a single corrupted character (collateralRecipient is the one
@@ -149,7 +162,7 @@ async function main() {
 
   const implementationCode = await ethers.provider.getCode(
     implementation,
-    requestedBlock ?? "latest",
+    block.number,
   )
   expectEqual(
     "Portal implementation runtime hash",
@@ -200,7 +213,6 @@ async function main() {
     ethers.provider,
   )
 
-  const callOverrides = { blockTag: requestedBlock ?? "latest" }
   const [
     configuredTbtc,
     fee,
@@ -291,10 +303,12 @@ async function main() {
   // Threshold's one on-chain action. In the execute-stage rerun this is a
   // hard requirement — a green preflight must guarantee executeBatch cannot
   // revert inside safeTransferFrom.
-  if (BigInt(receiptPayerAllowance) < recoveryAmount) {
+  if (
+    !hasExactRecoveryAllowance(BigInt(receiptPayerAllowance), recoveryAmount)
+  ) {
     const message =
       "receipt payer allowance to the Portal proxy is " +
-      `${receiptPayerAllowance.toString()} but the recovery pulls ` +
+      `${receiptPayerAllowance.toString()} but must equal exactly ` +
       `${recoveryAmount.toString()}; Threshold must approve the Portal ` +
       `proxy (${addresses.portal}) — not the recovery implementation — ` +
       "for exactly the recovery amount"
@@ -383,6 +397,7 @@ async function main() {
         depositId: BigInt(settlement.depositId),
         amount,
         depositorActiveDebtWei: settlement.depositorActiveDebtWei,
+        depositorActiveDepositIds: settlement.depositorActiveDepositIds,
         currentBalanceWei: BigInt(deposit.balance),
         currentDebtWei: BigInt(deposit.receiptMinted),
         projectedFeeWei: projectedFee,
@@ -395,38 +410,89 @@ async function main() {
   // otherwise repay themselves. A depositor left holding more stBTC than
   // their remaining receipt debt has no repayment path for the excess — the
   // exact condition this recovery exists to cure for Threshold must not be
-  // recreated for a third party. `depositorActiveDebtWei` (from the manifest
-  // generator) counts all of the depositor's active deposits; if absent, only
-  // the manifest's own entries are counted, which can only overstate the
-  // stranding risk, never hide it.
+  // recreated for a third party. The manifest supplies the complete set of
+  // deposit ids that were active for each selected owner at the snapshot, but
+  // their debt is read again at this preflight's pinned block. A newly active
+  // id omitted from the snapshot can only make this recomputation conservative.
   const byDepositor = new Map<
     string,
-    { settled: bigint; manifestDebt: bigint; activeDebt?: bigint }
+    {
+      settled: bigint
+      manifestActiveDebt: bigint
+      activeDepositIds: string[]
+    }
   >()
   checkedSettlements.forEach((settlement) => {
-    const entry = byDepositor.get(settlement.depositor) ?? {
+    const activeDepositIds = settlement.depositorActiveDepositIds
+    if (!activeDepositIds.includes(settlement.depositId.toString())) {
+      fail(
+        `active deposit ids for ${settlement.depositor} do not include ` +
+          `selected deposit ${settlement.depositId.toString()}`,
+      )
+    }
+
+    const manifestActiveDebt = BigInt(settlement.depositorActiveDebtWei)
+    const existing = byDepositor.get(settlement.depositor)
+    if (
+      existing &&
+      (existing.manifestActiveDebt !== manifestActiveDebt ||
+        existing.activeDepositIds.join(",") !== activeDepositIds.join(","))
+    ) {
+      fail(
+        `inconsistent active-debt metadata for ${settlement.depositor} ` +
+          "across settlement entries",
+      )
+    }
+
+    const entry = existing ?? {
       settled: 0n,
-      manifestDebt: 0n,
-      activeDebt: undefined,
+      manifestActiveDebt,
+      activeDepositIds,
     }
     entry.settled += settlement.amount
-    entry.manifestDebt += settlement.currentDebtWei
-    if (settlement.depositorActiveDebtWei) {
-      entry.activeDebt = BigInt(settlement.depositorActiveDebtWei)
-    }
     byDepositor.set(settlement.depositor, entry)
   })
 
   const strandingCheck = await Promise.all(
     Array.from(byDepositor.entries()).map(async ([depositor, entry]) => {
+      const { depositIds, totalDebt: debtBefore } =
+        await recomputeActiveReceiptDebt(
+          entry.activeDepositIds,
+          async (depositId) =>
+            BigInt(
+              (
+                await portal.deposits(
+                  depositor,
+                  addresses.tbtc,
+                  depositId,
+                  callOverrides,
+                )
+              ).receiptMinted,
+            ),
+        )
+      if (block.number === manifest.snapshotBlock) {
+        expectEqual(
+          `depositor ${depositor} active debt at snapshot`,
+          debtBefore,
+          entry.manifestActiveDebt,
+        )
+      }
+      if (entry.settled > debtBefore) {
+        fail(
+          `settlements for ${depositor} exceed live active debt ` +
+            `(${entry.settled.toString()} > ${debtBefore.toString()})`,
+        )
+      }
+
       const stbtcBalance = BigInt(
         await stbtc.balanceOf(depositor, callOverrides),
       )
-      const debtBefore = entry.activeDebt ?? entry.manifestDebt
       const debtAfter = debtBefore - entry.settled
       return {
         depositor,
+        activeDepositIds: depositIds,
         stbtcBalanceWei: stbtcBalance,
+        manifestReceiptDebtWei: entry.manifestActiveDebt,
         receiptDebtBeforeWei: debtBefore,
         receiptDebtAfterWei: debtAfter,
         strandedExcessWei:
@@ -471,6 +537,15 @@ async function main() {
     addresses.stbtc,
     recoveryAmount,
   ] as const
+  const expectedRecoveryImmutables: RecoveryImmutableValues = {
+    EXPECTED_PORTAL: addresses.portal,
+    RECOVERY_AUTHORITY: addresses.proxyAdmin,
+    RECEIPT_PAYER: addresses.receiptPayer,
+    COLLATERAL_RECIPIENT: addresses.collateralRecipient,
+    EXPECTED_TBTC: addresses.tbtc,
+    EXPECTED_RECEIPT_TOKEN: addresses.stbtc,
+    EXPECTED_RECOVERY_AMOUNT: recoveryAmount,
+  }
   const recoveryCall = recoveryFactory.interface.encodeFunctionData(
     "recoverTbtc",
     [
@@ -541,17 +616,24 @@ async function main() {
   }
   if (recoveryImplementation) {
     const recoveryAddress = ethers.getAddress(recoveryImplementation)
-    const recoveryCode = await ethers.provider.getCode(recoveryAddress)
+    const recoveryCode = await ethers.provider.getCode(
+      recoveryAddress,
+      block.number,
+    )
     if (recoveryCode === "0x") {
       fail(`no code at RECOVERY_IMPLEMENTATION ${recoveryAddress}`)
     }
 
     // The deployed implementation must be byte-for-byte the compiled local
-    // artifact (immutable value ranges masked), not merely a contract whose
-    // seven getters echo the expected values.
+    // artifact. Every immutable occurrence is checked against its expected
+    // constructor value before the ranges are masked for the remaining-code
+    // comparison; checking only the seven getters is insufficient because
+    // custom initcode can patch separate occurrences differently.
     const bytecodeVerification = await verifyRecoveryBytecode(
       ethers.provider,
       recoveryAddress,
+      expectedRecoveryImmutables,
+      block.number,
     )
 
     const configuredRecovery = new ethers.Contract(
@@ -560,13 +642,13 @@ async function main() {
       ethers.provider,
     )
     const immutableValues = await Promise.all([
-      configuredRecovery.EXPECTED_PORTAL(),
-      configuredRecovery.RECOVERY_AUTHORITY(),
-      configuredRecovery.RECEIPT_PAYER(),
-      configuredRecovery.COLLATERAL_RECIPIENT(),
-      configuredRecovery.EXPECTED_TBTC(),
-      configuredRecovery.EXPECTED_RECEIPT_TOKEN(),
-      configuredRecovery.EXPECTED_RECOVERY_AMOUNT(),
+      configuredRecovery.EXPECTED_PORTAL(callOverrides),
+      configuredRecovery.RECOVERY_AUTHORITY(callOverrides),
+      configuredRecovery.RECEIPT_PAYER(callOverrides),
+      configuredRecovery.COLLATERAL_RECIPIENT(callOverrides),
+      configuredRecovery.EXPECTED_TBTC(callOverrides),
+      configuredRecovery.EXPECTED_RECEIPT_TOKEN(callOverrides),
+      configuredRecovery.EXPECTED_RECOVERY_AMOUNT(callOverrides),
     ])
     constructorArgs.forEach((expected, index) =>
       expectEqual(
@@ -614,6 +696,7 @@ async function main() {
       payloads,
       predecessor,
       salt,
+      callOverrides,
     )
 
     // Surface the operation's lifecycle state so stale or duplicate

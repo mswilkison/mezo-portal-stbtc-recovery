@@ -73,7 +73,8 @@ contract PortalStbtcRecovery is Ownable2StepUpgradeable {
         DepositNotFound,
         DepositMigrating,
         DebtAlreadyRepaid,
-        Undercollateralized
+        Undercollateralized,
+        ReceiptHolderWouldBeStranded
     }
 
     // ---------------------------------------------------------------------
@@ -206,7 +207,10 @@ contract PortalStbtcRecovery is Ownable2StepUpgradeable {
     ///      revert here would let any third-party depositor veto the whole
     ///      timelock operation with a 1 wei repayment. The amount pulled,
     ///      burned, and released always equals the debt actually settled and
-    ///      never exceeds the immutable recovery amount.
+    ///      never exceeds the immutable recovery amount. Each deposit also
+    ///      retains at least its owner's live stBTC balance, so a receipt-token
+    ///      transfer immediately before execution can clamp the recovery but
+    ///      cannot strand that owner without debt they can repay.
     function recoverTbtc(
         ReceiptDebtSettlement[] calldata settlements
     ) external nonReentrant returns (uint256 totalSettled) {
@@ -310,6 +314,31 @@ contract PortalStbtcRecovery is Ownable2StepUpgradeable {
             uint96 settleAmount = settlement.amount;
             if (settleAmount > deposit.receiptMinted) {
                 settleAmount = deposit.receiptMinted;
+            }
+
+            // The normal Portal repayment path is keyed by msg.sender, so an
+            // owner needs enough debt in one of their deposits to redeem every
+            // stBTC token they currently hold. This live balance check closes
+            // the preflight-to-execution race atomically. Reserving the full
+            // balance in each selected deposit is intentionally conservative:
+            // it does not rely on enumerating the owner's other deposits.
+            uint256 depositorReceiptBalance = IERC20(receiptToken).balanceOf(
+                settlement.depositor
+            );
+            if (depositorReceiptBalance >= deposit.receiptMinted) {
+                emit ReceiptDebtSettlementSkipped(
+                    settlement.depositor,
+                    token,
+                    settlement.depositId,
+                    SettlementSkipReason.ReceiptHolderWouldBeStranded
+                );
+                continue;
+            }
+
+            uint96 maxNonStrandingSettlement = deposit.receiptMinted -
+                uint96(depositorReceiptBalance);
+            if (settleAmount > maxNonStrandingSettlement) {
+                settleAmount = maxNonStrandingSettlement;
             }
 
             deposit.balance -= settleAmount;

@@ -2,7 +2,10 @@ import { expect } from "chai"
 import { ethers, network, upgrades } from "hardhat"
 import { loadFixture, time } from "@nomicfoundation/hardhat-network-helpers"
 import type { ContractTransactionResponse } from "ethers"
-import { verifyRecoveryBytecode } from "../helpers/verify-recovery-bytecode"
+import {
+  RecoveryImmutableValues,
+  verifyRecoveryBytecode,
+} from "../helpers/verify-recovery-bytecode"
 
 const PORTAL_DEPOSITS_SLOT = 0n
 const PORTAL_FEE_INFO_SLOT = 5n
@@ -248,6 +251,7 @@ async function deployFixture() {
     receiptPayer,
     collateralRecipient,
     depositor,
+    otherHolder,
     portal,
     portalAddress,
     proxyAdmin,
@@ -268,6 +272,20 @@ async function deployFixture() {
 type Fixture = Awaited<ReturnType<typeof deployFixture>>
 
 type Settlements = Fixture["settlements"]
+
+async function recoveryImmutableValues(
+  fixture: Fixture,
+): Promise<RecoveryImmutableValues> {
+  return {
+    EXPECTED_PORTAL: fixture.portalAddress,
+    RECOVERY_AUTHORITY: fixture.proxyAdmin,
+    RECEIPT_PAYER: await fixture.receiptPayer.getAddress(),
+    COLLATERAL_RECIPIENT: await fixture.collateralRecipient.getAddress(),
+    EXPECTED_TBTC: fixture.tbtcAddress,
+    EXPECTED_RECEIPT_TOKEN: fixture.stbtcAddress,
+    EXPECTED_RECOVERY_AMOUNT: RECOVERY_AMOUNT,
+  }
+}
 
 async function scheduleRecovery(
   fixture: Fixture,
@@ -449,6 +467,64 @@ describe("PortalStbtcRecovery", () => {
       expect(await fixture.tbtc.balanceOf(recipient)).to.equal(
         RECOVERY_AMOUNT - 1n,
       )
+    })
+
+    it("atomically preserves debt when a selected depositor receives stBTC", async () => {
+      const fixture = await loadFixture(deployFixture)
+      const payer = await fixture.receiptPayer.getAddress()
+      const recipient = await fixture.collateralRecipient.getAddress()
+      const depositor = await fixture.depositor.getAddress()
+      const racedBalance = ethers.parseEther("0.1")
+      const recoveredAmount = RECOVERY_AMOUNT - racedBalance
+
+      // Models a transfer after the execute-stage preflight but before the
+      // governance batch is mined. The contract must enforce the bound using
+      // the balance in the execution transaction itself.
+      await fixture.stbtc
+        .connect(fixture.otherHolder)
+        .transfer(depositor, racedBalance)
+
+      const recoveryAtPortal = fixture.Recovery.attach(fixture.portalAddress)
+      const transaction = await scheduleRecovery(
+        fixture,
+        fixture.settlements,
+        ethers.id("live-no-stranding-stbtc-recovery"),
+      )
+
+      await expect(transaction)
+        .to.emit(recoveryAtPortal, "ReceiptDebtSettled")
+        .withArgs(depositor, fixture.tbtcAddress, 1n, FIRST_DEBT - racedBalance)
+      await expect(transaction)
+        .to.emit(recoveryAtPortal, "StbtcRecoveryCompleted")
+        .withArgs(payer, recipient, recoveredAmount)
+
+      const firstDeposit = await fixture.portal.deposits(
+        depositor,
+        fixture.tbtcAddress,
+        1n,
+      )
+      const secondDeposit = await fixture.portal.deposits(
+        depositor,
+        fixture.tbtcAddress,
+        2n,
+      )
+      const remainingDebt =
+        BigInt(firstDeposit.receiptMinted) + BigInt(secondDeposit.receiptMinted)
+
+      expect(await fixture.stbtc.balanceOf(depositor)).to.equal(racedBalance)
+      expect(remainingDebt).to.be.greaterThanOrEqual(racedBalance)
+      expect(firstDeposit.receiptMinted).to.equal(racedBalance)
+      expect(secondDeposit.receiptMinted).to.equal(
+        SECOND_DEBT - SECOND_SETTLEMENT,
+      )
+      expect(await fixture.stbtc.balanceOf(payer)).to.equal(racedBalance)
+      expect(await fixture.tbtc.balanceOf(recipient)).to.equal(recoveredAmount)
+      expect(
+        await fixture.stbtc.allowance(payer, fixture.portalAddress),
+      ).to.equal(racedBalance)
+      expect(
+        await upgrades.erc1967.getImplementationAddress(fixture.portalAddress),
+      ).to.equal(fixture.originalImplementation)
     })
 
     it("skips a deposit repaid in full and settles the remainder", async () => {
@@ -936,8 +1012,85 @@ describe("PortalStbtcRecovery", () => {
       const verification = await verifyRecoveryBytecode(
         ethers.provider,
         fixture.recoveryImplementation as string,
+        await recoveryImmutableValues(fixture),
       )
       expect(verification.maskedImmutableRanges.length).to.be.greaterThan(0)
+    })
+
+    it("rejects a mismatched non-getter occurrence of an immutable", async () => {
+      const fixture = await loadFixture(deployFixture)
+      const expectedImmutables = await recoveryImmutableValues(fixture)
+      const implementation = fixture.recoveryImplementation as string
+      const verification = await verifyRecoveryBytecode(
+        ethers.provider,
+        implementation,
+        expectedImmutables,
+      )
+      const originalCode = await ethers.provider.getCode(implementation)
+      const maliciousRecipient = ethers.Wallet.createRandom().address
+      const encodedRecipient = ethers.getBytes(
+        abiCoder.encode(["address"], [maliciousRecipient]),
+      )
+      const configuredRecovery = fixture.Recovery.attach(implementation)
+      const recipientRanges = verification.maskedImmutableRanges.filter(
+        ({ name }) => name === "COLLATERAL_RECIPIENT",
+      )
+
+      // Solidity may emit several independent references for one immutable.
+      // Find one not used by its public getter, mirroring custom initcode that
+      // preserves the getter while redirecting the transfer path.
+      const findBypassRange = async (
+        index: number,
+      ): Promise<
+        { name: string; start: number; length: number } | undefined
+      > => {
+        if (index >= recipientRanges.length) {
+          return undefined
+        }
+        const range = recipientRanges[index]
+        const patchedCode = ethers.getBytes(originalCode)
+        patchedCode.set(encodedRecipient, range.start)
+        await network.provider.send("hardhat_setCode", [
+          implementation,
+          ethers.hexlify(patchedCode),
+        ])
+        if (
+          (await configuredRecovery.COLLATERAL_RECIPIENT()) ===
+          expectedImmutables.COLLATERAL_RECIPIENT
+        ) {
+          return range
+        }
+        await network.provider.send("hardhat_setCode", [
+          implementation,
+          originalCode,
+        ])
+        return findBypassRange(index + 1)
+      }
+      const bypassRange = await findBypassRange(0)
+
+      expect(
+        bypassRange,
+        "expected a non-getter immutable occurrence",
+      ).not.to.equal(undefined)
+
+      let error: Error | undefined
+      try {
+        await verifyRecoveryBytecode(
+          ethers.provider,
+          implementation,
+          expectedImmutables,
+        )
+      } catch (caught) {
+        error = caught as Error
+      }
+      await network.provider.send("hardhat_setCode", [
+        implementation,
+        originalCode,
+      ])
+
+      expect(error?.message).to.match(
+        /immutable COLLATERAL_RECIPIENT occurrence/,
+      )
     })
 
     it("rejects a contract that is not the compiled artifact", async () => {
@@ -945,7 +1098,11 @@ describe("PortalStbtcRecovery", () => {
 
       let error: Error | undefined
       try {
-        await verifyRecoveryBytecode(ethers.provider, fixture.portalAddress)
+        await verifyRecoveryBytecode(
+          ethers.provider,
+          fixture.portalAddress,
+          await recoveryImmutableValues(fixture),
+        )
       } catch (caught) {
         error = caught as Error
       }

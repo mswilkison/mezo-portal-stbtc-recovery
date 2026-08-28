@@ -25,8 +25,13 @@ export type ManifestSettlement = {
   // of their deposits) at the snapshot block. Captured so reviewers and the
   // preflight can verify the settlement cannot strand a depositor with stBTC
   // they can no longer redeem against their own debt.
-  depositorStbtcBalanceWei?: string
-  depositorActiveDebtWei?: string
+  depositorStbtcBalanceWei: string
+  depositorActiveDebtWei: string
+  // Every deposit that had nonzero receipt debt for this depositor at the
+  // snapshot. Current preflight reads these records again at its pinned block
+  // instead of trusting the stale aggregate. Newly active records omitted from
+  // this snapshot only make the recomputed total conservative.
+  depositorActiveDepositIds: string[]
   preState: ManifestSettlementPreState
 }
 

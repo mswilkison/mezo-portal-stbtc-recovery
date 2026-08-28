@@ -2,6 +2,7 @@ import { expect } from "chai"
 import { ethers, network, upgrades } from "hardhat"
 import { time } from "@nomicfoundation/hardhat-network-helpers"
 import { recoveryManifest as manifest } from "../../helpers/recovery-manifest"
+import { recomputeActiveReceiptDebt } from "../../helpers/recovery-preflight"
 
 const describeFn =
   process.env.NODE_ENV === "recovery-fork-test" ? describe : describe.skip
@@ -90,42 +91,59 @@ describeFn("PortalStbtcRecovery - mainnet fork", function () {
     // The settlement must not strand a third-party depositor: nobody whose
     // debt is being settled may be left holding more stBTC than the receipt
     // debt they retain. Validates the manifest's recorded balances too.
-    const settledByDepositor = new Map<string, bigint>()
-    const activeDebtByDepositor = new Map<string, bigint>()
+    const byDepositor = new Map<
+      string,
+      {
+        settled: bigint
+        manifestActiveDebt: bigint
+        activeDepositIds: string[]
+        manifestStbtcBalance: bigint
+      }
+    >()
     manifest.settlements.forEach((settlement) => {
-      settledByDepositor.set(
-        settlement.depositor,
-        (settledByDepositor.get(settlement.depositor) ?? 0n) +
-          BigInt(settlement.amountWei),
-      )
-      if (settlement.depositorActiveDebtWei) {
-        activeDebtByDepositor.set(
-          settlement.depositor,
-          BigInt(settlement.depositorActiveDebtWei),
+      const existing = byDepositor.get(settlement.depositor)
+      const manifestActiveDebt = BigInt(settlement.depositorActiveDebtWei)
+      const manifestStbtcBalance = BigInt(settlement.depositorStbtcBalanceWei)
+      if (existing) {
+        expect(existing.manifestActiveDebt).to.equal(manifestActiveDebt)
+        expect(existing.activeDepositIds).to.deep.equal(
+          settlement.depositorActiveDepositIds,
         )
+        expect(existing.manifestStbtcBalance).to.equal(manifestStbtcBalance)
+        existing.settled += BigInt(settlement.amountWei)
+      } else {
+        byDepositor.set(settlement.depositor, {
+          settled: BigInt(settlement.amountWei),
+          manifestActiveDebt,
+          activeDepositIds: settlement.depositorActiveDepositIds,
+          manifestStbtcBalance,
+        })
       }
     })
+    const depositorEntries = Array.from(byDepositor.entries())
     await Promise.all(
-      Array.from(settledByDepositor.entries()).map(
-        async ([depositor, settled]) => {
-          const holderBalance = BigInt(await stbtc.balanceOf(depositor))
-          const recordedBalance = manifest.settlements.find(
-            (settlement) => settlement.depositor === depositor,
-          )?.depositorStbtcBalanceWei
-          if (recordedBalance !== undefined) {
-            expect(holderBalance, `${depositor} stBTC balance`).to.equal(
-              BigInt(recordedBalance),
-            )
-          }
-          const activeDebt = activeDebtByDepositor.get(depositor)
-          if (activeDebt !== undefined) {
-            expect(
-              holderBalance,
-              `${depositor} would be left holding unredeemable stBTC`,
-            ).to.be.lessThanOrEqual(activeDebt - settled)
-          }
-        },
-      ),
+      depositorEntries.map(async ([depositor, entry]) => {
+        const holderBalance = BigInt(await stbtc.balanceOf(depositor))
+        const { totalDebt: liveActiveDebt } = await recomputeActiveReceiptDebt(
+          entry.activeDepositIds,
+          async (depositId) =>
+            BigInt(
+              (await portal.deposits(depositor, addresses.tbtc, depositId))
+                .receiptMinted,
+            ),
+        )
+
+        expect(holderBalance, `${depositor} stBTC balance`).to.equal(
+          entry.manifestStbtcBalance,
+        )
+        expect(liveActiveDebt, `${depositor} live active debt`).to.equal(
+          entry.manifestActiveDebt,
+        )
+        expect(
+          holderBalance,
+          `${depositor} would be left holding unredeemable stBTC`,
+        ).to.be.lessThanOrEqual(liveActiveDebt - entry.settled)
+      }),
     )
 
     await network.provider.send("hardhat_setBalance", [
@@ -260,6 +278,27 @@ describeFn("PortalStbtcRecovery - mainnet fork", function () {
           depositsAfter[index].feeOwed,
       ).to.be.greaterThanOrEqual(0)
     })
+
+    // Re-read every affected owner's debt after the atomic batch. This is the
+    // same live invariant enforced by the recovery implementation, independent
+    // of the manifest's historical aggregate.
+    await Promise.all(
+      depositorEntries.map(async ([depositor, entry]) => {
+        const holderBalance = BigInt(await stbtc.balanceOf(depositor))
+        const { totalDebt: liveDebtAfter } = await recomputeActiveReceiptDebt(
+          entry.activeDepositIds,
+          async (depositId) =>
+            BigInt(
+              (await portal.deposits(depositor, addresses.tbtc, depositId))
+                .receiptMinted,
+            ),
+        )
+        expect(
+          holderBalance,
+          `${depositor} holds more stBTC than live debt after recovery`,
+        ).to.be.lessThanOrEqual(liveDebtAfter)
+      }),
+    )
 
     await network.provider.send("hardhat_stopImpersonatingAccount", [
       addresses.receiptPayer,

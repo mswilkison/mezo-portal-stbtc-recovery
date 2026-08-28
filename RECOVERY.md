@@ -74,10 +74,13 @@ active tBTC receipt debts first, restricted to depositors holding no more
 than a dust threshold (`1e12 wei`) of stBTC, with the final deposit settled
 partially. Depositors excluded by the policy are recorded in the manifest
 under `strandingExclusions` for review, and both the preflight and the fork
-test independently enforce the no-stranding property. The selection is
-reproducible: `npm run generate:recovery-manifest` rebuilds the manifest from
-chain state at any block, so reviewers can regenerate and diff it instead of
-trusting the committed file.
+test independently enforce the no-stranding property. The recovery contract
+also reads each selected owner's live stBTC balance inside the execution
+transaction and leaves enough receipt debt for that balance. A transfer after
+preflight can therefore reduce the recovered amount, but cannot strand the
+recipient. The selection is reproducible: `npm run generate:recovery-manifest`
+rebuilds the manifest from chain state at any block, so reviewers can
+regenerate and diff it instead of trusting the committed file.
 
 The pinned manifest is
 [`recovery/mainnet-25850299.json`](./recovery/mainnet-25850299.json)
@@ -98,7 +101,10 @@ under-collateralized after the manifest was pinned is skipped (with a
 `ReceiptDebtSettlementSkipped` event), and a partially repaid deposit is
 settled up to its remaining debt. The amount pulled from Threshold, burned,
 and released always equals the debt actually settled and never exceeds the
-approved amount.
+approved amount. If a selected owner receives stBTC before execution, its
+settlement is additionally clamped so its live stBTC balance remains covered
+by receipt debt. This check is part of the atomic batch, not merely an
+off-chain preflight assumption.
 
 Without this, any depositor named in the manifest could veto the whole
 recovery — a 1 wei repayment during the timelock delay would revert the
@@ -128,6 +134,8 @@ The call additionally requires:
 - every settled deposit to exist, remain outside migration, and keep enough
   collateral for its remaining debt and accrued fees (deposits that no longer
   qualify are skipped, never over-settled);
+- every selected depositor to retain receipt debt covering their live stBTC
+  balance, enforced during `recoverTbtc` itself;
 - at least one settlement to actually apply.
 
 ## Required participants
@@ -152,7 +160,9 @@ The preflight has two stages. `RECOVERY_STAGE=prepare` (the default) verifies
 state and prints calldata while Threshold's approval is still outstanding.
 `RECOVERY_STAGE=execute` is the mandatory rerun immediately before
 `executeBatch`: it additionally hard-fails unless the exact allowance is in
-place, the operation is ready, and nothing has drifted.
+place, the operation is ready, and nothing has drifted. Each run resolves its
+block once and pins every subsequent storage read, code read, and contract call
+to that same block.
 
 1. Thesis rebases this feature commit onto the exact canonical commit backing
    the live implementation. `npm run test:recovery` includes a provenance
@@ -169,13 +179,17 @@ place, the operation is ready, and nothing has drifted.
    if the implementation, proxy administration, token configuration, timelock
    roles, selected deposit state, or runtime hash differs from the reviewed
    manifest — or if any settlement would strand a third-party stBTC holder.
+   It re-reads every active deposit listed for each selected owner and computes
+   current debt from those live records instead of trusting the snapshot total.
 5. Deploy and verify `PortalStbtcRecovery` using the constructor arguments
    printed by the preflight.
 6. Rerun the preflight with `RECOVERY_IMPLEMENTATION` set. It verifies the
-   deployed runtime bytecode byte-for-byte against the local artifact (with
-   immutable value ranges masked), reads back every immutable, reports the
-   timelock operation's state, and prints the exact Threshold approval plus
-   Timelock schedule, execute, and cancel calldata.
+   deployed runtime bytecode byte-for-byte against the local artifact. Before
+   masking immutable ranges for the comparison, it verifies every occurrence
+   against the expected constructor value; getter readbacks alone are not
+   sufficient. It then reports the timelock operation's state and prints the
+   exact Threshold approval plus Timelock schedule, execute, and cancel
+   calldata.
 7. Mezo governance schedules the printed two-call batch. From this point
    until execution or cancellation, no other governance action may touch the
    Portal, its ProxyAdmin, or the timelock's Portal-related roles: the
@@ -194,9 +208,9 @@ place, the operation is ready, and nothing has drifted.
     the stBTC burn, debt and collateral changes, and restoration of
     implementation `0xb3696cdDDEaa764FEF98Dc109ECe3dEfABaB64d8`. If any
     settlement was skipped or clamped, the recovered amount is the settled
-    total; Threshold then revokes the residual allowance (`approve(portal,
-0)`) and the remainder is handled in a follow-up round with a fresh
-    manifest.
+    total. Threshold then revokes the residual allowance with
+    `approve(portal, 0)` and handles the remainder in a follow-up round with a
+    fresh manifest.
 
 If the attempt is abandoned at any point after scheduling: cancel the
 timelock operation (step 6 prints the calldata — operations never expire on
@@ -247,7 +261,8 @@ MAINNET_RPC_URL=https://your-archive-rpc.example \
   execute-stage preflight is mandatory immediately before `executeBatch`.
 - The stranding dust threshold (`1e12 wei`) and the balance-aware selection
   policy are governance-visible parameters recorded in the manifest;
-  approving the manifest approves the policy.
+  approving the manifest approves the policy. The contract's live balance
+  guard remains authoritative if holdings change after that approval.
 - This repository originates from a public npm snapshot and retains an old
   dependency tree with known audit warnings. It is an isolated recovery
   review artifact, not a recommendation to redeploy the whole package.
