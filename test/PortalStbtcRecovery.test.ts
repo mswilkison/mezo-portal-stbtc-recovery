@@ -6,6 +6,7 @@ import {
   RecoveryImmutableValues,
   verifyRecoveryBytecode,
 } from "../helpers/verify-recovery-bytecode"
+import { buildRecoveryBatchPayloads } from "../helpers/recovery-preflight"
 
 const PORTAL_DEPOSITS_SLOT = 0n
 const PORTAL_FEE_INFO_SLOT = 5n
@@ -328,22 +329,17 @@ async function scheduleRecovery(
     "recoverTbtc",
     [settlements, depositorContexts ?? fixture.depositorContexts],
   )
-  const installAndRecover = fixture.proxyAdminInterface.encodeFunctionData(
-    "upgradeAndCall",
-    [
-      fixture.portalAddress,
-      implementation ?? fixture.recoveryImplementation,
-      recoveryCall,
-    ],
-  )
-  const restorePortal = fixture.proxyAdminInterface.encodeFunctionData(
-    "upgradeAndCall",
-    [fixture.portalAddress, fixture.originalImplementation, "0x"],
-  )
-
-  const targets = [fixture.proxyAdmin, fixture.proxyAdmin]
-  const values = [0, 0]
-  const payloads = [installAndRecover, restorePortal]
+  // The exact helper whose output the preflight prints for governance —
+  // executing it here keeps the printed batch and the tested batch one
+  // artifact.
+  const { targets, values, payloads } = buildRecoveryBatchPayloads({
+    portal: fixture.portalAddress,
+    proxyAdmin: fixture.proxyAdmin,
+    recoveryImplementation: (implementation ??
+      fixture.recoveryImplementation) as string,
+    originalImplementation: fixture.originalImplementation,
+    recoverCalldata: recoveryCall,
+  })
   const predecessor = ethers.ZeroHash
 
   await fixture.timelock.scheduleBatch(

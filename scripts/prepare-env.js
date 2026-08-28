@@ -6,19 +6,17 @@
 /* eslint-disable @typescript-eslint/no-var-requires */
 const fs = require("fs")
 const path = require("path")
+// The same parser dotenv-safer validates with. A hand-rolled regex would
+// miss dotenv-legal forms like `export KEY=value`, decide the key is
+// missing, and append a bare duplicate that dotenv's last-occurrence-wins
+// parsing would then resolve to an empty value — corrupting the user's own
+// configuration.
+const dotenv = require("dotenv")
 
 const root = path.join(__dirname, "..")
 const exampleFile = process.env.CI ? ".env.ci.example" : ".env.example"
 const examplePath = path.join(root, exampleFile)
 const envPath = path.join(root, ".env")
-
-function keysOf(content) {
-  return content
-    .split("\n")
-    .map((line) => line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=/))
-    .filter(Boolean)
-    .map((match) => match[1])
-}
 
 const example = fs.readFileSync(examplePath, "utf8")
 
@@ -28,8 +26,10 @@ if (!fs.existsSync(envPath)) {
 }
 
 const env = fs.readFileSync(envPath, "utf8")
-const existing = new Set(keysOf(env))
-const missing = keysOf(example).filter((key) => !existing.has(key))
+const existing = new Set(Object.keys(dotenv.parse(env)))
+const missing = Object.keys(dotenv.parse(example)).filter(
+  (key) => !existing.has(key),
+)
 
 if (missing.length > 0) {
   const suffix = env.endsWith("\n") || env.length === 0 ? "" : "\n"

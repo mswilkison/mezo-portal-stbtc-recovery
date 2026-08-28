@@ -1,19 +1,19 @@
 import { readFileSync } from "fs"
 import { artifacts, ethers } from "hardhat"
 import {
-  recoveryManifest as manifest,
+  loadRecoveryManifest,
   recoveryManifestPath,
 } from "../helpers/recovery-manifest"
 import {
   ADMIN_SLOT,
-  FEE_PRECISION,
   IMPLEMENTATION_SLOT,
-  ONE_YEAR,
   SettlementProjectionInput,
   buildRecoveryBatchPayloads,
+  effectiveFeeIntegralAt,
   hasExactRecoveryAllowance,
   pinnedBlockContext,
   projectSettlementOutcome,
+  projectedFeeOwed,
   recomputeActiveReceiptDebt,
 } from "../helpers/recovery-preflight"
 import {
@@ -21,9 +21,16 @@ import {
   verifyRecoveryBytecode,
 } from "../helpers/verify-recovery-bytecode"
 
+const manifest = loadRecoveryManifest()
+
 const PROPOSER_ROLE = ethers.id("PROPOSER_ROLE")
 const EXECUTOR_ROLE = ethers.id("EXECUTOR_ROLE")
 const CANCELLER_ROLE = ethers.id("CANCELLER_ROLE")
+
+// Fee accrual between the preflight block and the executeBatch transaction;
+// used only to pad the projection's under-collateralization classification
+// toward the safe side.
+const FEE_DRIFT_PAD_SECONDS = 3600n
 
 // RECOVERY_STAGE=prepare (default) validates the manifest against a chosen
 // block (RECOVERY_BLOCK or latest) and prints calldata while the Threshold
@@ -323,18 +330,12 @@ async function main() {
   )
   expectEqual("manifest settlement total", manifestTotal, roundAmount)
 
-  if (BigInt(portalTbtcBalance) < roundAmount) {
-    fail("Portal does not hold enough tBTC")
-  }
-  if (BigInt(receiptPayerBalance) < roundAmount) {
-    fail("receipt payer does not hold the configured stBTC amount")
-  }
-  if (BigInt(portalStbtcDebt) < roundAmount) {
-    fail("Portal does not have enough stBTC debt to burn the recovery amount")
-  }
-  if (BigInt(fee.totalMinted) < roundAmount) {
-    fail("Portal does not have enough tBTC-specific receipt debt")
-  }
+  // NOTE: the balance/debt sufficiency checks live AFTER the projection —
+  // they gate on what the contract will actually settle, not the original
+  // round amount, because recoverTbtc clamps to live state. Gating on the
+  // round amount here would abort a valid drift-tolerant partial execution
+  // (for example, total receipt debt dropping below the round while the
+  // selected debt remains settleable).
 
   // Threshold's one on-chain action. In the execute-stage rerun this is a
   // hard requirement — a green preflight must guarantee executeBatch cannot
@@ -352,10 +353,25 @@ async function main() {
     warn(`${message} (expected while preparing; required before execution)`)
   }
 
-  const annualFeeRate = (BigInt(fee.annualFee) * 10n ** 16n) / ONE_YEAR
-  const effectiveFeeIntegral =
-    BigInt(fee.feeIntegral) +
-    (BigInt(block.timestamp) - BigInt(fee.lastFeeUpdateAt)) * annualFeeRate
+  const feeState = {
+    feeIntegral: BigInt(fee.feeIntegral),
+    lastFeeUpdateAt: BigInt(fee.lastFeeUpdateAt),
+    annualFee: BigInt(fee.annualFee),
+  }
+  const effectiveFeeIntegral = effectiveFeeIntegralAt(
+    feeState,
+    BigInt(block.timestamp),
+  )
+  // Fees keep accruing between this preflight and the executeBatch
+  // transaction. The under-collateralization classification in the
+  // projection uses a drift-padded integral so a deposit sitting on the
+  // boundary is conservatively projected as skipped rather than flipping
+  // from "settles" to a skip after a green run. Exact-at-this-block fees
+  // are still used for the snapshot equality checks and reported margins.
+  const paddedFeeIntegral = effectiveFeeIntegralAt(
+    feeState,
+    BigInt(block.timestamp) + FEE_DRIFT_PAD_SECONDS,
+  )
 
   const checkedSettlements = await Promise.all(
     manifest.settlements.map(async (settlement) => {
@@ -408,11 +424,16 @@ async function main() {
         )
       }
 
-      const projectedFee =
-        BigInt(deposit.feeOwed) +
-        ((effectiveFeeIntegral - BigInt(deposit.lastFeeIntegral)) *
-          BigInt(deposit.receiptMinted)) /
-          FEE_PRECISION
+      const depositFeeInput = {
+        feeOwedWei: BigInt(deposit.feeOwed),
+        lastFeeIntegral: BigInt(deposit.lastFeeIntegral),
+        receiptMintedWei: BigInt(deposit.receiptMinted),
+      }
+      const projectedFee = projectedFeeOwed(
+        depositFeeInput,
+        effectiveFeeIntegral,
+      )
+      const paddedFee = projectedFeeOwed(depositFeeInput, paddedFeeIntegral)
       const collateralMargin =
         BigInt(deposit.balance) - BigInt(deposit.receiptMinted) - projectedFee
       if (atSnapshotBlock && collateralMargin < 0n) {
@@ -444,6 +465,7 @@ async function main() {
         currentDebtWei: BigInt(deposit.receiptMinted),
         migrating: Number(deposit.tbtcMigrationState) !== 0,
         projectedFeeWei: projectedFee,
+        paddedFeeWei: paddedFee,
         collateralMarginWei: collateralMargin,
       }
     }),
@@ -463,7 +485,21 @@ async function main() {
       activeDepositIds: string[]
     }
   >()
+  const seenSettlementKeys = new Set<string>()
   checkedSettlements.forEach((settlement) => {
+    // The generator can never emit a duplicate (depositor, depositId), so
+    // one in the manifest means hand-editing or merge damage. On-chain a
+    // duplicate settles once (the second entry clamps against decremented
+    // storage), so calldata carrying one does not match what was reviewed.
+    const settlementKey = `${settlement.depositor}:${settlement.depositId.toString()}`
+    if (seenSettlementKeys.has(settlementKey)) {
+      fail(
+        `duplicate settlement entry for deposit ${settlement.depositor}/` +
+          `${settlement.depositId.toString()}; fix the manifest`,
+      )
+    }
+    seenSettlementKeys.add(settlementKey)
+
     const activeDepositIds = settlement.depositorActiveDepositIds
     if (!activeDepositIds.includes(settlement.depositId.toString())) {
       fail(
@@ -550,7 +586,7 @@ async function main() {
         balanceWei: settlement.currentBalanceWei,
         receiptMintedWei: settlement.currentDebtWei,
         migrating: settlement.migrating,
-        projectedFeeWei: settlement.projectedFeeWei,
+        projectedFeeWei: settlement.paddedFeeWei,
       },
     }),
   )
@@ -559,6 +595,28 @@ async function main() {
     ownerCapacity,
   )
   const projectedResidualWei = manifestTotal - projectedTotalWei
+
+  // Sufficiency checks against what will actually be settled (the contract
+  // pulls, burns, and releases exactly totalSettled, never the original
+  // round amount). Anchoring these to the round amount would let ordinary
+  // third-party repayments veto a valid partial execution.
+  if (BigInt(portalTbtcBalance) < projectedTotalWei) {
+    fail("Portal does not hold enough tBTC for the projected settlement")
+  }
+  if (BigInt(receiptPayerBalance) < projectedTotalWei) {
+    fail("receipt payer does not hold the projected settlement amount")
+  }
+  if (BigInt(portalStbtcDebt) < projectedTotalWei) {
+    fail(
+      "Portal does not have enough stBTC debt to burn the projected settlement",
+    )
+  }
+  if (BigInt(fee.totalMinted) < projectedTotalWei) {
+    fail(
+      "Portal does not have enough tBTC-specific receipt debt for the " +
+        "projected settlement",
+    )
+  }
 
   if (driftMessages.length > 0) {
     warn(
@@ -581,22 +639,28 @@ async function main() {
       `reviewed ${manifestTotal.toString()} ` +
       `(${projectedResidualWei.toString()} residual would remain with the ` +
       "receipt payer for a follow-up round)"
-    // At the prepare stage a materially reduced projection means the
-    // selection should be regenerated instead of scheduled. Wei-level noise
-    // (up to the generator's dust threshold per selected owner) is
-    // tolerated; anything larger needs an explicit governance decision.
+    // A materially reduced projection needs an explicit governance decision
+    // at BOTH stages — at prepare because the selection should simply be
+    // regenerated, and at execute because that is when drift has actually
+    // accumulated and the choice is execute-reduced or cancel. Wei-level
+    // noise (up to the generator's dust threshold per selected owner) is
+    // tolerated.
     const reductionTolerance = 1000000000000n * BigInt(ownerReports.length)
     if (
-      STAGE === "prepare" &&
       projectedResidualWei > reductionTolerance &&
       process.env.RECOVERY_ACCEPT_REDUCED_RECOVERY !== "1"
     ) {
-      fail(
-        `${message}. Regenerate the manifest ` +
-          "(scripts/generate-stbtc-recovery-manifest.ts) or, if governance " +
-          "accepts recovering less in this round, set " +
-          "RECOVERY_ACCEPT_REDUCED_RECOVERY=1",
-      )
+      const remedy =
+        STAGE === "prepare"
+          ? "Regenerate the manifest " +
+            "(scripts/generate-stbtc-recovery-manifest.ts) or, if " +
+            "governance accepts recovering less in this round, set " +
+            "RECOVERY_ACCEPT_REDUCED_RECOVERY=1"
+          : "Cancel the scheduled operation (calldata printed below) and " +
+            "re-pin, or — only with explicit governance acceptance of the " +
+            "reduced round — set RECOVERY_ACCEPT_REDUCED_RECOVERY=1 and " +
+            "rerun"
+      fail(`${message}. ${remedy}`)
     }
     warn(message)
   }
@@ -743,14 +807,28 @@ async function main() {
       addresses.stbtc,
     )
     // The immutable is an upper bound so a residual round can reuse this
-    // deployed, reviewed implementation with a smaller fresh manifest.
-    if (BigInt(deployedMaxAmount) < manifestTotal) {
+    // deployed, reviewed implementation with a smaller fresh manifest. It
+    // must be anchored externally, never to the deployed contract's own
+    // getter — otherwise the occurrence-by-occurrence bytecode check below
+    // would be circular for this one immutable. Round one anchors to the
+    // manifest total; a residual round passes the original deployment's
+    // amount via RECOVERY_DEPLOYED_MAX_WEI.
+    const expectedMaxAmount = process.env.RECOVERY_DEPLOYED_MAX_WEI
+      ? BigInt(process.env.RECOVERY_DEPLOYED_MAX_WEI)
+      : manifestTotal
+    if (expectedMaxAmount < manifestTotal) {
       fail(
-        `recovery EXPECTED_MAX_RECOVERY_AMOUNT ${deployedMaxAmount} is below ` +
+        `RECOVERY_DEPLOYED_MAX_WEI ${expectedMaxAmount.toString()} is below ` +
           `this round's settlement total ${manifestTotal.toString()}`,
       )
     }
-    if (BigInt(deployedMaxAmount) > manifestTotal) {
+    expectEqual(
+      "recovery EXPECTED_MAX_RECOVERY_AMOUNT (set RECOVERY_DEPLOYED_MAX_WEI " +
+        "for a residual round reusing the original deployment)",
+      deployedMaxAmount,
+      expectedMaxAmount,
+    )
+    if (expectedMaxAmount > manifestTotal) {
       warn(
         `deployed EXPECTED_MAX_RECOVERY_AMOUNT ${deployedMaxAmount} exceeds ` +
           `this round's total ${manifestTotal.toString()} (expected for a ` +
@@ -759,10 +837,11 @@ async function main() {
     }
 
     // The deployed implementation must be byte-for-byte the compiled local
-    // artifact. Every immutable occurrence is checked against the deployed
-    // getter values before the ranges are masked for the remaining-code
-    // comparison; checking only the seven getters is insufficient because
-    // custom initcode can patch separate occurrences differently.
+    // artifact. Every immutable occurrence is checked against the externally
+    // anchored expected values before the ranges are masked for the
+    // remaining-code comparison; checking only the seven getters is
+    // insufficient because custom initcode can patch separate occurrences
+    // differently.
     const expectedRecoveryImmutables: RecoveryImmutableValues = {
       EXPECTED_PORTAL: addresses.portal,
       RECOVERY_AUTHORITY: addresses.proxyAdmin,
@@ -770,7 +849,7 @@ async function main() {
       COLLATERAL_RECIPIENT: addresses.collateralRecipient,
       EXPECTED_TBTC: addresses.tbtc,
       EXPECTED_RECEIPT_TOKEN: addresses.stbtc,
-      EXPECTED_MAX_RECOVERY_AMOUNT: BigInt(deployedMaxAmount),
+      EXPECTED_MAX_RECOVERY_AMOUNT: expectedMaxAmount,
     }
     const bytecodeVerification = await verifyRecoveryBytecode(
       ethers.provider,

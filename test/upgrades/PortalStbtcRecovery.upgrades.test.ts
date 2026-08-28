@@ -1,11 +1,12 @@
-import { ethers, upgrades } from "hardhat"
+import { ethers, network, upgrades } from "hardhat"
 
-// `npm run test:upgrades` sweeps this directory against the live-state
-// mainnet_fork network, whose remote accounts cannot sign the local proxy
-// deployment this test performs. It runs on the default hardhat network via
-// `npm run test:recovery` instead.
-const describeFn =
-  process.env.NODE_ENV === "upgrades-test" ? describe.skip : describe
+// This test deploys a local proxy, which needs the in-process hardhat
+// network's signers. Skip by actual capability (the selected network), not
+// by NODE_ENV sniffing: `npm run test:upgrades` sweeps this directory
+// against the remote mainnet_fork network and must skip it, while any run
+// on the hardhat network (test:recovery, bare hardhat test — whatever
+// NODE_ENV happens to be) must execute it.
+const describeFn = network.name === "hardhat" ? describe : describe.skip
 
 describeFn("PortalStbtcRecovery - storage layout", () => {
   it("is storage-compatible with the reconstructed live Portal", async () => {

@@ -1,8 +1,11 @@
 import { expect } from "chai"
 import {
+  annualFeeRatePerSecond,
+  effectiveFeeIntegralAt,
   hasExactRecoveryAllowance,
   pinnedBlockContext,
   projectSettlementOutcome,
+  projectedFeeOwed,
   recomputeActiveReceiptDebt,
 } from "../helpers/recovery-preflight"
 
@@ -64,6 +67,34 @@ describe("recovery preflight helpers", () => {
     // A migrating deposit cannot be repaid through the normal path, so its
     // debt must not count toward the owner's redemption capacity.
     expect(result.totalDebt).to.equal(100n)
+  })
+
+  it("mirrors the Portal's lazy fee accounting", () => {
+    // Independently derived from the Portal source: feePerSecond =
+    // annualFee * 1e16 / 365 days (integer division), integral grows
+    // linearly, and accrued fee = integralDiff * minted / 1e18.
+    expect(annualFeeRatePerSecond(2n)).to.equal(
+      (2n * 10n ** 16n) / (365n * 24n * 60n * 60n),
+    )
+
+    const fee = {
+      feeIntegral: 1_000n,
+      lastFeeUpdateAt: 1_700_000_000n,
+      annualFee: 2n,
+    }
+    const later = 1_700_000_000n + 2_592_000n // 30 days
+    const expectedIntegral = 1_000n + 2_592_000n * annualFeeRatePerSecond(2n)
+    expect(effectiveFeeIntegralAt(fee, later)).to.equal(expectedIntegral)
+    expect(effectiveFeeIntegralAt(fee, fee.lastFeeUpdateAt)).to.equal(1_000n)
+
+    const deposit = {
+      feeOwedWei: 7n,
+      lastFeeIntegral: 1_000n,
+      receiptMintedWei: 10n ** 18n,
+    }
+    expect(projectedFeeOwed(deposit, expectedIntegral)).to.equal(
+      7n + (expectedIntegral - 1_000n),
+    )
   })
 
   it("rejects incomplete or unsorted active-deposit metadata", async () => {
@@ -202,6 +233,35 @@ describe("recovery preflight helpers", () => {
       ])
       // The last entry clamps to its remaining debt.
       expect(projected[4].projectedWei).to.equal(100n)
+      expect(projectedTotalWei).to.equal(100n)
+    })
+
+    it("consumes per-deposit debt across repeated entries", () => {
+      // A duplicated (depositor, depositId) settles once on-chain — the
+      // second entry clamps against the storage the first already
+      // decremented. The projection must mirror that, not double-count the
+      // static snapshot: two 75-wei requests against 100 wei of debt with
+      // ample owner capacity execute 100, never 150.
+      const { projected, projectedTotalWei } = projectSettlementOutcome(
+        [
+          {
+            depositor: owner,
+            depositId: 7n,
+            amountWei: 75n,
+            deposit: healthyDeposit(100n, 300n),
+          },
+          {
+            depositor: owner,
+            depositId: 7n,
+            amountWei: 75n,
+            deposit: healthyDeposit(100n, 300n),
+          },
+        ],
+        new Map([[owner, 1_000n]]),
+      )
+
+      expect(projected[0].projectedWei).to.equal(75n)
+      expect(projected[1].projectedWei).to.equal(25n)
       expect(projectedTotalWei).to.equal(100n)
     })
 

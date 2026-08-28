@@ -7,7 +7,7 @@ import "hardhat-deploy"
 import "hardhat-contract-sizer"
 import "hardhat-gas-reporter"
 import dotenv from "dotenv-safer"
-import { recoveryManifest } from "./helpers/recovery-manifest"
+import { tryLoadRecoveryManifest } from "./helpers/recovery-manifest"
 
 dotenv.config({
   allowEmptyValues: true,
@@ -22,15 +22,34 @@ const MAINNET_PRIVATE_KEY = process.env.MAINNET_PRIVATE_KEY
   ? [process.env.MAINNET_PRIVATE_KEY]
   : []
 
+const RECOVERY_FORK_ENABLED = process.env.NODE_ENV === "recovery-fork-test"
+// When the fork mode is explicitly requested, refuse to half-honor it: a
+// missing RPC URL would silently boot an unforked local chain and the fork
+// test's first assertion would then blame the wrong variable.
+if (RECOVERY_FORK_ENABLED && MAINNET_RPC_URL.length === 0) {
+  throw new Error(
+    "NODE_ENV=recovery-fork-test requires MAINNET_RPC_URL (an archive RPC); " +
+      "set it in .env before running the recovery fork test",
+  )
+}
+
 // The recovery fork test pins to the reviewed manifest's snapshot block by
 // default so a stale .env cannot silently fork a different block after a
 // re-pin. MAINNET_FORK_BLOCK_NUMBER remains as an explicit override only.
-const MAINNET_FORK_BLOCK_NUMBER = process.env.MAINNET_FORK_BLOCK_NUMBER
+// The manifest is loaded leniently: a broken pin must not take down every
+// hardhat command (including the generator needed to fix it), so it only
+// fails here when the fork actually needs the block.
+const pinnedManifest = tryLoadRecoveryManifest()
+const forkBlockNumber = process.env.MAINNET_FORK_BLOCK_NUMBER
   ? Number(process.env.MAINNET_FORK_BLOCK_NUMBER)
-  : recoveryManifest.snapshotBlock
-
-const RECOVERY_FORK_ENABLED =
-  process.env.NODE_ENV === "recovery-fork-test" && MAINNET_RPC_URL.length > 0
+  : pinnedManifest?.snapshotBlock
+if (RECOVERY_FORK_ENABLED && forkBlockNumber === undefined) {
+  throw new Error(
+    "the recovery fork needs a pinned block: fix the manifest pin in " +
+      "helpers/recovery-manifest.ts or set MAINNET_FORK_BLOCK_NUMBER",
+  )
+}
+const MAINNET_FORK_BLOCK_NUMBER = forkBlockNumber ?? 0
 
 const SEPOLIA_RPC_URL = process.env.SEPOLIA_RPC_URL
   ? process.env.SEPOLIA_RPC_URL

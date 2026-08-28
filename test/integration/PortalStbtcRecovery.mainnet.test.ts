@@ -1,11 +1,13 @@
 import { expect } from "chai"
 import { ethers, network, upgrades } from "hardhat"
 import { time } from "@nomicfoundation/hardhat-network-helpers"
-import { recoveryManifest as manifest } from "../../helpers/recovery-manifest"
+import { loadRecoveryManifest } from "../../helpers/recovery-manifest"
 import {
   buildRecoveryBatchPayloads,
   recomputeActiveReceiptDebt,
 } from "../../helpers/recovery-preflight"
+
+const manifest = loadRecoveryManifest()
 
 const describeFn =
   process.env.NODE_ENV === "recovery-fork-test" ? describe : describe.skip

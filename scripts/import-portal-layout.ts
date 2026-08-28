@@ -1,5 +1,5 @@
 import { ethers, upgrades } from "hardhat"
-import { recoveryManifest } from "../helpers/recovery-manifest"
+import { loadRecoveryManifest } from "../helpers/recovery-manifest"
 
 // Reconciles .openzeppelin/mainnet.json with the implementation actually
 // installed behind the live Portal proxy. The network file predates the
@@ -13,7 +13,7 @@ import { recoveryManifest } from "../helpers/recovery-manifest"
 // provenance test enforces this), so the recorded layout is the live one.
 async function main() {
   const Portal = await ethers.getContractFactory("Portal")
-  const proxy = recoveryManifest.addresses.portal
+  const proxy = loadRecoveryManifest().addresses.portal
   await upgrades.forceImport(proxy, Portal, { kind: "transparent" })
 
   const implementation = await upgrades.erc1967.getImplementationAddress(proxy)

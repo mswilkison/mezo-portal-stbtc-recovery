@@ -98,7 +98,37 @@ export type RecoveryManifest = {
   settlements: ManifestSettlement[]
 }
 
-// eslint-disable-next-line @typescript-eslint/no-var-requires, import/no-dynamic-require, global-require
-const manifestJson = require(`../recovery/${recoveryManifestFile}`)
+let cachedManifest: RecoveryManifest | undefined
 
-export const recoveryManifest = manifestJson as RecoveryManifest
+// Loads the pinned manifest, failing with a message that names the pin and
+// the fix instead of a bare MODULE_NOT_FOUND. Scripts and tests that cannot
+// work without the manifest should call this and let it throw.
+export function loadRecoveryManifest(): RecoveryManifest {
+  if (!cachedManifest) {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires, import/no-dynamic-require, global-require
+      cachedManifest = require(
+        `../recovery/${recoveryManifestFile}`,
+      ) as RecoveryManifest
+    } catch (error) {
+      throw new Error(
+        `failed to load the pinned recovery manifest ${recoveryManifestPath}: ` +
+          `${(error as Error).message}. After a re-pin, recoveryManifestFile ` +
+          "in helpers/recovery-manifest.ts must name a committed file in " +
+          "recovery/",
+      )
+    }
+  }
+  return cachedManifest
+}
+
+// For callers that can degrade gracefully without the manifest — the hardhat
+// config uses this so a broken pin does not take down every hardhat command
+// (including the generator needed to produce a replacement manifest).
+export function tryLoadRecoveryManifest(): RecoveryManifest | undefined {
+  try {
+    return loadRecoveryManifest()
+  } catch {
+    return undefined
+  }
+}

@@ -1,12 +1,12 @@
 import { writeFileSync } from "fs"
 import { join } from "path"
 import { artifacts, ethers } from "hardhat"
-import { recoveryManifest as currentManifest } from "../helpers/recovery-manifest"
+import { loadRecoveryManifest } from "../helpers/recovery-manifest"
 import {
   ADMIN_SLOT,
-  FEE_PRECISION,
   IMPLEMENTATION_SLOT,
-  ONE_YEAR,
+  effectiveFeeIntegralAt,
+  projectedFeeOwed,
 } from "../helpers/recovery-preflight"
 
 // Regenerates the recovery manifest from chain state so a re-pin is a
@@ -28,6 +28,8 @@ import {
 // Portal path; zeroing their debt would leave that stBTC unredeemable —
 // recreating for them the exact stranded position this recovery cures for
 // Threshold. Excluded depositors are recorded in the manifest for review.
+
+const currentManifest = loadRecoveryManifest()
 
 const RECEIPT_MINTED_TOPIC = ethers.id(
   "ReceiptMinted(address,address,uint256,uint256)",
@@ -275,10 +277,14 @@ async function main() {
   )
   log(`Found ${candidates.size} deposits with tBTC receipt mint history`)
 
-  const annualFeeRate = (BigInt(fee.annualFee) * 10n ** 16n) / ONE_YEAR
-  const effectiveFeeIntegral =
-    BigInt(fee.feeIntegral) +
-    (BigInt(block.timestamp) - BigInt(fee.lastFeeUpdateAt)) * annualFeeRate
+  const effectiveFeeIntegral = effectiveFeeIntegralAt(
+    {
+      feeIntegral: BigInt(fee.feeIntegral),
+      lastFeeUpdateAt: BigInt(fee.lastFeeUpdateAt),
+      annualFee: BigInt(fee.annualFee),
+    },
+    BigInt(block.timestamp),
+  )
 
   const candidateList = Array.from(candidates.values())
   const states = await mapWithConcurrency(candidateList, 8, async (entry) => {
@@ -300,9 +306,10 @@ async function main() {
     const balance = BigInt(deposit.balance)
     const feeOwed = BigInt(deposit.feeOwed)
     const lastFeeIntegral = BigInt(deposit.lastFeeIntegral)
-    const projectedFee =
-      feeOwed +
-      ((effectiveFeeIntegral - lastFeeIntegral) * receiptMinted) / FEE_PRECISION
+    const projectedFee = projectedFeeOwed(
+      { feeOwedWei: feeOwed, lastFeeIntegral, receiptMintedWei: receiptMinted },
+      effectiveFeeIntegral,
+    )
     active.push({
       depositor: entry.depositor,
       depositId: entry.depositId,
@@ -324,6 +331,19 @@ async function main() {
     `Active tBTC debt positions: ${active.length}, ` +
       `total debt ${activeDebtTotal.toString()}`,
   )
+  // The Portal's own bookkeeping is the completeness check for the event
+  // scan: every wei of tBTC receipt debt was minted through a ReceiptMinted
+  // event, so a scan that starts too late or a provider that dropped logs
+  // shows up as a shortfall here instead of silently truncating the
+  // candidate set and the owners' active-deposit lists.
+  if (activeDebtTotal !== BigInt(fee.totalMinted)) {
+    fail(
+      `scanned active debt ${activeDebtTotal.toString()} does not match the ` +
+        `Portal's feeInfo.totalMinted ${fee.totalMinted.toString()}; the ` +
+        "ReceiptMinted scan is incomplete — check SCAN_START_BLOCK and the " +
+        "RPC provider's log coverage",
+    )
+  }
 
   const depositors = Array.from(
     new Set(active.map((deposit) => deposit.depositor)),
@@ -339,14 +359,22 @@ async function main() {
   const stbtcBalances = new Map(
     balanceEntries.map(({ depositor, balance }) => [depositor, balance]),
   )
+  // Per-depositor repayable debt, EXCLUDING deposits in tBTC migration —
+  // the exact semantics of the contract's stranding guard and of
+  // recomputeActiveReceiptDebt, which the preflight and fork test use to
+  // verify this very field at the snapshot block. The id lists still carry
+  // every deposit with receipt debt (migration is re-evaluated dynamically
+  // at read time by every consumer).
   const activeDebtByDepositor = new Map<string, bigint>()
   const activeDepositIdsByDepositor = new Map<string, bigint[]>()
   active.forEach((deposit) => {
-    activeDebtByDepositor.set(
-      deposit.depositor,
-      (activeDebtByDepositor.get(deposit.depositor) ?? 0n) +
-        deposit.receiptMinted,
-    )
+    if (deposit.migrationState === 0) {
+      activeDebtByDepositor.set(
+        deposit.depositor,
+        (activeDebtByDepositor.get(deposit.depositor) ?? 0n) +
+          deposit.receiptMinted,
+      )
+    }
     const depositIds = activeDepositIdsByDepositor.get(deposit.depositor) ?? []
     depositIds.push(deposit.depositId)
     activeDepositIdsByDepositor.set(deposit.depositor, depositIds)
@@ -367,7 +395,7 @@ async function main() {
     .map((depositor) => ({
       depositor,
       stbtcBalanceWei: stbtcBalances.get(depositor)!.toString(),
-      activeDebtWei: activeDebtByDepositor.get(depositor)!.toString(),
+      activeDebtWei: (activeDebtByDepositor.get(depositor) ?? 0n).toString(),
       depositIds: active
         .filter((deposit) => deposit.depositor === depositor)
         .map((deposit) => deposit.depositId)
@@ -408,13 +436,34 @@ async function main() {
       return a.depositId < b.depositId ? -1 : 1
     })
 
-  const eligibleTotal = eligible.reduce(
-    (total, deposit) => total + deposit.receiptMinted,
-    0n,
-  )
-  if (eligibleTotal < recoveryAmount) {
+  // Each owner's settleable capacity mirrors the contract's stranding
+  // guard: non-migrating debt minus their own stBTC holdings. Even a
+  // dust-level balance must be reserved here, or the generated manifest
+  // would violate the per-owner invariant at its own snapshot block and
+  // the fork test's stranding assertion would fail while the preflight
+  // stayed green.
+  const ownerSettleable = new Map<string, bigint>()
+  depositors.forEach((depositor) => {
+    const debt = activeDebtByDepositor.get(depositor) ?? 0n
+    const balance = stbtcBalances.get(depositor)!
+    ownerSettleable.set(depositor, debt > balance ? debt - balance : 0n)
+  })
+
+  const eligibleByOwner = new Map<string, bigint>()
+  eligible.forEach((deposit) => {
+    eligibleByOwner.set(
+      deposit.depositor,
+      (eligibleByOwner.get(deposit.depositor) ?? 0n) + deposit.receiptMinted,
+    )
+  })
+  let drawableTotal = 0n
+  eligibleByOwner.forEach((eligibleDebt, depositor) => {
+    const capacity = ownerSettleable.get(depositor)!
+    drawableTotal += eligibleDebt < capacity ? eligibleDebt : capacity
+  })
+  if (drawableTotal < recoveryAmount) {
     fail(
-      `eligible (non-stranding) debt ${eligibleTotal.toString()} cannot ` +
+      `eligible (non-stranding) debt ${drawableTotal.toString()} cannot ` +
         `cover the recovery amount ${recoveryAmount.toString()}; governance ` +
         "must revisit the dust threshold or the policy",
     )
@@ -426,9 +475,19 @@ async function main() {
     if (remaining === 0n) {
       return
     }
-    const amount =
-      deposit.receiptMinted <= remaining ? deposit.receiptMinted : remaining
+    const capacity = ownerSettleable.get(deposit.depositor)!
+    if (capacity === 0n) {
+      return
+    }
+    let amount = deposit.receiptMinted
+    if (amount > capacity) {
+      amount = capacity
+    }
+    if (amount > remaining) {
+      amount = remaining
+    }
     selected.push({ deposit, amount })
+    ownerSettleable.set(deposit.depositor, capacity - amount)
     remaining -= amount
   })
   if (remaining !== 0n) {
@@ -443,11 +502,13 @@ async function main() {
       .replace(/\.\d{3}Z$/, "Z"),
     selectionPolicy:
       "Largest active tBTC receipt debts first, restricted to depositors " +
-      `holding at most ${dustWei.toString()} wei of stBTC (a depositor still ` +
-      "holding stBTC can redeem it against their own debt through the " +
-      "normal repayment path and must not be left with unredeemable stBTC); " +
-      "the final deposit is settled partially. Excluded depositors are " +
-      "listed under strandingExclusions.",
+      `holding at most ${dustWei.toString()} wei of stBTC, with each ` +
+      "owner's total selection additionally capped at their non-migrating " +
+      "debt minus their holdings (a depositor still holding stBTC can " +
+      "redeem it against their own debt through the normal repayment path " +
+      "and must not be left with unredeemable stBTC); the final deposit is " +
+      "settled partially. Excluded depositors are listed under " +
+      "strandingExclusions.",
     addresses: {
       portal: addresses.portal,
       originalImplementation,

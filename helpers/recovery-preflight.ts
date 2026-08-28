@@ -32,6 +32,41 @@ export function hasExactRecoveryAllowance(
   return allowance === recoveryAmount
 }
 
+// The Portal's lazy fee accounting, in one place. The generator records
+// these values into the manifest and the preflight recomputes them for its
+// snapshot equality checks and projections; a fee-model change must not be
+// able to split the two. (The unit tests keep their own independent copy of
+// the formula on purpose — it is the oracle these helpers are tested
+// against.)
+export function annualFeeRatePerSecond(annualFeePercent: bigint): bigint {
+  return (annualFeePercent * 10n ** 16n) / ONE_YEAR
+}
+
+export function effectiveFeeIntegralAt(
+  fee: { feeIntegral: bigint; lastFeeUpdateAt: bigint; annualFee: bigint },
+  timestamp: bigint,
+): bigint {
+  return (
+    fee.feeIntegral +
+    (timestamp - fee.lastFeeUpdateAt) * annualFeeRatePerSecond(fee.annualFee)
+  )
+}
+
+export function projectedFeeOwed(
+  deposit: {
+    feeOwedWei: bigint
+    lastFeeIntegral: bigint
+    receiptMintedWei: bigint
+  },
+  effectiveIntegral: bigint,
+): bigint {
+  return (
+    deposit.feeOwedWei +
+    ((effectiveIntegral - deposit.lastFeeIntegral) * deposit.receiptMintedWei) /
+      FEE_PRECISION
+  )
+}
+
 export type ActiveDepositRecord = {
   receiptMintedWei: bigint
   migrating: boolean
@@ -103,14 +138,18 @@ export type ProjectedSettlement = {
 // and the per-owner stranding capacity (live non-migrating debt across the
 // owner's reviewed deposits minus their live stBTC balance, decremented as
 // their deposits settle). `ownerCapacityWei` maps each depositor to that
-// capacity and is consumed by the projection. The fee input approximates the
-// fee the contract will accrue at execution time; it only matters near the
-// under-collateralization boundary, which the contract re-evaluates exactly.
+// capacity and is consumed by the projection. Per-deposit debt is likewise
+// consumed across entries, matching the contract's storage decrement, so a
+// repeated (depositor, depositId) entry is never double-counted. The fee
+// input approximates the fee the contract will accrue at execution time; it
+// only matters near the under-collateralization boundary, which the
+// contract re-evaluates exactly.
 export function projectSettlementOutcome(
   entries: readonly SettlementProjectionInput[],
   ownerCapacityWei: ReadonlyMap<string, bigint>,
 ): { projected: ProjectedSettlement[]; projectedTotalWei: bigint } {
   const remainingCapacity = new Map(ownerCapacityWei)
+  const remainingDeposit = new Map<string, bigint>()
   const projected: ProjectedSettlement[] = []
   let projectedTotalWei = 0n
 
@@ -148,7 +187,11 @@ export function projectSettlementOutcome(
       })
       return
     }
-    if (entry.deposit.receiptMintedWei === 0n) {
+
+    const depositKey = `${entry.depositor}:${entry.depositId.toString()}`
+    const depositDebt =
+      remainingDeposit.get(depositKey) ?? entry.deposit.receiptMintedWei
+    if (depositDebt === 0n) {
       projected.push({
         ...base,
         projectedWei: 0n,
@@ -157,7 +200,7 @@ export function projectSettlementOutcome(
       return
     }
     if (
-      entry.deposit.receiptMintedWei + entry.deposit.projectedFeeWei >
+      depositDebt + entry.deposit.projectedFeeWei >
       entry.deposit.balanceWei
     ) {
       projected.push({
@@ -169,8 +212,8 @@ export function projectSettlementOutcome(
     }
 
     let settle = entry.amountWei
-    if (settle > entry.deposit.receiptMintedWei) {
-      settle = entry.deposit.receiptMintedWei
+    if (settle > depositDebt) {
+      settle = depositDebt
     }
     if (settle > capacity) {
       settle = capacity
@@ -184,6 +227,7 @@ export function projectSettlementOutcome(
       return
     }
 
+    remainingDeposit.set(depositKey, depositDebt - settle)
     remainingCapacity.set(entry.depositor, capacity - settle)
     projectedTotalWei += settle
     projected.push({ ...base, projectedWei: settle })
