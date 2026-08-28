@@ -1,0 +1,258 @@
+{
+  "chainId": 1,
+  "snapshotBlock": 25850299,
+  "snapshotTimestamp": "2026-08-28T00:57:59Z",
+  "selectionPolicy": "Largest active tBTC receipt debts first, restricted to depositors holding at most 1000000000000 wei of stBTC (a depositor still holding stBTC can redeem it against their own debt through the normal repayment path and must not be left with unredeemable stBTC); the final deposit is settled partially. Excluded depositors are listed under strandingExclusions.",
+  "addresses": {
+    "portal": "0xAB13B8eecf5AA2460841d75da5d5D861fD5B8A39",
+    "originalImplementation": "0xb3696cdDDEaa764FEF98Dc109ECe3dEfABaB64d8",
+    "proxyAdmin": "0x260cA2abeF5d38181E2562F00FA92AD1DC681734",
+    "proxyAdminOwnerTimelock": "0x82f08041f1Bc1aa399320743F33f75CcA482b25a",
+    "portalLogicOwner": "0x98D8899c3030741925BE630C710A98B57F397C7a",
+    "tbtc": "0x18084fbA666a33d37592fA2633fD49a74DD93a88",
+    "stbtc": "0xdF217EFD8f3ecb5E837aedF203C28c1f06854017",
+    "receiptPayer": "0xd818B9f7Cb4090047D26C51e63C9CB1b5E12886a",
+    "collateralRecipient": "0x71E47a4429d35827e0312AA13162197C23287546"
+  },
+  "implementationRuntimeHash": "0x45d9f7bc2be7231b786206cf8c08716af1938f75363d4ec7ab1f3ee7bccb0ba7",
+  "recoveryAmountWei": "1091038926395006521",
+  "observedState": {
+    "receiptPayerStbtcBalanceWei": "1091038926395006521",
+    "portalTbtcBalanceWei": "4258129611578347184",
+    "portalStbtcDebtWei": "6677219865006317422",
+    "depositCount": "25151",
+    "activeTbtcDepositCount": 87,
+    "activeTbtcReceiptDebtWei": "1939721887006317423",
+    "feeInfo": {
+      "totalMintedWei": "1939721887006317423",
+      "lastFeeUpdateAt": 1768775831,
+      "feeIntegral": "27951750350754480",
+      "annualFeePercent": 2,
+      "mintCapPercent": 90,
+      "receiptToken": "0xdF217EFD8f3ecb5E837aedF203C28c1f06854017",
+      "feeCollectedWei": "303152305103757625"
+    }
+  },
+  "strandingExclusions": [
+    {
+      "depositor": "0x950D988208628F1dDb6C63aC6b1F867EC8ED6a1E",
+      "stbtcBalanceWei": "387610329704770866",
+      "activeDebtWei": "384455402254823538",
+      "depositIds": ["108", "113", "114", "105"]
+    },
+    {
+      "depositor": "0x6EA70C9805a8b4C7A782caD2641D35f238Ef3513",
+      "stbtcBalanceWei": "960516361186302",
+      "activeDebtWei": "96942391962144576",
+      "depositIds": ["21078"]
+    },
+    {
+      "depositor": "0x6e80164ea60673D64d5d6228beb684a1274Bb017",
+      "stbtcBalanceWei": "3409769999999999",
+      "activeDebtWei": "5390000000000000",
+      "depositIds": ["17660"]
+    },
+    {
+      "depositor": "0x2e3Eea8D60D4852ca37BceECfDb1f3F98964a2E8",
+      "stbtcBalanceWei": "1250144297428399",
+      "activeDebtWei": "987660000000000",
+      "depositIds": ["15559"]
+    },
+    {
+      "depositor": "0xD411328549Eb057Aee0a4Ab6aEFC2E298B780547",
+      "stbtcBalanceWei": "146857205689869",
+      "activeDebtWei": "146857205689869",
+      "depositIds": ["13043"]
+    },
+    {
+      "depositor": "0x3500128c4cf23C5755E38b1f28d6F34e1130EB3c",
+      "stbtcBalanceWei": "343229915308635",
+      "activeDebtWei": "43169915308635",
+      "depositIds": ["12704"]
+    },
+    {
+      "depositor": "0x85F031cD70b1Fc767c2Cc0677B3e03c2AF6511C4",
+      "stbtcBalanceWei": "14756142029434",
+      "activeDebtWei": "18353526980187",
+      "depositIds": ["17739"]
+    },
+    {
+      "depositor": "0x23943026758F8A66749146f247637cCa4ecaB1F8",
+      "stbtcBalanceWei": "3772521532019",
+      "activeDebtWei": "3772521532019",
+      "depositIds": ["19181"]
+    }
+  ],
+  "settlements": [
+    {
+      "depositor": "0x11D8A8a83750bFF1b10eDA011e0B33f378842f9a",
+      "depositId": "23033",
+      "depositIdHex": "0x59f9",
+      "amountWei": "506321143512484403",
+      "depositorStbtcBalanceWei": "0",
+      "depositorActiveDebtWei": "506321143512484403",
+      "preState": {
+        "balanceWei": "562579048347204893",
+        "receiptDebtWei": "506321143512484403",
+        "feeOwedWei": "0",
+        "lastFeeIntegral": "4318660573788096",
+        "migrationState": 0,
+        "feeAtSnapshotWei": "18099986714760961",
+        "collateralMarginAtSnapshotWei": "38157918119959529"
+      }
+    },
+    {
+      "depositor": "0x295174fB716b7B2C0a553822C5CD7C21E0eFA148",
+      "depositId": "587",
+      "depositIdHex": "0x24b",
+      "amountWei": "133763725772618796",
+      "depositorStbtcBalanceWei": "0",
+      "depositorActiveDebtWei": "133763725772618796",
+      "preState": {
+        "balanceWei": "148626361969576440",
+        "receiptDebtWei": "133763725772618796",
+        "feeOwedWei": "0",
+        "lastFeeIntegral": "102496194715824",
+        "migrationState": 0,
+        "feeAtSnapshotWei": "5345760405988580",
+        "collateralMarginAtSnapshotWei": "9516875790969064"
+      }
+    },
+    {
+      "depositor": "0x540F091A2961564A997eCea48b9aAA1c0E98637D",
+      "depositId": "19877",
+      "depositIdHex": "0x4da5",
+      "amountWei": "119674337771331202",
+      "depositorStbtcBalanceWei": "0",
+      "depositorActiveDebtWei": "120227323759554023",
+      "preState": {
+        "balanceWei": "132971486412590225",
+        "receiptDebtWei": "119674337771331202",
+        "feeOwedWei": "0",
+        "lastFeeIntegral": "977146117680996",
+        "migrationState": 0,
+        "feeAtSnapshotWei": "4678016123447456",
+        "collateralMarginAtSnapshotWei": "8619132517811567"
+      }
+    },
+    {
+      "depositor": "0x44506f5bE56ee41C62f5307CBed36a90A2E3D781",
+      "depositId": "21077",
+      "depositIdHex": "0x5255",
+      "amountWei": "111212571760131698",
+      "depositorStbtcBalanceWei": "0",
+      "depositorActiveDebtWei": "111212571760131698",
+      "preState": {
+        "balanceWei": "123569524177924109",
+        "receiptDebtWei": "111212571760131698",
+        "feeOwedWei": "0",
+        "lastFeeIntegral": "2322534244102308",
+        "migrationState": 0,
+        "feeAtSnapshotWei": "4197625416290103",
+        "collateralMarginAtSnapshotWei": "8159327001502308"
+      }
+    },
+    {
+      "depositor": "0xD897D8D6c19A4F981bcad5C96BA5311513E349d0",
+      "depositId": "585",
+      "depositIdHex": "0x249",
+      "amountWei": "60751503453888819",
+      "depositorStbtcBalanceWei": "0",
+      "depositorActiveDebtWei": "60751503453888819",
+      "preState": {
+        "balanceWei": "67501670504320911",
+        "receiptDebtWei": "60751503453888819",
+        "feeOwedWei": "0",
+        "lastFeeIntegral": "102016742661540",
+        "migrationState": 0,
+        "feeAtSnapshotWei": "2427914414660648",
+        "collateralMarginAtSnapshotWei": "4322252635771444"
+      }
+    },
+    {
+      "depositor": "0x561c689A25cBC25d7ED197642F5C9681AF902f5b",
+      "depositId": "17797",
+      "depositIdHex": "0x4585",
+      "amountWei": "45000000000000000",
+      "depositorStbtcBalanceWei": "0",
+      "depositorActiveDebtWei": "312742798154264314",
+      "preState": {
+        "balanceWei": "50000000000000000",
+        "receiptDebtWei": "45000000000000000",
+        "feeOwedWei": "0",
+        "lastFeeIntegral": "138744292089708",
+        "migrationState": 0,
+        "feeAtSnapshotWei": "1796757874799140",
+        "collateralMarginAtSnapshotWei": "3203242125200860"
+      }
+    },
+    {
+      "depositor": "0x561c689A25cBC25d7ED197642F5C9681AF902f5b",
+      "depositId": "17808",
+      "depositIdHex": "0x4590",
+      "amountWei": "39664176867719171",
+      "depositorStbtcBalanceWei": "0",
+      "depositorActiveDebtWei": "312742798154264314",
+      "preState": {
+        "balanceWei": "44071307630799079",
+        "receiptDebtWei": "39664176867719171",
+        "feeOwedWei": "0",
+        "lastFeeIntegral": "143272450380168",
+        "migrationState": 0,
+        "feeAtSnapshotWei": "1583529775095356",
+        "collateralMarginAtSnapshotWei": "2823600987984552"
+      }
+    },
+    {
+      "depositor": "0x561c689A25cBC25d7ED197642F5C9681AF902f5b",
+      "depositId": "17815",
+      "depositIdHex": "0x4597",
+      "amountWei": "34948110007316141",
+      "depositorStbtcBalanceWei": "0",
+      "depositorActiveDebtWei": "312742798154264314",
+      "preState": {
+        "balanceWei": "38831233341462379",
+        "receiptDebtWei": "34948110007316141",
+        "feeOwedWei": "0",
+        "lastFeeIntegral": "143713850684112",
+        "migrationState": 0,
+        "feeAtSnapshotWei": "1395232809208264",
+        "collateralMarginAtSnapshotWei": "2487890524937974"
+      }
+    },
+    {
+      "depositor": "0x561c689A25cBC25d7ED197642F5C9681AF902f5b",
+      "depositId": "17816",
+      "depositIdHex": "0x4598",
+      "amountWei": "30776851629479754",
+      "depositorStbtcBalanceWei": "0",
+      "depositorActiveDebtWei": "312742798154264314",
+      "preState": {
+        "balanceWei": "34196501810533060",
+        "receiptDebtWei": "30776851629479754",
+        "feeOwedWei": "0",
+        "lastFeeIntegral": "143866057685472",
+        "migrationState": 0,
+        "feeAtSnapshotWei": "1228699046553345",
+        "collateralMarginAtSnapshotWei": "2190951134499961"
+      }
+    },
+    {
+      "depositor": "0x561c689A25cBC25d7ED197642F5C9681AF902f5b",
+      "depositId": "17819",
+      "depositIdHex": "0x459b",
+      "amountWei": "8926505620036537",
+      "depositorStbtcBalanceWei": "0",
+      "depositorActiveDebtWei": "312742798154264314",
+      "preState": {
+        "balanceWei": "30100821822842566",
+        "receiptDebtWei": "27090739640558309",
+        "feeOwedWei": "0",
+        "lastFeeIntegral": "144604261642068",
+        "migrationState": 0,
+        "feeAtSnapshotWei": "1081519022052919",
+        "collateralMarginAtSnapshotWei": "1928563160231338"
+      }
+    }
+  ]
+}

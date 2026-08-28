@@ -4,7 +4,7 @@ import { join } from "path"
 // config, the preflight script, and the fork test must all import the
 // manifest from here so that re-pinning to a new snapshot only ever touches
 // this file and the manifest it points at.
-import manifestJson from "../recovery/mainnet-25849540.json"
+import manifestJson from "../recovery/mainnet-25850299.json"
 
 export type ManifestSettlementPreState = {
   balanceWei: string
@@ -62,7 +62,7 @@ export type RecoveryManifest = {
   settlements: ManifestSettlement[]
 }
 
-export const recoveryManifestFile = "mainnet-25849540.json"
+export const recoveryManifestFile = "mainnet-25850299.json"
 
 export const recoveryManifestPath = join(
   __dirname,
