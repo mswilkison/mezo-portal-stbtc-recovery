@@ -1,6 +1,13 @@
 import { ethers, upgrades } from "hardhat"
 
-describe("PortalStbtcRecovery - storage layout", () => {
+// `npm run test:upgrades` sweeps this directory against the live-state
+// mainnet_fork network, whose remote accounts cannot sign the local proxy
+// deployment this test performs. It runs on the default hardhat network via
+// `npm run test:recovery` instead.
+const describeFn =
+  process.env.NODE_ENV === "upgrades-test" ? describe.skip : describe
+
+describeFn("PortalStbtcRecovery - storage layout", () => {
   it("is storage-compatible with the reconstructed live Portal", async () => {
     const signers = await ethers.getSigners()
     const addresses = await Promise.all(

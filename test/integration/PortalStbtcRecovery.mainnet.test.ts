@@ -1,13 +1,26 @@
 import { expect } from "chai"
 import { ethers, network, upgrades } from "hardhat"
 import { time } from "@nomicfoundation/hardhat-network-helpers"
-import manifest from "../../recovery/mainnet-25849540.json"
+import { recoveryManifest as manifest } from "../../helpers/recovery-manifest"
 
 const describeFn =
   process.env.NODE_ENV === "recovery-fork-test" ? describe : describe.skip
 
-describeFn("PortalStbtcRecovery - mainnet fork", () => {
+// eslint-disable-next-line func-names
+describeFn("PortalStbtcRecovery - mainnet fork", function () {
+  // Forked-state reads go to a remote archive RPC; public gateways need far
+  // more than mocha's default timeout.
+  this.timeout(600_000)
+
   it("recovers Threshold's exact stBTC balance and atomically restores Portal", async () => {
+    // A wrong fork pin must fail loudly instead of silently validating a
+    // different block than the one governance reviewed.
+    expect(
+      (await ethers.provider.getBlock("latest"))!.number,
+      "forked block does not match the manifest snapshot " +
+        "(check MAINNET_FORK_BLOCK_NUMBER overrides)",
+    ).to.equal(manifest.snapshotBlock)
+
     const { addresses } = manifest
     const recoveryAmount = BigInt(manifest.recoveryAmountWei)
     const settlements = manifest.settlements.map((settlement) => ({
@@ -67,8 +80,52 @@ describeFn("PortalStbtcRecovery - mainnet fork", () => {
     expect(await stbtc.balanceOf(addresses.receiptPayer)).to.equal(
       recoveryAmount,
     )
+    const feeInfoObserved = (
+      manifest.observedState as { feeInfo: { totalMintedWei: string } }
+    ).feeInfo
     expect(feeBefore.totalMinted).to.equal(
-      BigInt(manifest.observedState.feeInfo.totalMintedWei),
+      BigInt(feeInfoObserved.totalMintedWei),
+    )
+
+    // The settlement must not strand a third-party depositor: nobody whose
+    // debt is being settled may be left holding more stBTC than the receipt
+    // debt they retain. Validates the manifest's recorded balances too.
+    const settledByDepositor = new Map<string, bigint>()
+    const activeDebtByDepositor = new Map<string, bigint>()
+    manifest.settlements.forEach((settlement) => {
+      settledByDepositor.set(
+        settlement.depositor,
+        (settledByDepositor.get(settlement.depositor) ?? 0n) +
+          BigInt(settlement.amountWei),
+      )
+      if (settlement.depositorActiveDebtWei) {
+        activeDebtByDepositor.set(
+          settlement.depositor,
+          BigInt(settlement.depositorActiveDebtWei),
+        )
+      }
+    })
+    await Promise.all(
+      Array.from(settledByDepositor.entries()).map(
+        async ([depositor, settled]) => {
+          const holderBalance = BigInt(await stbtc.balanceOf(depositor))
+          const recordedBalance = manifest.settlements.find(
+            (settlement) => settlement.depositor === depositor,
+          )?.depositorStbtcBalanceWei
+          if (recordedBalance !== undefined) {
+            expect(holderBalance, `${depositor} stBTC balance`).to.equal(
+              BigInt(recordedBalance),
+            )
+          }
+          const activeDebt = activeDebtByDepositor.get(depositor)
+          if (activeDebt !== undefined) {
+            expect(
+              holderBalance,
+              `${depositor} would be left holding unredeemable stBTC`,
+            ).to.be.lessThanOrEqual(activeDebt - settled)
+          }
+        },
+      ),
     )
 
     await network.provider.send("hardhat_setBalance", [

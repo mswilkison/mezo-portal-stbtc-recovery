@@ -7,6 +7,7 @@ import "hardhat-deploy"
 import "hardhat-contract-sizer"
 import "hardhat-gas-reporter"
 import dotenv from "dotenv-safer"
+import { recoveryManifest } from "./helpers/recovery-manifest"
 
 dotenv.config({
   allowEmptyValues: true,
@@ -21,9 +22,12 @@ const MAINNET_PRIVATE_KEY = process.env.MAINNET_PRIVATE_KEY
   ? [process.env.MAINNET_PRIVATE_KEY]
   : []
 
+// The recovery fork test pins to the reviewed manifest's snapshot block by
+// default so a stale .env cannot silently fork a different block after a
+// re-pin. MAINNET_FORK_BLOCK_NUMBER remains as an explicit override only.
 const MAINNET_FORK_BLOCK_NUMBER = process.env.MAINNET_FORK_BLOCK_NUMBER
   ? Number(process.env.MAINNET_FORK_BLOCK_NUMBER)
-  : 25849540
+  : recoveryManifest.snapshotBlock
 
 const RECOVERY_FORK_ENABLED =
   process.env.NODE_ENV === "recovery-fork-test" && MAINNET_RPC_URL.length > 0
@@ -56,6 +60,10 @@ const config: HardhatUserConfig = {
         enabled: true,
         runs: 10000,
       },
+      // The live Portal implementation was compiled for the paris EVM
+      // (see UPSTREAM.md). Without this, solc 0.8.24 defaults to shanghai
+      // and the build can never reproduce the pinned runtime bytecode hash.
+      evmVersion: "paris",
     },
   },
   typechain: {
@@ -96,13 +104,14 @@ const config: HardhatUserConfig = {
           }
         : {}),
     },
+    // NOTE: this is an HTTP network entry, so hardhat ignores any `forking`
+    // configuration here (forking is only honored by the in-process
+    // `hardhat` network). Tests on this network query the RPC's live state;
+    // the pinned recovery fork test runs on the `hardhat` network via
+    // `npm run test:recovery:fork` instead.
     mainnet_fork: {
       url: MAINNET_RPC_URL,
       chainId: 1,
-      forking: {
-        url: MAINNET_RPC_URL,
-        blockNumber: MAINNET_FORK_BLOCK_NUMBER,
-      },
     },
   },
   external: {

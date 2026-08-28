@@ -16,7 +16,7 @@
     "prepare:env": "cp -n .env.example .env || true",
     "preflight:recovery": "npm run prepare:env && hardhat run scripts/prepare-stbtc-recovery.ts --network mainnet",
     "test": "npm run prepare:env && hardhat test",
-    "test:recovery": "npm run prepare:env && hardhat test test/PortalStbtcRecovery.test.ts test/upgrades/PortalStbtcRecovery.upgrades.test.ts",
+    "test:recovery": "npm run prepare:env && hardhat test test/Portal.provenance.test.ts test/PortalStbtcRecovery.test.ts test/upgrades/PortalStbtcRecovery.upgrades.test.ts",
     "test:recovery:fork": "npm run prepare:env && NODE_ENV=recovery-fork-test hardhat test test/integration/PortalStbtcRecovery.mainnet.test.ts --network hardhat",
     "test:upgrades": "npm run prepare:env && NODE_ENV=upgrades-test hardhat test ./test/upgrades/*.test.ts --network mainnet_fork",
     "node": "hardhat node",
