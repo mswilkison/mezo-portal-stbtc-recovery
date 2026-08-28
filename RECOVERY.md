@@ -85,7 +85,10 @@ owner — never multiplied per deposit — and can never leave the recipient
 holding unredeemable stBTC. The selection is reproducible:
 `npm run generate:recovery-manifest` rebuilds the manifest from chain state
 at any block, so reviewers can regenerate and diff it instead of trusting
-the committed file.
+the committed file; the generator reserves each selected owner's own
+holdings out of their selectable debt and refuses to emit a manifest whose
+event scan does not reconcile with the Portal's own `totalMinted`
+bookkeeping.
 
 The pinned manifest is
 [`recovery/mainnet-25850299.json`](./recovery/mainnet-25850299.json)
@@ -182,11 +185,20 @@ hand third parties a process-level veto the contract itself does not have.
 `RECOVERY_STAGE=execute` is the mandatory rerun immediately before
 `executeBatch`: it always validates latest state (`RECOVERY_BLOCK` is
 refused), and hard-fails unless the exact allowance is in place, the
-operation is ready, and the projected settlement is nonzero. Structural
-checks — implementation, proxy administration, tokens, roles, runtime hash —
-are hard failures at every stage. Each run resolves its block once and pins
-every subsequent storage read, code read, and contract call to that same
-block.
+operation is ready, and the projected settlement is nonzero. A materially
+reduced projection (beyond wei-level noise) requires the same explicit
+`RECOVERY_ACCEPT_REDUCED_RECOVERY=1` acknowledgment at both stages — at the
+execute stage the alternative is cancelling with the printed calldata — so
+drift discovered after scheduling cannot silently execute a smaller round
+than governance signed off on. Structural checks — implementation, proxy
+administration, tokens, roles, runtime hash — are hard failures at every
+stage, while balance and debt sufficiency are checked against the projected
+settlement (the amount the contract actually pulls), never the original
+round total. Boundary classification pads fee accrual by an hour so a
+deposit crossing its collateral margin between preflight and execution is
+conservatively projected as skipped; a flip past that padding still reverts
+atomically and harmlessly. Each run resolves its block once and pins every
+subsequent storage read, code read, and contract call to that same block.
 
 1. Thesis rebases this feature commit onto the exact canonical commit backing
    the live implementation. `npm run test:recovery` includes a provenance
@@ -234,8 +246,9 @@ block.
    Approving before or during the delay would leave a standing allowance to
    an upgradeable proxy for longer than necessary.
 9. Governance reruns the preflight with `RECOVERY_STAGE=execute` (against
-   latest state — it requires the exact allowance, a ready operation, and a
-   nonzero projected settlement) and executes the batch.
+   latest state — it requires the exact allowance, a ready operation, a
+   nonzero projected settlement, and explicit acknowledgment of any
+   material reduction) and executes the batch.
 10. Verify the `StbtcRecoveryCompleted` event and any
     `ReceiptDebtSettlementSkipped` events, the Threshold Safe tBTC increase,
     the stBTC burn, debt and collateral changes, and restoration of
@@ -244,8 +257,10 @@ block.
     total. Threshold then revokes the residual allowance with
     `approve(portal, 0)` and handles the remainder in a follow-up round: a
     fresh manifest and schedule against the same deployed implementation
-    (its immutable amount is an upper bound), needing no redeploy or
-    re-verification.
+    (its immutable amount is an upper bound), needing no redeploy. The
+    residual round's preflight passes the original deployment's amount as
+    `RECOVERY_DEPLOYED_MAX_WEI`, which anchors the byte-for-byte immutable
+    verification externally instead of trusting the deployed getter.
 
 If the attempt is abandoned at any point after scheduling: cancel the
 timelock operation (step 6 prints the calldata — operations never expire on
