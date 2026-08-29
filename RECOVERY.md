@@ -222,22 +222,24 @@ refused), and hard-fails unless the exact allowance is in place, the
 operation is ready, and the projected settlement is nonzero. A materially
 reduced projection (beyond wei-level noise) requires the same explicit
 `RECOVERY_ACCEPT_REDUCED_RECOVERY=1` acknowledgment at both stages — at the
-execute stage the alternative is cancelling with the printed calldata — so
+execute stage an unaccepted reduction or all-zero projection prints
+`preflightPassed: false` with the verified cancellation calldata before
+exiting nonzero — so
 drift discovered after scheduling cannot silently execute a smaller round
 than governance signed off on. Structural checks — implementation, proxy
 administration, tokens, runtime hash, and the reviewed anchors — are hard
 failures at every stage.
 
-Balance and debt sufficiency are checked against the round's **requested**
-total, not the projection. The projection is deliberately conservative (fees
-padded by an hour, owner capacity read at the preflight block), which makes
-it a _lower_ bound on what the contract pulls: a padded-boundary deposit can
-settle in full, and owner capacity rises if a selected owner's balance drops
-before execution. Gating sufficiency on the projection would therefore let a
-green execute-stage run be followed by a revert inside the transfer. The
-requested total is the true upper bound, and gating on it is veto-free
-because those balances are controlled by Threshold and the Portal, not by
-third-party depositors.
+Token funding and receipt-debt consistency are checked against a live
+settlement upper bound: permanently unavailable deposits are excluded and
+each remaining request is clamped to that deposit's live debt. The bound
+deliberately ignores fee-boundary and owner-capacity skips because those can
+make the projection lower than what the contract ultimately settles. Under
+the verified Portal implementation, debt cannot be re-minted into the
+reviewed deposit ids, so the bound is sufficient for the tBTC transfer, stBTC
+pull and burn, and both debt reductions. Because it falls with ordinary
+repayments and withdrawals, those actions cannot veto a valid partial round
+by leaving funding checks pinned to the stale requested total.
 
 Timelock role checks are a weaker assurance than the rest, and the runbook
 should not be read as claiming otherwise: the preflight is read-only and has

@@ -455,14 +455,24 @@ describe("PortalStbtcRecovery", () => {
 
       // A 1 wei repayment on deposit 1 after the manifest was reviewed. It
       // must reduce the recovered amount by 1 wei, not veto the batch.
-      await seedDeposit(
+      // Exercise the ordinary Portal path so the deposit, fee.totalMinted,
+      // and the Portal's stBTC debt all drift together as they do on mainnet.
+      await fixture.stbtc.connect(fixture.otherHolder).transfer(depositor, 1n)
+      await fixture.stbtc
+        .connect(fixture.depositor)
+        .approve(fixture.portalAddress, 1n)
+      await fixture.portal
+        .connect(fixture.depositor)
+        .repayReceipt(fixture.tbtcAddress, 1n, 1n)
+
+      const debtAfterRepayment = await fixture.stbtc.currentDebt(
         fixture.portalAddress,
-        depositor,
-        fixture.tbtcAddress,
-        1n,
-        FIRST_BALANCE,
-        FIRST_DEBT - 1n,
       )
+      const feeAfterRepayment = await fixture.portal.feeInfo(
+        fixture.tbtcAddress,
+      )
+      expect(debtAfterRepayment).to.equal(TOTAL_DEBT - 1n)
+      expect(feeAfterRepayment.totalMinted).to.equal(TOTAL_DEBT - 1n)
 
       const recoveryAtPortal = fixture.Recovery.attach(fixture.portalAddress)
       const transaction = await scheduleRecovery(

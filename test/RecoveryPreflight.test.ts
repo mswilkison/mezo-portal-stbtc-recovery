@@ -1,8 +1,10 @@
 import { expect } from "chai"
 import {
   annualFeeRatePerSecond,
+  emitRecoveryPreflightResult,
   effectiveFeeIntegralAt,
   hasExactRecoveryAllowance,
+  maximumSettlementFromLiveDebt,
   pinnedBlockContext,
   projectSettlementOutcome,
   projectedFeeOwed,
@@ -27,6 +29,74 @@ describe("recovery preflight helpers", () => {
     expect(hasExactRecoveryAllowance(amount - 1n, amount)).to.equal(false)
     expect(hasExactRecoveryAllowance(amount + 1n, amount)).to.equal(false)
     expect(hasExactRecoveryAllowance(2n ** 256n - 1n, amount)).to.equal(false)
+  })
+
+  it("bounds funding and debt sufficiency by live selected debt", () => {
+    const owner = "0xAAA0000000000000000000000000000000000001"
+    const entry = (depositId: bigint, amountWei: bigint, debtWei: bigint) => ({
+      depositor: owner,
+      depositId,
+      amountWei,
+      deposit: {
+        balanceWei: 1_000n,
+        receiptMintedWei: debtWei,
+        migrating: false,
+        projectedFeeWei: 0n,
+      },
+    })
+
+    // A 1-wei repayment lowers the valid round from 100 to 99. Global receipt
+    // debt of 99 is sufficient for what the contract can still settle and
+    // must not be compared with the stale 100-wei manifest total.
+    expect(maximumSettlementFromLiveDebt([entry(1n, 100n, 99n)])).to.equal(99n)
+
+    // A fully repaid and withdrawn entry is permanently skipped. It must not
+    // keep token funding pinned to the stale manifest total, while a live
+    // entry remains fully covered even if its padded fee projection may skip.
+    const withdrawn = entry(2n, 100n, 0n)
+    withdrawn.deposit.balanceWei = 0n
+    const live = entry(3n, 100n, 100n)
+    live.deposit.projectedFeeWei = 1_000n
+    expect(maximumSettlementFromLiveDebt([withdrawn, live])).to.equal(100n)
+
+    const migrating = entry(4n, 100n, 100n)
+    migrating.deposit.migrating = true
+    expect(maximumSettlementFromLiveDebt([migrating, live])).to.equal(100n)
+
+    // The upper bound consumes repeated keys exactly once even though the
+    // mandatory manifest validation rejects duplicates independently.
+    expect(
+      maximumSettlementFromLiveDebt([
+        entry(2n, 75n, 100n),
+        entry(2n, 75n, 100n),
+      ]),
+    ).to.equal(100n)
+  })
+
+  it("emits governance output before a deferred execution failure", () => {
+    const emitted: string[] = []
+
+    expect(() =>
+      emitRecoveryPreflightResult(
+        '{"preflightPassed":false,"governanceBatch":{"cancelTransaction":"0x1234"}}',
+        "cancel the reduced operation",
+        (output) => emitted.push(output),
+      ),
+    ).to.throw("Recovery preflight failed: cancel the reduced operation")
+    expect(emitted).to.deep.equal([
+      '{"preflightPassed":false,"governanceBatch":{"cancelTransaction":"0x1234"}}',
+    ])
+    expect(JSON.parse(emitted[0])).to.deep.equal({
+      preflightPassed: false,
+      governanceBatch: { cancelTransaction: "0x1234" },
+    })
+
+    expect(() =>
+      emitRecoveryPreflightResult("ready", undefined, (output) =>
+        emitted.push(output),
+      ),
+    ).not.to.throw()
+    expect(emitted[1]).to.equal("ready")
   })
 
   it("recomputes active debt from every live deposit record", async () => {

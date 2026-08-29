@@ -10,8 +10,10 @@ import {
   IMPLEMENTATION_SLOT,
   SettlementProjectionInput,
   buildRecoveryBatchPayloads,
+  emitRecoveryPreflightResult,
   effectiveFeeIntegralAt,
   hasExactRecoveryAllowance,
+  maximumSettlementFromLiveDebt,
   pinnedBlockContext,
   projectSettlementOutcome,
   projectedFeeOwed,
@@ -409,12 +411,10 @@ async function main() {
   )
   expectEqual("manifest settlement total", manifestTotal, roundAmount)
 
-  // NOTE: the balance/debt sufficiency checks live AFTER the projection —
-  // they gate on what the contract will actually settle, not the original
-  // round amount, because recoverTbtc clamps to live state. Gating on the
-  // round amount here would abort a valid drift-tolerant partial execution
-  // (for example, total receipt debt dropping below the round while the
-  // selected debt remains settleable).
+  // Sufficiency checks live after the projection inputs are assembled. Token
+  // funding and receipt-debt accounting use the selected deposits' live
+  // settlement upper bound; the conservative projected total is not a safe
+  // funding bound.
 
   // Threshold's one on-chain action. In the execute-stage rerun this is a
   // hard requirement — a green preflight must guarantee executeBatch cannot
@@ -736,40 +736,38 @@ async function main() {
     projectionInputs,
     ownerCapacity,
   )
+  const liveSettlementUpperBoundWei =
+    maximumSettlementFromLiveDebt(projectionInputs)
   const projectedResidualWei = manifestTotal - projectedTotalWei
 
-  // Sufficiency is checked against the REQUESTED round total, not the
-  // projection. The projection is deliberately conservative — it pads fees
-  // by an hour and reads owner capacity at this block — so it is a LOWER
-  // bound on what the contract pulls: a padded-boundary deposit can settle
-  // in full, and owner capacity rises if a selected owner's balance drops
-  // before execution. Gating on the projection would therefore let a green
-  // execute-stage run be followed by a revert inside safeTransferFrom. The
-  // requested total is the true upper bound on what recoverTbtc can pull,
-  // and gating on it is veto-free here because these are balances only
-  // Threshold and the Portal control, not third-party depositors.
-  if (BigInt(portalTbtcBalance) < manifestTotal) {
+  // Funding and receipt-debt accounting use the live settlement upper bound.
+  // It excludes entries the contract can no longer settle and clamps the
+  // rest to live debt, but deliberately ignores fee and owner-capacity skips
+  // that make the projection a lower bound. Under the verified Portal, debt
+  // cannot be re-minted into these reviewed deposit ids, so this is the true
+  // maximum recoverTbtc can pull, burn, and release after this pinned read.
+  if (BigInt(portalTbtcBalance) < liveSettlementUpperBoundWei) {
     fail(
-      `Portal holds ${portalTbtcBalance.toString()} tBTC, below this round's ` +
-        `requested total ${manifestTotal.toString()}`,
+      `Portal holds ${portalTbtcBalance.toString()} tBTC, below the live ` +
+        `settlement upper bound ${liveSettlementUpperBoundWei.toString()}`,
     )
   }
-  if (BigInt(receiptPayerBalance) < manifestTotal) {
+  if (BigInt(receiptPayerBalance) < liveSettlementUpperBoundWei) {
     fail(
-      `receipt payer holds ${receiptPayerBalance.toString()} stBTC, below ` +
-        `this round's requested total ${manifestTotal.toString()}`,
+      `receipt payer holds ${receiptPayerBalance.toString()} stBTC, below the ` +
+        `live settlement upper bound ${liveSettlementUpperBoundWei.toString()}`,
     )
   }
-  if (BigInt(portalStbtcDebt) < manifestTotal) {
+  if (BigInt(portalStbtcDebt) < liveSettlementUpperBoundWei) {
     fail(
-      "Portal does not have enough stBTC debt to burn this round's requested " +
-        "total",
+      `Portal stBTC debt ${portalStbtcDebt.toString()} is below the maximum ` +
+        `live settlement ${liveSettlementUpperBoundWei.toString()}`,
     )
   }
-  if (BigInt(fee.totalMinted) < manifestTotal) {
+  if (BigInt(fee.totalMinted) < liveSettlementUpperBoundWei) {
     fail(
-      "Portal does not have enough tBTC-specific receipt debt for this " +
-        "round's requested total",
+      `tBTC-specific receipt debt ${fee.totalMinted.toString()} is below the ` +
+        `maximum live settlement ${liveSettlementUpperBoundWei.toString()}`,
     )
   }
 
@@ -780,15 +778,18 @@ async function main() {
     )
   }
 
+  let failureAfterOutput: string | undefined
   if (projectedTotalWei === 0n) {
-    fail(
+    const message =
       "no settlement would apply at the current state — executeBatch would " +
-        "revert with NothingSettled; cancel the operation and re-pin the " +
-        "manifest",
-    )
-  }
-
-  if (projectedResidualWei > 0n) {
+      "revert with NothingSettled"
+    if (STAGE === "prepare") {
+      fail(`${message}; regenerate the manifest`)
+    }
+    failureAfterOutput =
+      `${message}; cancel the operation using the cancelTransaction calldata ` +
+      "printed in governanceBatch and re-pin the manifest"
+  } else if (projectedResidualWei > 0n) {
     const message =
       `projected settlement is ${projectedTotalWei.toString()} of the ` +
       `reviewed ${manifestTotal.toString()} ` +
@@ -805,24 +806,27 @@ async function main() {
       projectedResidualWei > reductionTolerance &&
       process.env.RECOVERY_ACCEPT_REDUCED_RECOVERY !== "1"
     ) {
-      const remedy =
-        STAGE === "prepare"
-          ? "Regenerate the manifest " +
+      if (STAGE === "prepare") {
+        fail(
+          `${message}. Regenerate the manifest ` +
             "(scripts/generate-stbtc-recovery-manifest.ts) or, if " +
             "governance accepts recovering less in this round, set " +
-            "RECOVERY_ACCEPT_REDUCED_RECOVERY=1"
-          : "Cancel the scheduled operation (calldata printed below) and " +
-            "re-pin, or — only with explicit governance acceptance of the " +
-            "reduced round — set RECOVERY_ACCEPT_REDUCED_RECOVERY=1 and " +
-            "rerun"
-      fail(`${message}. ${remedy}`)
+            "RECOVERY_ACCEPT_REDUCED_RECOVERY=1",
+        )
+      }
+      failureAfterOutput =
+        `${message}. Cancel the scheduled operation using the ` +
+        "cancelTransaction calldata printed in governanceBatch and re-pin, " +
+        "or — only with explicit governance acceptance of the reduced " +
+        "round — set RECOVERY_ACCEPT_REDUCED_RECOVERY=1 and rerun"
+    } else {
+      warn(message)
+      warn(
+        "after execution the receipt payer must revoke the residual allowance " +
+          `with approve(${addresses.portal}, 0) — the round consumes only the ` +
+          "settled amount and the remainder stays approved to the proxy",
+      )
     }
-    warn(message)
-    warn(
-      "after execution the receipt payer must revoke the residual allowance " +
-        `with approve(${addresses.portal}, 0) — the round consumes only the ` +
-        "settled amount and the remainder stays approved to the proxy",
-    )
   }
 
   const recoveryFactory = await ethers.getContractFactory("PortalStbtcRecovery")
@@ -860,6 +864,8 @@ async function main() {
 
   const output: Record<string, unknown> = {
     stage: STAGE,
+    preflightPassed: failureAfterOutput === undefined,
+    blockingFailure: failureAfterOutput,
     verifiedAt: {
       blockNumber: block.number,
       blockHash: block.hash,
@@ -898,11 +904,13 @@ async function main() {
     },
     settlementProjection: {
       manifestTotalWei: manifestTotal,
+      liveSettlementUpperBoundWei,
       projectedTotalWei,
       projectedResidualWei,
       note:
         "the projection is a conservative LOWER bound (fees padded, capacity " +
-        "read at this block); sufficiency is checked against manifestTotalWei",
+        "read at this block); all funding and receipt-debt sufficiency is " +
+        "checked against liveSettlementUpperBoundWei",
       owners: ownerReports,
       entries: projected,
     },
@@ -1147,8 +1155,14 @@ async function main() {
     }
   }
 
-  // eslint-disable-next-line no-console
-  console.log(stringify(output))
+  emitRecoveryPreflightResult(
+    stringify(output),
+    failureAfterOutput,
+    (serializedOutput) => {
+      // eslint-disable-next-line no-console
+      console.log(serializedOutput)
+    },
+  )
 }
 
 type RecoveryManifestAddresses = (typeof manifest)["addresses"]

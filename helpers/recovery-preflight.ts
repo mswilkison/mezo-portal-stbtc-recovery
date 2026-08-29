@@ -133,6 +133,59 @@ export type ProjectedSettlement = {
     | "ReceiptHolderWouldBeStranded"
 }
 
+// Upper-bounds what `recoverTbtc` can settle from the selected deposits at
+// the pinned block without relying on the fee-padding or owner-capacity
+// projection. Permanently unavailable entries (deleted or migrating) are
+// excluded, each remaining request is clamped to that deposit's live debt,
+// and repeated keys consume the same debt sequentially just as the contract
+// does. Unlike the manifest total, this bound falls with ordinary repayments
+// and withdrawals; unlike the conservative projection, it never drops merely
+// because a fee boundary or owner balance currently causes a live entry to
+// be skipped or clamped.
+export function maximumSettlementFromLiveDebt(
+  entries: readonly SettlementProjectionInput[],
+): bigint {
+  const remainingDeposit = new Map<string, bigint>()
+  let maximumTotalWei = 0n
+
+  entries.forEach((entry) => {
+    if (entry.amountWei <= 0n) {
+      throw new Error(
+        `settlement amount for ${entry.depositor}/${entry.depositId} ` +
+          "must be positive",
+      )
+    }
+    if (entry.deposit.balanceWei === 0n || entry.deposit.migrating) {
+      return
+    }
+
+    const depositKey = `${entry.depositor}:${entry.depositId.toString()}`
+    const depositDebt =
+      remainingDeposit.get(depositKey) ?? entry.deposit.receiptMintedWei
+    const settle = entry.amountWei < depositDebt ? entry.amountWei : depositDebt
+
+    remainingDeposit.set(depositKey, depositDebt - settle)
+    maximumTotalWei += settle
+  })
+
+  return maximumTotalWei
+}
+
+// The execute-stage reduced-recovery gate must still terminate nonzero, but
+// only after the serialized governance output (including cancel calldata) is
+// emitted. Keeping the ordering in one tested helper prevents a future
+// refactor from restoring the abort-before-calldata failure mode.
+export function emitRecoveryPreflightResult(
+  serializedOutput: string,
+  failureAfterOutput: string | undefined,
+  emit: (output: string) => void,
+): void {
+  emit(serializedOutput)
+  if (failureAfterOutput) {
+    throw new Error(`Recovery preflight failed: ${failureAfterOutput}`)
+  }
+}
+
 // Projects what `recoverTbtc` will actually settle, mirroring the contract's
 // drift tolerance: per-deposit skip conditions, clamping to remaining debt,
 // and the per-owner stranding capacity (live non-migrating debt across the
