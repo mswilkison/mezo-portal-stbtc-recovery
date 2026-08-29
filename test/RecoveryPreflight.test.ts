@@ -1,4 +1,18 @@
 import { expect } from "chai"
+import { readFileSync } from "fs"
+import { join } from "path"
+import {
+  EXTERNAL_STBTC_REVIEW_CONFIRMATION,
+  ExternalStbtcReader,
+  evaluateExternalStbtcGate,
+  screenExternalStbtcHoldings,
+} from "../helpers/external-stbtc"
+import * as anchors from "../helpers/recovery-anchors"
+import {
+  RecoveryManifest,
+  loadRecoveryManifest,
+  validateManifestShape,
+} from "../helpers/recovery-manifest"
 import {
   annualFeeRatePerSecond,
   emitRecoveryPreflightResult,
@@ -12,6 +26,314 @@ import {
 } from "../helpers/recovery-preflight"
 
 describe("recovery preflight helpers", () => {
+  it("rejects a malformed manifest before it can be shared", () => {
+    const valid = loadRecoveryManifest()
+    const malformed = {
+      ...valid,
+      snapshotBlock: valid.snapshotBlock.toString(),
+    } as unknown as RecoveryManifest
+
+    expect(() => validateManifestShape(malformed)).to.throw(
+      "snapshotBlock must be a JSON number",
+    )
+    expect(() => validateManifestShape(valid)).not.to.throw()
+    expect(valid.addresses.portalLogicOwner).to.equal(
+      anchors.PORTAL_LOGIC_OWNER,
+    )
+  })
+
+  it("keeps manifest generation independent of the current pin", () => {
+    const generatorSource = readFileSync(
+      join(__dirname, "..", "scripts", "generate-stbtc-recovery-manifest.ts"),
+      "utf8",
+    )
+
+    expect(generatorSource).not.to.include("loadRecoveryManifest")
+    expect(generatorSource).to.include("anchors.PORTAL_LOGIC_OWNER")
+  })
+
+  describe("external stBTC holdings gate", () => {
+    const depositor = "0x0000000000000000000000000000000000000001"
+    const venue = "0x0000000000000000000000000000000000000002"
+    const reader = (
+      overrides: Partial<ExternalStbtcReader> = {},
+    ): ExternalStbtcReader => ({
+      getSentTransfers: async () => [],
+      getTotalReceivedWei: async () => 0n,
+      getStbtcBalance: async () => 0n,
+      getCode: async () => "0x",
+      getTokenBalance: async () => 0n,
+      getTokenSymbol: async () => "LP",
+      resolveKnownDestination: async () => undefined,
+      getUniswapV3Positions: async () => [],
+      ...overrides,
+    })
+
+    it("requires the non-enumerable positions to be reviewed manually", async () => {
+      const report = await screenExternalStbtcHoldings([depositor], reader())
+
+      // An empty destination scan is not proof: an LP token could have been
+      // received from a third party, staked, or held at a related address.
+      expect(evaluateExternalStbtcGate(report, undefined).passed).to.equal(
+        false,
+      )
+      expect(
+        evaluateExternalStbtcGate(report, EXTERNAL_STBTC_REVIEW_CONFIRMATION)
+          .passed,
+      ).to.equal(true)
+    })
+
+    it("preserves a nonzero claim when token metadata reverts", async () => {
+      const report = await screenExternalStbtcHoldings(
+        [depositor],
+        reader({
+          getSentTransfers: async () => [
+            { destination: venue, amountWei: 10n },
+          ],
+          getCode: async () => "0x01",
+          // A strategy-backed share token may itself custody no stBTC.
+          getStbtcBalance: async () => 0n,
+          getTokenBalance: async () => 7n,
+          getTokenSymbol: async () => {
+            throw new Error("non-standard symbol")
+          },
+        }),
+      )
+
+      expect(
+        report.depositors[0].destinations[0].depositorClaimBalanceWei,
+      ).to.equal(7n)
+      expect(report.depositors[0].destinations[0].symbol).to.equal(undefined)
+      expect(
+        evaluateExternalStbtcGate(report, EXTERNAL_STBTC_REVIEW_CONFIRMATION)
+          .passed,
+      ).to.equal(false)
+    })
+
+    it("fails closed on an unreadable unknown venue even at one wei", async () => {
+      const report = await screenExternalStbtcHoldings(
+        [depositor],
+        reader({
+          getSentTransfers: async () => [
+            { destination: venue, amountWei: 10n },
+          ],
+          getCode: async () => "0x01",
+          getStbtcBalance: async (address) =>
+            address.toLowerCase() === venue.toLowerCase() ? 1n : 0n,
+          getTokenBalance: async () => {
+            throw new Error("balanceOf reverted")
+          },
+        }),
+      )
+
+      expect(report.depositors[0].destinations[0].claimBalanceError).to.equal(
+        "balanceOf reverted",
+      )
+      expect(evaluateExternalStbtcGate(report, undefined).passed).to.equal(
+        false,
+      )
+      expect(
+        evaluateExternalStbtcGate(report, EXTERNAL_STBTC_REVIEW_CONFIRMATION)
+          .passed,
+      ).to.equal(false)
+    })
+
+    it("does not turn a directly held balance into a process veto", async () => {
+      const report = await screenExternalStbtcHoldings(
+        [depositor],
+        reader({ getStbtcBalance: async () => 1n }),
+      )
+
+      // The recovery contract reads this balance atomically and clamps the
+      // owner's settlement; only positions outside that wallet need this
+      // process-level gate.
+      expect(
+        evaluateExternalStbtcGate(report, EXTERNAL_STBTC_REVIEW_CONFIRMATION)
+          .passed,
+      ).to.equal(true)
+      expect(report.depositors[0].walletBalanceWei).to.equal(1n)
+    })
+
+    it("accepts an exact typed router resolution without treating dust as a share token", async () => {
+      const report = await screenExternalStbtcHoldings(
+        [depositor],
+        reader({
+          getSentTransfers: async () => [
+            { destination: venue, amountWei: 10n },
+          ],
+          getCode: async () => "0x01",
+          getStbtcBalance: async (address) =>
+            address.toLowerCase() === venue.toLowerCase() ? 1n : 0n,
+          getTokenBalance: async () => {
+            throw new Error("must not call ERC20 balanceOf for typed router")
+          },
+          resolveKnownDestination: async () => ({
+            adapter: "curve-router-v1.1",
+            status: "noClaim",
+            evidence: "reconciled swap",
+          }),
+        }),
+      )
+
+      expect(report.unverifiableReasons).to.deep.equal([])
+      expect(report.depositors[0].destinations[0].resolution).to.equal(
+        "noClaim",
+      )
+      expect(
+        evaluateExternalStbtcGate(report, EXTERNAL_STBTC_REVIEW_CONFIRMATION)
+          .passed,
+      ).to.equal(true)
+    })
+
+    it("keeps a failed typed adapter blocking even with attestation", async () => {
+      const report = await screenExternalStbtcHoldings(
+        [depositor],
+        reader({
+          getSentTransfers: async () => [{ destination: venue, amountWei: 1n }],
+          getCode: async () => "0x01",
+          getStbtcBalance: async (address) =>
+            address.toLowerCase() === venue.toLowerCase() ? 1n : 0n,
+          resolveKnownDestination: async () => ({
+            adapter: "curve-router-v1.1",
+            status: "unresolved",
+            evidence: "runtime hash mismatch",
+          }),
+        }),
+      )
+
+      expect(
+        evaluateExternalStbtcGate(report, EXTERNAL_STBTC_REVIEW_CONFIRMATION)
+          .passed,
+      ).to.equal(false)
+      expect(report.unverifiableReasons[0]).to.include("runtime hash mismatch")
+    })
+
+    it("does not reclassify a known protocol as an EOA after code drift", async () => {
+      let adapterCalled = false
+      const report = await screenExternalStbtcHoldings(
+        [depositor],
+        reader({
+          getSentTransfers: async () => [
+            { destination: venue, amountWei: 10n },
+          ],
+          getCode: async () => "0x",
+          getStbtcBalance: async () => 0n,
+          resolveKnownDestination: async () => {
+            adapterCalled = true
+            return {
+              adapter: "curve-router-v1.1",
+              status: "unresolved",
+              evidence: "router output was not tBTC",
+            }
+          },
+        }),
+      )
+
+      expect(adapterCalled).to.equal(true)
+      expect(
+        evaluateExternalStbtcGate(report, EXTERNAL_STBTC_REVIEW_CONFIRMATION)
+          .passed,
+      ).to.equal(false)
+    })
+
+    it("blocks a live canonical Uniswap V3 stBTC position", async () => {
+      const report = await screenExternalStbtcHoldings(
+        [depositor],
+        reader({
+          getUniswapV3Positions: async () => [
+            {
+              adapter: "uniswap-v3-nft",
+              tokenId: 796823n,
+              owner: depositor,
+              token0: "0x0000000000000000000000000000000000000003",
+              token1: "0x0000000000000000000000000000000000000004",
+              fee: 10000,
+              liquidity: 1n,
+              tokensOwed0: 0n,
+              tokensOwed1: 0n,
+            },
+          ],
+        }),
+      )
+
+      expect(
+        evaluateExternalStbtcGate(report, EXTERNAL_STBTC_REVIEW_CONFIRMATION)
+          .passed,
+      ).to.equal(false)
+      expect(report.detectedClaimReasons[0]).to.include("NFT 796823")
+    })
+
+    it("blocks a direct Uniswap V3 core position with no NFT", async () => {
+      const report = await screenExternalStbtcHoldings(
+        [depositor],
+        reader({
+          getUniswapV3Positions: async () => [
+            {
+              adapter: "uniswap-v3-core",
+              owner: depositor,
+              tickLower: -200,
+              tickUpper: 200,
+              liquidity: 1n,
+              tokensOwed0: 0n,
+              tokensOwed1: 0n,
+            },
+          ],
+        }),
+      )
+
+      expect(
+        evaluateExternalStbtcGate(report, EXTERNAL_STBTC_REVIEW_CONFIRMATION)
+          .passed,
+      ).to.equal(false)
+      expect(report.detectedClaimReasons[0]).to.include("core range -200/200")
+    })
+
+    it("accepts a fully collected canonical Uniswap V3 stBTC position", async () => {
+      const report = await screenExternalStbtcHoldings(
+        [depositor],
+        reader({
+          getUniswapV3Positions: async () => [
+            {
+              adapter: "uniswap-v3-nft",
+              tokenId: 796823n,
+              owner: depositor,
+              token0: "0x0000000000000000000000000000000000000003",
+              token1: "0x0000000000000000000000000000000000000004",
+              fee: 10000,
+              liquidity: 0n,
+              tokensOwed0: 0n,
+              tokensOwed1: 0n,
+            },
+          ],
+        }),
+      )
+
+      expect(
+        evaluateExternalStbtcGate(report, EXTERNAL_STBTC_REVIEW_CONFIRMATION)
+          .passed,
+      ).to.equal(true)
+    })
+
+    it("fails closed when canonical position enumeration fails", async () => {
+      const report = await screenExternalStbtcHoldings(
+        [depositor],
+        reader({
+          getUniswapV3Positions: async () => {
+            throw new Error("position manager code drift")
+          },
+        }),
+      )
+
+      expect(
+        evaluateExternalStbtcGate(report, EXTERNAL_STBTC_REVIEW_CONFIRMATION)
+          .passed,
+      ).to.equal(false)
+      expect(report.unverifiableReasons[0]).to.include(
+        "position manager code drift",
+      )
+    })
+  })
+
   it("pins RPC and contract reads to the same block", () => {
     expect(pinnedBlockContext(25_850_299)).to.deep.equal({
       rpcBlockTag: "0x18a71bb",

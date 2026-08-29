@@ -92,12 +92,30 @@ measure. This is precisely the case that matters: Threshold's own stranded
 balance came from exiting that Curve pool, so a selected depositor with a
 pool position is exactly the party this recovery could strand. Screening for
 it is therefore a mandatory review step, not something the contract can
-enforce: `npm run check:external-stbtc` replays every settled depositor's
-stBTC transfer history, reports where their minted receipt tokens went, and
-fails if any of them still holds a claim on a venue holding stBTC. If a
-depositor is flagged, prefer reducing their settlement by the externally
-held amount over excluding them outright — exclusion forfeits far more
-recovery capacity than the holding justifies.
+enforce. `npm run check:external-stbtc` replays every settled depositor's
+stBTC transfer history, reports where their receipt tokens went, and fails
+closed on a detected claim. An unreadable claim balance remains explicitly
+UNRESOLVED rather than being reset to zero and always blocks, even when the
+manual-review attestation is present. The reviewed Curve Router v1.1 and
+Uniswap V3 tBTC/stBTC destinations are handled by narrow protocol adapters:
+the former verifies its exact runtime/version and reconciles each stBTC input
+transaction to a tBTC output returned to the same depositor, while the latter
+verifies the canonical factory, pool, and position-manager identities and
+re-reads every currently wallet-owned stBTC position NFT. It also enumerates
+the pool's indexed Mint history for each depositor and re-reads every direct
+core position range, because Uniswap V3 does not require liquidity to be
+represented by an NFT. Any nonzero position liquidity or uncollected amount
+blocks. The persistent one-wei balances at those two contracts are therefore
+resolved by protocol evidence, never by a generic dust exception; code drift,
+receipt mismatch, or an unreadable position remains UNRESOLVED.
+
+That automated list is not exhaustive: an owner can receive LP tokens without
+sending stBTC, stake the LP in a gauge/vault, or use another controlled
+address. The command therefore never treats an automated-only result as
+CLEAN; it passes only with the exact manual-review confirmation documented
+below. If a depositor's complete ownership and protocol positions cannot be
+established, do not attest — reduce their settlement by the externally held
+amount or exclude them.
 
 The selection is reproducible:
 `npm run generate:recovery-manifest` rebuilds the manifest from chain state
@@ -106,6 +124,9 @@ the committed file; the generator reserves each selected owner's own
 holdings out of their selectable debt and refuses to emit a manifest whose
 event scan does not reconcile with the Portal's own `totalMinted`
 bookkeeping.
+The generator takes every non-chain-derived address, including the default
+governance role-holder, from `helpers/recovery-anchors.ts`; it does not load
+the old manifest, so a missing or malformed pin cannot prevent regeneration.
 
 The pinned manifest is
 [`recovery/mainnet-25850299.json`](./recovery/mainnet-25850299.json)
@@ -260,9 +281,10 @@ code read, and contract call to that same block.
    the live runtime hash recorded in [UPSTREAM.md](./UPSTREAM.md) (this
    requires the `evmVersion: "paris"` compiler setting pinned in
    `hardhat.config.ts`). That hash, the Portal proxy, the implementation
-   address, and both Threshold counterparties are duplicated as reviewed
-   constants in [`helpers/recovery-anchors.ts`](./helpers/recovery-anchors.ts);
-   the preflight hard-fails if the manifest disagrees with them. Confirm
+   address, governance role-holder, and both Threshold counterparties are
+   duplicated as reviewed constants in
+   [`helpers/recovery-anchors.ts`](./helpers/recovery-anchors.ts); the
+   preflight hard-fails if the manifest disagrees with them. Confirm
    `COLLATERAL_RECIPIENT` there against a source outside this repository —
    it is the destination of every released tBTC and nothing on chain
    anchors it, so a wrong-but-valid address would otherwise be carried
@@ -275,11 +297,24 @@ code read, and contract call to that same block.
    (`npm run test:recovery` covers the first two — the storage-layout test
    is included there and is deliberately skipped by `npm run test:upgrades`,
    which runs against a remote network that cannot sign local deployments).
-4. Screen the selected depositors for externally held stBTC:
-   `MAINNET_RPC_URL=<archive rpc> npm run check:external-stbtc`. This is the
-   review step the on-chain guard structurally cannot perform (see the
-   selection section above); it must report every settled depositor CLEAN
-   before the manifest is approved.
+4. Screen the selected depositors for externally held stBTC. First manually
+   verify every other address each depositor controls and every LP, share,
+   gauge, vault, or locked position that can return stBTC — including tokens
+   received without a direct stBTC transfer. Then run:
+
+   ```sh
+   MAINNET_RPC_URL=<archive rpc> \
+   RECOVERY_EXTERNAL_STBTC_REVIEW=I_CONFIRM_NO_EXTERNAL_STBTC_CLAIMS \
+   npm run check:external-stbtc
+   ```
+
+   This is the review the on-chain guard structurally cannot perform. The
+   confirmation is an operator attestation, not an automated proof; do not
+   persist it in `.env`. Its typed Curve and Uniswap checks must report no
+   claim or unresolved state, and the command as a whole must report PASSED
+   before the manifest is approved. If ownership or venue coverage is
+   uncertain, exclude or reduce that depositor instead.
+
 5. Run the preflight against a current archive RPC. It intentionally aborts
    if the implementation, proxy administration, token configuration, timelock
    roles, or runtime hash differs from the reviewed manifest. It re-reads
@@ -314,10 +349,19 @@ code read, and contract call to that same block.
    Thesis or the recovery implementation—for exactly the recovery amount.
    Approving before or during the delay would leave a standing allowance to
    an upgradeable proxy for longer than necessary.
-10. Governance reruns the preflight with `RECOVERY_STAGE=execute` (against
-    latest state — it requires the exact allowance, a ready operation, a
-    nonzero projected settlement, and explicit acknowledgment of any
-    material reduction) and executes the batch.
+10. Immediately before `executeBatch`, governance repeats the manual review
+    from step 4 and reruns the preflight with both
+    `RECOVERY_STAGE=execute` and
+    `RECOVERY_EXTERNAL_STBTC_REVIEW=I_CONFIRM_NO_EXTERNAL_STBTC_CLAIMS`.
+    The execute preflight reruns the automated external-position screen at
+    the same pinned latest block as every other read; a detected claim,
+    unreadable relevant `balanceOf`, protocol identity/transaction mismatch,
+    active or uncollected Uniswap V3 NFT/core position,
+    missing manual confirmation, stale allowance, unready operation, zero
+    projection, or unaccepted material reduction prints the verified
+    cancellation calldata and exits nonzero. Only execute the batch after
+    this latest-state run reports
+    `preflightPassed: true`.
 11. Verify the `StbtcRecoveryCompleted` event and any
     `ReceiptDebtSettlementSkipped` events, the Threshold Safe tBTC increase,
     the stBTC burn, debt and collateral changes, and restoration of
@@ -362,6 +406,7 @@ RECOVERY_IMPLEMENTATION=0xDeployedRecoveryImplementation \
 MAINNET_RPC_URL=https://your-archive-rpc.example \
 RECOVERY_IMPLEMENTATION=0xDeployedRecoveryImplementation \
 RECOVERY_STAGE=execute \
+RECOVERY_EXTERNAL_STBTC_REVIEW=I_CONFIRM_NO_EXTERNAL_STBTC_CLAIMS \
   npm run preflight:recovery
 
 # To re-pin the manifest at a new block:

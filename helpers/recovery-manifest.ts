@@ -106,7 +106,7 @@ let cachedManifest: RecoveryManifest | undefined
 // against snapshotBlock, so a quoted "25850299" would silently demote nine
 // hard checks to warnings and still print a green run. Validate the shape
 // where a wrong type changes behavior rather than merely crashing.
-function validateManifestShape(manifest: RecoveryManifest): void {
+export function validateManifestShape(manifest: RecoveryManifest): void {
   const problems: string[] = []
   const requireInteger = (label: string, value: unknown) => {
     if (typeof value !== "number" || !Number.isInteger(value)) {
@@ -185,10 +185,16 @@ function validateManifestShape(manifest: RecoveryManifest): void {
 export function loadRecoveryManifest(): RecoveryManifest {
   if (!cachedManifest) {
     try {
+      // Validate a local candidate before publishing it through the shared
+      // module cache. hardhat.config.ts deliberately catches malformed-pin
+      // errors through tryLoadRecoveryManifest(); assigning first would let
+      // that caught object bypass validation in every later caller.
       // eslint-disable-next-line @typescript-eslint/no-var-requires, import/no-dynamic-require, global-require
-      cachedManifest = require(
+      const manifest = require(
         `../recovery/${recoveryManifestFile}`,
       ) as RecoveryManifest
+      validateManifestShape(manifest)
+      cachedManifest = manifest
     } catch (error) {
       throw new Error(
         `failed to load the pinned recovery manifest ${recoveryManifestPath}: ` +
@@ -197,7 +203,6 @@ export function loadRecoveryManifest(): RecoveryManifest {
           "recovery/",
       )
     }
-    validateManifestShape(cachedManifest)
   }
   return cachedManifest
 }

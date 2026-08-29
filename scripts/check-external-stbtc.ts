@@ -1,177 +1,126 @@
 import { ethers } from "hardhat"
+import {
+  EXTERNAL_STBTC_REVIEW_CONFIRMATION,
+  createEthersExternalStbtcReader,
+  evaluateExternalStbtcGate,
+  screenExternalStbtcHoldings,
+} from "../helpers/external-stbtc"
 import { loadRecoveryManifest } from "../helpers/recovery-manifest"
 import { pinnedBlockContext } from "../helpers/recovery-preflight"
 
-// Screens every selected depositor for stBTC they hold OUTSIDE their wallet.
+// Produces the automated half of the selected-depositor external-stBTC
+// review. Transfer history can find direct recipient venues, but it cannot
+// discover LP tokens received from somebody else, LP tokens moved into a
+// gauge/vault, or another address controlled by the depositor. Consequently
+// this command never calls an automated-only result CLEAN: it also requires
+// the explicit manual-review confirmation below.
 //
-// The recovery contract's stranding guard can only price
-// `balanceOf(depositor)`. stBTC the same party holds indirectly — in an AMM
-// pool, a vault, or another address — is invisible to it, so the guard is a
-// floor rather than a proof. That gap matters here specifically: Threshold's
-// own stranded position came from exiting the Curve stBTC/tBTC pool, so a
-// selected depositor with a pool position is exactly the case that would
-// recreate the stranding this recovery exists to cure.
+//   MAINNET_RPC_URL=<archive rpc> \
+//   RECOVERY_EXTERNAL_STBTC_REVIEW=I_CONFIRM_NO_EXTERNAL_STBTC_CLAIMS \
+//   npm run check:external-stbtc
 //
-// This script makes that review step mechanical: for each settled depositor
-// it replays their full stBTC Transfer history, reports where their minted
-// receipt tokens went, and checks whether they still hold a claim on any
-// contract that currently holds stBTC.
-//
-//   MAINNET_RPC_URL=<archive rpc> npm run check:external-stbtc
-//
-// A depositor is CLEAN when they hold no stBTC directly and no balance in
-// any stBTC-holding contract they transferred to. Anything else needs human
-// judgement before the manifest is approved: either exclude that depositor,
-// or (better, because it preserves recovery capacity) reduce their
-// settlement by the externally-held amount.
-
-const TRANSFER_TOPIC = ethers.id("Transfer(address,address,uint256)")
-const ERC20_ABI = [
-  "function balanceOf(address) view returns (uint256)",
-  "function name() view returns (string)",
-  "function symbol() view returns (string)",
-]
-
-function padAddress(address: string): string {
-  return ethers.zeroPadValue(ethers.getAddress(address), 32)
-}
-
-function addressFromTopic(topic: string): string {
-  return ethers.getAddress(`0x${topic.slice(-40)}`)
-}
+// Set the confirmation only after manually checking every selected
+// depositor's controlled addresses and all LP/share/gauge/vault positions.
+// If ownership or protocol coverage cannot be established, exclude that
+// depositor or reduce its settlement instead of attesting.
 
 async function main() {
   const manifest = loadRecoveryManifest()
-  const { callOverrides } = pinnedBlockContext(
-    process.env.CHECK_BLOCK
-      ? Number(process.env.CHECK_BLOCK)
-      : await ethers.provider.getBlockNumber(),
-  )
+  const requestedBlock = process.env.CHECK_BLOCK
+    ? Number(process.env.CHECK_BLOCK)
+    : await ethers.provider.getBlockNumber()
+  const block = await ethers.provider.getBlock(requestedBlock)
+  if (!block) {
+    throw new Error(`external stBTC review block ${requestedBlock} not found`)
+  }
+  const { callOverrides } = pinnedBlockContext(block.number)
+  const blockNumber = Number(callOverrides.blockTag)
   const stbtcAddress = manifest.addresses.stbtc
-  const stbtc = new ethers.Contract(stbtcAddress, ERC20_ABI, ethers.provider)
-
   const depositors = Array.from(
     new Set(manifest.settlements.map((s) => ethers.getAddress(s.depositor))),
+  )
+  const reader = createEthersExternalStbtcReader(
+    ethers.provider,
+    manifest.addresses.tbtc,
+    stbtcAddress,
+    blockNumber,
+  )
+  const report = await screenExternalStbtcHoldings(depositors, reader)
+  const gate = evaluateExternalStbtcGate(
+    report,
+    process.env.RECOVERY_EXTERNAL_STBTC_REVIEW,
   )
 
   // eslint-disable-next-line no-console
   const print = console.log
-  print(`stBTC external-holdings screen at block ${callOverrides.blockTag}`)
+  print(
+    `stBTC external-holdings screen at block ${blockNumber} (${block.hash})`,
+  )
   print(`token ${stbtcAddress}, ${depositors.length} settled depositors\n`)
 
-  let anyFlagged = false
-
-  // Sequential on purpose: this is an operator-run audit over an archive RPC
-  // where a burst of unbounded log queries is the fastest way to get rate
-  // limited mid-screen.
-  // eslint-disable-next-line no-restricted-syntax
-  for (const depositor of depositors) {
-    // eslint-disable-next-line no-await-in-loop
-    const [sentLogs, receivedLogs, walletBalance] = await Promise.all([
-      ethers.provider.getLogs({
-        address: stbtcAddress,
-        topics: [TRANSFER_TOPIC, padAddress(depositor)],
-        fromBlock: 0,
-        toBlock: callOverrides.blockTag,
-      }),
-      ethers.provider.getLogs({
-        address: stbtcAddress,
-        topics: [TRANSFER_TOPIC, null, padAddress(depositor)],
-        fromBlock: 0,
-        toBlock: callOverrides.blockTag,
-      }),
-      stbtc.balanceOf(depositor, callOverrides) as Promise<bigint>,
-    ])
-
-    const destinations = new Map<string, bigint>()
-    sentLogs.forEach((log) => {
-      const to = addressFromTopic(log.topics[2])
-      destinations.set(to, (destinations.get(to) ?? 0n) + BigInt(log.data))
-    })
-    const totalReceived = receivedLogs.reduce(
-      (total, log) => total + BigInt(log.data),
-      0n,
-    )
-
-    print(`${depositor}`)
+  report.depositors.forEach((depositor) => {
+    print(depositor.depositor)
     print(
-      `  minted/received ${ethers.formatEther(totalReceived)} stBTC, ` +
-        `wallet balance now ${ethers.formatEther(walletBalance)}`,
+      `  minted/received ${ethers.formatEther(
+        depositor.totalReceivedWei,
+      )} stBTC, wallet balance now ${ethers.formatEther(
+        depositor.walletBalanceWei,
+      )} (wallet balance is handled atomically by the recovery contract)`,
     )
-
-    const claims: string[] = []
-    // eslint-disable-next-line no-restricted-syntax
-    for (const [destination, amount] of destinations) {
-      // eslint-disable-next-line no-await-in-loop
-      const code = await ethers.provider.getCode(
-        destination,
-        callOverrides.blockTag,
-      )
-      const isContract = code !== "0x"
-      let venueHolding = 0n
-      let claim = 0n
-      let label = ""
-      if (isContract) {
-        const venue = new ethers.Contract(
-          destination,
-          ERC20_ABI,
-          ethers.provider,
-        )
-        // eslint-disable-next-line no-await-in-loop
-        venueHolding = BigInt(await stbtc.balanceOf(destination, callOverrides))
-        try {
-          // A share/LP token balance in a venue that itself holds stBTC is an
-          // indirect claim on that stBTC.
-          // eslint-disable-next-line no-await-in-loop
-          claim = BigInt(await venue.balanceOf(depositor, callOverrides))
-          // eslint-disable-next-line no-await-in-loop
-          label = `${await venue.symbol(callOverrides)}`
-        } catch {
-          claim = 0n
+    depositor.destinations.forEach((destination) => {
+      let details =
+        `    -> ${destination.destination} ` +
+        `${destination.isContract ? "contract" : "EOA"} ` +
+        `${ethers.formatEther(destination.amountSentWei)} sent`
+      if (destination.venueStbtcBalanceWei !== undefined) {
+        details += `; venue holds ${ethers.formatEther(
+          destination.venueStbtcBalanceWei,
+        )} stBTC`
+      }
+      if (destination.isContract) {
+        if (destination.depositorClaimBalanceWei !== undefined) {
+          details += `; depositor's raw share balance ${destination.depositorClaimBalanceWei.toString()}${
+            destination.symbol ? ` (${destination.symbol})` : ""
+          }`
+        } else if (destination.claimBalanceError) {
+          details += `; share balance UNVERIFIABLE: ${destination.claimBalanceError}`
         }
       }
-      print(
-        `    -> ${destination} ${isContract ? "contract" : "EOA"} ` +
-          `${ethers.formatEther(amount)} sent${
-            isContract
-              ? `; venue holds ${ethers.formatEther(venueHolding)} stBTC, ` +
-                `depositor's share balance ${ethers.formatEther(claim)}${
-                  label ? ` (${label})` : ""
-                }`
-              : ""
-          }`,
-      )
-      if (claim > 0n && venueHolding > 0n) {
-        claims.push(`${ethers.formatEther(claim)} of ${label || destination}`)
+      if (destination.adapter) {
+        details += `; ${destination.adapter} ${destination.resolution}: ${destination.protocolEvidence}`
       }
-    }
-
-    if (walletBalance > 0n || claims.length > 0) {
-      anyFlagged = true
+      print(details)
+    })
+    depositor.positions.forEach((position) => {
+      const positionId =
+        position.adapter === "uniswap-v3-nft"
+          ? `NFT ${position.tokenId.toString()}`
+          : `core ${position.tickLower}/${position.tickUpper}`
       print(
-        `  FLAGGED: holds stBTC directly or via ${claims.join(", ") || "n/a"}`,
+        `    Uniswap V3 ${positionId}: liquidity ` +
+          `${position.liquidity.toString()}, owed ` +
+          `${position.tokensOwed0.toString()}/${position.tokensOwed1.toString()}`,
       )
-    } else {
-      print(
-        "  CLEAN: no direct stBTC and no share balance in any venue it funded",
-      )
-    }
+    })
     print("")
-  }
+  })
 
-  if (anyFlagged) {
-    print(
-      "RESULT: at least one settled depositor holds stBTC outside their " +
-        "wallet. Do NOT approve this manifest as-is — exclude them, or " +
-        "reduce their settlement by the externally-held amount.",
-    )
+  print(`AUTOMATED LIMIT: ${report.limitation}`)
+  if (report.unverifiableReasons.length > 0) {
+    print("AUTOMATED UNRESOLVED (always blocking):")
+    report.unverifiableReasons.forEach((reason) => print(`  - ${reason}`))
+  }
+  if (!gate.passed) {
+    print("RESULT: BLOCKED. Do not approve or execute this recovery:")
+    gate.blockingReasons.forEach((reason) => print(`  - ${reason}`))
     process.exitCode = 1
     return
   }
+
   print(
-    "RESULT: every settled depositor is clean — no direct stBTC and no " +
-      "claim on any venue they sent stBTC to. The on-chain guard's " +
-      "wallet-only view is sufficient for this manifest.",
+    "RESULT: PASSED. Direct recipient venues have no detected claim and " +
+      "the operator supplied the mandatory manual external-holdings " +
+      `confirmation (${EXTERNAL_STBTC_REVIEW_CONFIRMATION}).`,
   )
 }
 

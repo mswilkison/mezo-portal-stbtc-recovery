@@ -1,0 +1,837 @@
+import {
+  Contract,
+  Log,
+  Provider,
+  TransactionReceipt,
+  getAddress,
+  id,
+  keccak256,
+  solidityPackedKeccak256,
+  zeroPadValue,
+} from "ethers"
+import * as anchors from "./recovery-anchors"
+
+const TRANSFER_TOPIC = id("Transfer(address,address,uint256)")
+const UNISWAP_V3_MINT_TOPIC = id(
+  "Mint(address,address,int24,int24,uint128,uint256,uint256)",
+)
+const ERC20_ABI = [
+  "function balanceOf(address) view returns (uint256)",
+  "function symbol() view returns (string)",
+]
+const CURVE_ROUTER_ABI = ["function version() view returns (string)"]
+const UNISWAP_V3_FACTORY_ABI = [
+  "function getPool(address tokenA,address tokenB,uint24 fee) view returns (address pool)",
+]
+const UNISWAP_V3_POOL_ABI = [
+  "function factory() view returns (address)",
+  "function token0() view returns (address)",
+  "function token1() view returns (address)",
+  "function fee() view returns (uint24)",
+  "function positions(bytes32 key) view returns (uint128 liquidity,uint256 feeGrowthInside0LastX128,uint256 feeGrowthInside1LastX128,uint128 tokensOwed0,uint128 tokensOwed1)",
+]
+const UNISWAP_V3_POSITION_MANAGER_ABI = [
+  "function ownerOf(uint256 tokenId) view returns (address)",
+  "function positions(uint256 tokenId) view returns (uint96 nonce,address operator,address token0,address token1,uint24 fee,int24 tickLower,int24 tickUpper,uint128 liquidity,uint256 feeGrowthInside0LastX128,uint256 feeGrowthInside1LastX128,uint128 tokensOwed0,uint128 tokensOwed1)",
+]
+
+// This exact, deliberately explicit value is an operator attestation, not an
+// automated proof. It must be supplied only after the selected depositors'
+// other controlled addresses and LP/share/gauge/vault positions have been
+// checked immediately before execution.
+export const EXTERNAL_STBTC_REVIEW_CONFIRMATION =
+  "I_CONFIRM_NO_EXTERNAL_STBTC_CLAIMS"
+
+export type ExternalStbtcTransfer = {
+  destination: string
+  amountWei: bigint
+  transactionHash?: string
+  blockNumber?: number
+  logIndex?: number
+}
+
+export type ExternalStbtcDestinationResolution = {
+  adapter: "curve-router-v1.1" | "uniswap-v3-pool"
+  status: "noClaim" | "claim" | "unresolved"
+  evidence: string
+}
+
+export type ExternalStbtcNftPositionReport = {
+  adapter: "uniswap-v3-nft"
+  tokenId: bigint
+  owner: string
+  token0: string
+  token1: string
+  fee: number
+  liquidity: bigint
+  tokensOwed0: bigint
+  tokensOwed1: bigint
+}
+
+export type ExternalStbtcCorePositionReport = {
+  adapter: "uniswap-v3-core"
+  owner: string
+  tickLower: number
+  tickUpper: number
+  liquidity: bigint
+  tokensOwed0: bigint
+  tokensOwed1: bigint
+}
+
+export type ExternalStbtcPositionReport =
+  ExternalStbtcNftPositionReport | ExternalStbtcCorePositionReport
+
+export type ExternalStbtcReader = {
+  getSentTransfers(depositor: string): Promise<ExternalStbtcTransfer[]>
+  getTotalReceivedWei(depositor: string): Promise<bigint>
+  getStbtcBalance(address: string): Promise<bigint>
+  getCode(address: string): Promise<string>
+  getTokenBalance(token: string, holder: string): Promise<bigint>
+  getTokenSymbol(token: string): Promise<string>
+  resolveKnownDestination(
+    depositor: string,
+    destination: string,
+    transfers: ExternalStbtcTransfer[],
+  ): Promise<ExternalStbtcDestinationResolution | undefined>
+  getUniswapV3Positions(
+    depositor: string,
+  ): Promise<ExternalStbtcPositionReport[]>
+}
+
+export type ExternalStbtcDestinationReport = {
+  destination: string
+  amountSentWei: bigint
+  isContract: boolean
+  venueStbtcBalanceWei?: bigint
+  depositorClaimBalanceWei?: bigint
+  symbol?: string
+  claimBalanceError?: string
+  adapter?: ExternalStbtcDestinationResolution["adapter"]
+  resolution?: ExternalStbtcDestinationResolution["status"]
+  protocolEvidence?: string
+}
+
+export type ExternalStbtcDepositorReport = {
+  depositor: string
+  totalReceivedWei: bigint
+  walletBalanceWei: bigint
+  destinations: ExternalStbtcDestinationReport[]
+  positions: ExternalStbtcPositionReport[]
+}
+
+export type ExternalStbtcScreenReport = {
+  depositors: ExternalStbtcDepositorReport[]
+  detectedClaimReasons: string[]
+  unverifiableReasons: string[]
+  limitation: string
+}
+
+export type ExternalStbtcGate = {
+  passed: boolean
+  manualReviewConfirmed: boolean
+  blockingReasons: string[]
+  report: ExternalStbtcScreenReport
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : `${error}`
+}
+
+// Automates only what chain history can establish without knowing which
+// other accounts and protocols a depositor controls. A clear report is
+// intentionally not sufficient to pass evaluateExternalStbtcGate(): LP
+// tokens can arrive without a direct stBTC transfer, can be staked in a
+// gauge/vault, and stBTC can sit at an undisclosed related address.
+export async function screenExternalStbtcHoldings(
+  depositors: string[],
+  reader: ExternalStbtcReader,
+): Promise<ExternalStbtcScreenReport> {
+  const reports: ExternalStbtcDepositorReport[] = []
+  const detectedClaimReasons: string[] = []
+  const unverifiableReasons: string[] = []
+
+  // Sequential on purpose: the production reader performs archive-log
+  // queries, and unbounded parallel ranges are routinely rate limited.
+  /* eslint-disable no-await-in-loop */
+  // eslint-disable-next-line no-restricted-syntax
+  for (const rawDepositor of depositors) {
+    const depositor = getAddress(rawDepositor)
+    const depositorReads = Promise.all([
+      reader.getSentTransfers(depositor),
+      reader.getTotalReceivedWei(depositor),
+      reader.getStbtcBalance(depositor),
+    ])
+    const [sentTransfers, totalReceivedWei, walletBalanceWei] =
+      await depositorReads
+
+    const amountsByDestination = new Map<string, bigint>()
+    sentTransfers.forEach(({ destination, amountWei }) => {
+      const normalized = getAddress(destination)
+      amountsByDestination.set(
+        normalized,
+        (amountsByDestination.get(normalized) ?? 0n) + amountWei,
+      )
+    })
+
+    const destinations: ExternalStbtcDestinationReport[] = []
+    // eslint-disable-next-line no-restricted-syntax
+    for (const [destination, amountSentWei] of amountsByDestination) {
+      const isContract = (await reader.getCode(destination)) !== "0x"
+      const destinationReport: ExternalStbtcDestinationReport = {
+        destination,
+        amountSentWei,
+        isContract,
+      }
+
+      const transfers = sentTransfers.filter(
+        (transfer) =>
+          getAddress(transfer.destination) === getAddress(destination),
+      )
+      let knownResolution: ExternalStbtcDestinationResolution | undefined
+      let resolutionFailed = false
+      try {
+        // Resolve reviewed addresses even if their code disappeared. Code
+        // absence/drift must become UNRESOLVED, not silently reclassify a
+        // previously reviewed protocol as an EOA.
+        knownResolution = await reader.resolveKnownDestination(
+          depositor,
+          destination,
+          transfers,
+        )
+      } catch (error) {
+        resolutionFailed = true
+        const detail = errorMessage(error)
+        destinationReport.claimBalanceError = detail
+        unverifiableReasons.push(
+          `cannot classify ${depositor}'s interaction with ` +
+            `${destination}: ${detail}`,
+        )
+      }
+
+      if (knownResolution) {
+        destinationReport.venueStbtcBalanceWei =
+          await reader.getStbtcBalance(destination)
+        destinationReport.adapter = knownResolution.adapter
+        destinationReport.resolution = knownResolution.status
+        destinationReport.protocolEvidence = knownResolution.evidence
+        if (knownResolution.status === "claim") {
+          detectedClaimReasons.push(
+            `${depositor} has an external stBTC claim through ` +
+              `${destination}: ${knownResolution.evidence}`,
+          )
+        } else if (knownResolution.status === "unresolved") {
+          unverifiableReasons.push(
+            `cannot resolve ${depositor}'s interaction with ` +
+              `${destination}: ${knownResolution.evidence}`,
+          )
+        }
+      } else if (isContract && !resolutionFailed) {
+        const venueStbtcBalanceWei = await reader.getStbtcBalance(destination)
+        destinationReport.venueStbtcBalanceWei = venueStbtcBalanceWei
+        try {
+          // A share token can deploy all underlying into a strategy and hold
+          // zero stBTC itself. Query every unknown contract destination;
+          // current venue custody is context, never a prerequisite.
+          const claimBalanceWei = await reader.getTokenBalance(
+            destination,
+            depositor,
+          )
+          destinationReport.depositorClaimBalanceWei = claimBalanceWei
+
+          if (claimBalanceWei > 0n) {
+            try {
+              destinationReport.symbol =
+                await reader.getTokenSymbol(destination)
+            } catch {
+              // Non-standard, bytes32, and reverting symbol() methods are
+              // display-only failures. The claim remains blocking and is
+              // identified by its contract address.
+            }
+            detectedClaimReasons.push(
+              `${depositor} holds ${claimBalanceWei.toString()} share/LP ` +
+                `units in external venue ${destination}`,
+            )
+          }
+        } catch (error) {
+          const detail = errorMessage(error)
+          destinationReport.claimBalanceError = detail
+          unverifiableReasons.push(
+            `cannot evaluate ${depositor}'s share/LP balance in ` +
+              `external venue ${destination}: ${detail}`,
+          )
+        }
+      }
+      destinations.push(destinationReport)
+    }
+
+    let positions: ExternalStbtcPositionReport[] = []
+    try {
+      positions = await reader.getUniswapV3Positions(depositor)
+      positions.forEach((position) => {
+        if (
+          position.liquidity > 0n ||
+          position.tokensOwed0 > 0n ||
+          position.tokensOwed1 > 0n
+        ) {
+          const positionId =
+            position.adapter === "uniswap-v3-nft"
+              ? `NFT ${position.tokenId.toString()}`
+              : `core range ${position.tickLower}/${position.tickUpper}`
+          detectedClaimReasons.push(
+            `${depositor} owns Uniswap V3 ${positionId} ` +
+              `with liquidity ${position.liquidity.toString()} and owed ` +
+              `${position.tokensOwed0.toString()}/${position.tokensOwed1.toString()}`,
+          )
+        }
+      })
+    } catch (error) {
+      unverifiableReasons.push(
+        `cannot enumerate ${depositor}'s canonical Uniswap V3 stBTC ` +
+          `positions: ${errorMessage(error)}`,
+      )
+    }
+
+    reports.push({
+      depositor,
+      totalReceivedWei,
+      walletBalanceWei,
+      destinations,
+      positions,
+    })
+  }
+  /* eslint-enable no-await-in-loop */
+
+  return {
+    depositors: reports,
+    detectedClaimReasons,
+    unverifiableReasons,
+    limitation:
+      "transfer destinations are not exhaustive: manually verify LP/share " +
+      "tokens received from third parties, staked gauge/vault positions, " +
+      "and every other address controlled by each selected depositor",
+  }
+}
+
+export function evaluateExternalStbtcGate(
+  report: ExternalStbtcScreenReport,
+  confirmation: string | undefined,
+): ExternalStbtcGate {
+  const manualReviewConfirmed =
+    confirmation === EXTERNAL_STBTC_REVIEW_CONFIRMATION
+  // Concrete nonzero claims and unreadable relevant balances always block.
+  // The manual attestation covers only positions/address ownership the
+  // automated scan cannot enumerate; it must not override a failed RPC or
+  // balanceOf call that could be concealing a claim.
+  const blockingReasons = [
+    ...report.detectedClaimReasons,
+    ...report.unverifiableReasons,
+  ]
+  if (!manualReviewConfirmed) {
+    blockingReasons.push(
+      "manual external-holdings verification is missing; set " +
+        `RECOVERY_EXTERNAL_STBTC_REVIEW=${EXTERNAL_STBTC_REVIEW_CONFIRMATION} ` +
+        "only after checking every selected depositor's other controlled " +
+        "addresses and LP/share/gauge/vault positions",
+    )
+  }
+
+  return {
+    passed: blockingReasons.length === 0,
+    manualReviewConfirmed,
+    blockingReasons,
+    report,
+  }
+}
+
+function paddedAddress(address: string): string {
+  return zeroPadValue(getAddress(address), 32)
+}
+
+function addressFromTopic(topic: string): string {
+  return getAddress(`0x${topic.slice(-40)}`)
+}
+
+function canonicalAddress(value: string): string {
+  return getAddress(value)
+}
+
+function signedInt24(topic: string): number {
+  return Number(BigInt.asIntN(24, BigInt(topic)))
+}
+
+function sameAddress(left: string, right: string): boolean {
+  return canonicalAddress(left) === canonicalAddress(right)
+}
+
+function requireRuntimeHash(
+  label: string,
+  code: string,
+  expectedHash: string,
+): void {
+  const actualHash = keccak256(code)
+  if (actualHash !== expectedHash) {
+    throw new Error(
+      `${label} runtime hash ${actualHash} does not match reviewed ` +
+        `${expectedHash}`,
+    )
+  }
+}
+
+function transferMatches(
+  log: Log,
+  token: string,
+  from: string,
+  to: string,
+  amountWei?: bigint,
+): boolean {
+  if (
+    !sameAddress(log.address, token) ||
+    log.topics[0] !== TRANSFER_TOPIC ||
+    log.topics.length < 3 ||
+    !sameAddress(addressFromTopic(log.topics[1]), from) ||
+    !sameAddress(addressFromTopic(log.topics[2]), to)
+  ) {
+    return false
+  }
+  return amountWei === undefined || BigInt(log.data) === amountWei
+}
+
+function receiptLogs(receipt: TransactionReceipt): Log[] {
+  return receipt.logs.filter((log): log is Log => log instanceof Log)
+}
+
+export function createEthersExternalStbtcReader(
+  provider: Provider,
+  tbtcAddress: string,
+  stbtcAddress: string,
+  blockNumber: number,
+): ExternalStbtcReader {
+  const stbtc = new Contract(stbtcAddress, ERC20_ABI, provider)
+  const callOverrides = { blockTag: blockNumber }
+  const curveRouter = new Contract(
+    anchors.CURVE_ROUTER_V1_1,
+    CURVE_ROUTER_ABI,
+    provider,
+  )
+  const uniswapFactory = new Contract(
+    anchors.UNISWAP_V3_FACTORY,
+    UNISWAP_V3_FACTORY_ABI,
+    provider,
+  )
+  const uniswapPool = new Contract(
+    anchors.UNISWAP_V3_TBTC_STBTC_POOL,
+    UNISWAP_V3_POOL_ABI,
+    provider,
+  )
+  const positionManager = new Contract(
+    anchors.UNISWAP_V3_POSITION_MANAGER,
+    UNISWAP_V3_POSITION_MANAGER_ABI,
+    provider,
+  )
+
+  let protocolIdentityCheck: Promise<void> | undefined
+  const verifyProtocolIdentities = (): Promise<void> => {
+    if (!protocolIdentityCheck) {
+      protocolIdentityCheck = (async () => {
+        const [curveCode, factoryCode, poolCode, positionManagerCode] =
+          await Promise.all([
+            provider.getCode(anchors.CURVE_ROUTER_V1_1, blockNumber),
+            provider.getCode(anchors.UNISWAP_V3_FACTORY, blockNumber),
+            provider.getCode(anchors.UNISWAP_V3_TBTC_STBTC_POOL, blockNumber),
+            provider.getCode(anchors.UNISWAP_V3_POSITION_MANAGER, blockNumber),
+          ])
+        requireRuntimeHash(
+          "Curve router v1.1",
+          curveCode,
+          anchors.CURVE_ROUTER_V1_1_RUNTIME_HASH,
+        )
+        requireRuntimeHash(
+          "Uniswap V3 factory",
+          factoryCode,
+          anchors.UNISWAP_V3_FACTORY_RUNTIME_HASH,
+        )
+        requireRuntimeHash(
+          "Uniswap V3 tBTC/stBTC pool",
+          poolCode,
+          anchors.UNISWAP_V3_TBTC_STBTC_POOL_RUNTIME_HASH,
+        )
+        requireRuntimeHash(
+          "Uniswap V3 position manager",
+          positionManagerCode,
+          anchors.UNISWAP_V3_POSITION_MANAGER_RUNTIME_HASH,
+        )
+      })()
+    }
+    return protocolIdentityCheck
+  }
+
+  const verifyCurveTransfer = async (
+    depositor: string,
+    transfer: ExternalStbtcTransfer,
+  ): Promise<void> => {
+    if (!transfer.transactionHash) {
+      throw new Error("Curve transfer has no transaction provenance")
+    }
+    const receipt = await provider.getTransactionReceipt(
+      transfer.transactionHash,
+    )
+    if (!receipt || receipt.status !== 1) {
+      throw new Error(`Curve transaction ${transfer.transactionHash} failed`)
+    }
+    if (
+      receipt.blockNumber > blockNumber ||
+      !sameAddress(receipt.from, depositor) ||
+      !receipt.to ||
+      !sameAddress(receipt.to, anchors.CURVE_ROUTER_V1_1)
+    ) {
+      throw new Error(
+        `Curve transaction ${transfer.transactionHash} has unexpected ` +
+          "block, sender, or receiver",
+      )
+    }
+    const logs = receiptLogs(receipt)
+    const hasInput = logs.some((log) =>
+      transferMatches(
+        log,
+        stbtcAddress,
+        depositor,
+        anchors.CURVE_ROUTER_V1_1,
+        transfer.amountWei,
+      ),
+    )
+    const fullyForwarded = logs.some((log) => {
+      if (
+        !sameAddress(log.address, stbtcAddress) ||
+        log.topics[0] !== TRANSFER_TOPIC ||
+        log.topics.length < 3 ||
+        !sameAddress(addressFromTopic(log.topics[1]), anchors.CURVE_ROUTER_V1_1)
+      ) {
+        return false
+      }
+      return BigInt(log.data) === transfer.amountWei
+    })
+    const hasTbtcOutput = logs.some(
+      (log) =>
+        transferMatches(
+          log,
+          tbtcAddress,
+          anchors.CURVE_ROUTER_V1_1,
+          depositor,
+        ) && BigInt(log.data) > 0n,
+    )
+    const unexpectedRouterOutput = logs.some((log) => {
+      if (
+        log.topics[0] !== TRANSFER_TOPIC ||
+        log.topics.length < 3 ||
+        !sameAddress(
+          addressFromTopic(log.topics[1]),
+          anchors.CURVE_ROUTER_V1_1,
+        ) ||
+        !sameAddress(addressFromTopic(log.topics[2]), depositor)
+      ) {
+        return false
+      }
+      return !sameAddress(log.address, tbtcAddress)
+    })
+    // A Curve route that mints an LP/share token directly to the receiver is
+    // still an external claim even if the router also moves tBTC dust. For a
+    // reviewed stBTC-to-tBTC swap, tBTC is the only Transfer-event token that
+    // may arrive at the depositor in this transaction.
+    const unexpectedTokenReceipt = logs.some(
+      (log) =>
+        log.topics[0] === TRANSFER_TOPIC &&
+        log.topics.length >= 3 &&
+        sameAddress(addressFromTopic(log.topics[2]), depositor) &&
+        !sameAddress(log.address, tbtcAddress),
+    )
+    if (
+      !hasInput ||
+      !fullyForwarded ||
+      !hasTbtcOutput ||
+      unexpectedRouterOutput ||
+      unexpectedTokenReceipt
+    ) {
+      throw new Error(
+        `Curve transaction ${transfer.transactionHash} is not a fully ` +
+          "reconciled stBTC-to-tBTC swap back to the depositor",
+      )
+    }
+  }
+
+  const verifyUniswapPool = async (): Promise<void> => {
+    await verifyProtocolIdentities()
+    const [factory, token0, token1, fee] = await Promise.all([
+      uniswapPool.factory(callOverrides),
+      uniswapPool.token0(callOverrides),
+      uniswapPool.token1(callOverrides),
+      uniswapPool.fee(callOverrides),
+    ])
+    if (!sameAddress(factory, anchors.UNISWAP_V3_FACTORY)) {
+      throw new Error(`Uniswap pool reports unexpected factory ${factory}`)
+    }
+    const pair = new Set([canonicalAddress(token0), canonicalAddress(token1)])
+    if (
+      !pair.has(canonicalAddress(tbtcAddress)) ||
+      !pair.has(canonicalAddress(stbtcAddress))
+    ) {
+      throw new Error(
+        `Uniswap pool reports unexpected pair ${token0}/${token1}`,
+      )
+    }
+    if (Number(fee) !== anchors.UNISWAP_V3_TBTC_STBTC_POOL_FEE) {
+      throw new Error(`Uniswap pool reports unexpected fee ${fee.toString()}`)
+    }
+    const registeredPool = await uniswapFactory.getPool(
+      token0,
+      token1,
+      fee,
+      callOverrides,
+    )
+    if (!sameAddress(registeredPool, anchors.UNISWAP_V3_TBTC_STBTC_POOL)) {
+      throw new Error(
+        `Uniswap factory registered unexpected pool ${registeredPool}`,
+      )
+    }
+  }
+
+  return {
+    async getSentTransfers(depositor) {
+      const logs = await provider.getLogs({
+        address: stbtcAddress,
+        topics: [TRANSFER_TOPIC, paddedAddress(depositor)],
+        fromBlock: 0,
+        toBlock: blockNumber,
+      })
+      return logs.map((log) => ({
+        destination: addressFromTopic(log.topics[2]),
+        amountWei: BigInt(log.data),
+        transactionHash: log.transactionHash,
+        blockNumber: log.blockNumber,
+        logIndex: log.index,
+      }))
+    },
+    async getTotalReceivedWei(depositor) {
+      const logs = await provider.getLogs({
+        address: stbtcAddress,
+        topics: [TRANSFER_TOPIC, null, paddedAddress(depositor)],
+        fromBlock: 0,
+        toBlock: blockNumber,
+      })
+      return logs.reduce((total, log) => total + BigInt(log.data), 0n)
+    },
+    async getStbtcBalance(address) {
+      return BigInt(await stbtc.balanceOf(address, callOverrides))
+    },
+    async getCode(address) {
+      return provider.getCode(address, blockNumber)
+    },
+    async getTokenBalance(token, holder) {
+      const contract = new Contract(token, ERC20_ABI, provider)
+      return BigInt(await contract.balanceOf(holder, callOverrides))
+    },
+    async getTokenSymbol(token) {
+      const contract = new Contract(token, ERC20_ABI, provider)
+      return `${await contract.symbol(callOverrides)}`
+    },
+    async resolveKnownDestination(depositor, destination, transfers) {
+      if (sameAddress(destination, anchors.CURVE_ROUTER_V1_1)) {
+        try {
+          await verifyProtocolIdentities()
+          const version = `${await curveRouter.version(callOverrides)}`
+          if (version !== "1.1.0") {
+            throw new Error(`unexpected Curve router version ${version}`)
+          }
+          // eslint-disable-next-line no-restricted-syntax
+          for (const transfer of transfers) {
+            // eslint-disable-next-line no-await-in-loop
+            await verifyCurveTransfer(depositor, transfer)
+          }
+          return {
+            adapter: "curve-router-v1.1",
+            status: "noClaim",
+            evidence:
+              `${transfers.length} stBTC-to-tBTC swap transaction(s) ` +
+              "reconciled; exact router code/version has no share ledger",
+          }
+        } catch (error) {
+          return {
+            adapter: "curve-router-v1.1",
+            status: "unresolved",
+            evidence: errorMessage(error),
+          }
+        }
+      }
+
+      if (sameAddress(destination, anchors.UNISWAP_V3_TBTC_STBTC_POOL)) {
+        try {
+          await verifyUniswapPool()
+          return {
+            adapter: "uniswap-v3-pool",
+            status: "noClaim",
+            evidence:
+              "exact canonical tBTC/stBTC pool; position-manager NFTs and " +
+              "direct core ranges are screened independently",
+          }
+        } catch (error) {
+          return {
+            adapter: "uniswap-v3-pool",
+            status: "unresolved",
+            evidence: errorMessage(error),
+          }
+        }
+      }
+      return undefined
+    },
+    async getUniswapV3Positions(depositor) {
+      await verifyProtocolIdentities()
+      const [incoming, outgoing] = await Promise.all([
+        provider.getLogs({
+          address: anchors.UNISWAP_V3_POSITION_MANAGER,
+          topics: [TRANSFER_TOPIC, null, paddedAddress(depositor)],
+          fromBlock: 0,
+          toBlock: blockNumber,
+        }),
+        provider.getLogs({
+          address: anchors.UNISWAP_V3_POSITION_MANAGER,
+          topics: [TRANSFER_TOPIC, paddedAddress(depositor)],
+          fromBlock: 0,
+          toBlock: blockNumber,
+        }),
+      ])
+      // A self-transfer matches both queries. Deduplicate by log identity and
+      // derive direction from the actual `to` topic so it cannot hide a live
+      // position by being processed once as incoming and once as outgoing.
+      const eventsById = new Map<string, Log>()
+      ;[...incoming, ...outgoing].forEach((log) => {
+        eventsById.set(`${log.transactionHash}:${log.index}`, log)
+      })
+      const ownershipEvents = Array.from(eventsById.values()).sort(
+        (left, right) => {
+          if (left.blockNumber !== right.blockNumber) {
+            return left.blockNumber - right.blockNumber
+          }
+          if (left.transactionIndex !== right.transactionIndex) {
+            return left.transactionIndex - right.transactionIndex
+          }
+          return left.index - right.index
+        },
+      )
+      const currentlyOwned = new Map<bigint, boolean>()
+      ownershipEvents.forEach((log) => {
+        if (log.topics.length < 4) {
+          throw new Error(`malformed position NFT Transfer log ${log.index}`)
+        }
+        currentlyOwned.set(
+          BigInt(log.topics[3]),
+          sameAddress(addressFromTopic(log.topics[2]), depositor),
+        )
+      })
+
+      const ownedTokenIds = Array.from(currentlyOwned.entries())
+        .filter(([, isOwned]) => isOwned)
+        .map(([tokenId]) => tokenId)
+      const nftPositionReports = await Promise.all(
+        ownedTokenIds.map(async (tokenId) => {
+          const owner = await positionManager.ownerOf(tokenId, callOverrides)
+          if (!sameAddress(owner, depositor)) {
+            throw new Error(
+              `position ${tokenId.toString()} ownership disagrees with Transfer history`,
+            )
+          }
+          const position = await positionManager.positions(
+            tokenId,
+            callOverrides,
+          )
+          const token0 = canonicalAddress(position[2])
+          const token1 = canonicalAddress(position[3])
+          if (
+            !sameAddress(token0, stbtcAddress) &&
+            !sameAddress(token1, stbtcAddress)
+          ) {
+            return undefined
+          }
+          const registeredPool = await uniswapFactory.getPool(
+            token0,
+            token1,
+            position[4],
+            callOverrides,
+          )
+          if (
+            sameAddress(
+              registeredPool,
+              "0x0000000000000000000000000000000000000000",
+            )
+          ) {
+            throw new Error(
+              `position ${tokenId.toString()} has no canonical Uniswap V3 pool`,
+            )
+          }
+          return {
+            adapter: "uniswap-v3-nft" as const,
+            tokenId,
+            owner: canonicalAddress(owner),
+            token0,
+            token1,
+            fee: Number(position[4]),
+            liquidity: BigInt(position[7]),
+            tokensOwed0: BigInt(position[10]),
+            tokensOwed1: BigInt(position[11]),
+          }
+        }),
+      )
+      const filteredNftPositions = nftPositionReports.filter(
+        (position): position is ExternalStbtcNftPositionReport =>
+          position !== undefined,
+      )
+
+      // Uniswap V3 core permits callers to own positions directly, without
+      // the canonical NFT manager. The owner is indexed in every pool Mint
+      // event, so enumerate every range ever minted to this depositor and
+      // read the live position key at the same pinned block. This also finds
+      // positions funded by somebody else, which stBTC transfer history from
+      // the depositor alone cannot discover.
+      const directMintLogs = await provider.getLogs({
+        address: anchors.UNISWAP_V3_TBTC_STBTC_POOL,
+        topics: [UNISWAP_V3_MINT_TOPIC, paddedAddress(depositor)],
+        fromBlock: 0,
+        toBlock: blockNumber,
+      })
+      const directRanges = new Map<
+        string,
+        { tickLower: number; tickUpper: number }
+      >()
+      directMintLogs.forEach((log) => {
+        if (log.topics.length < 4) {
+          throw new Error(`malformed Uniswap V3 Mint log ${log.index}`)
+        }
+        const tickLower = signedInt24(log.topics[2])
+        const tickUpper = signedInt24(log.topics[3])
+        directRanges.set(`${tickLower}:${tickUpper}`, {
+          tickLower,
+          tickUpper,
+        })
+      })
+      const corePositions = await Promise.all(
+        Array.from(directRanges.values()).map(
+          async ({ tickLower, tickUpper }) => {
+            const key = solidityPackedKeccak256(
+              ["address", "int24", "int24"],
+              [depositor, tickLower, tickUpper],
+            )
+            const position = await uniswapPool.positions(key, callOverrides)
+            return {
+              adapter: "uniswap-v3-core" as const,
+              owner: canonicalAddress(depositor),
+              tickLower,
+              tickUpper,
+              liquidity: BigInt(position[0]),
+              tokensOwed0: BigInt(position[3]),
+              tokensOwed1: BigInt(position[4]),
+            }
+          },
+        ),
+      )
+      return [...filteredNftPositions, ...corePositions]
+    },
+  }
+}

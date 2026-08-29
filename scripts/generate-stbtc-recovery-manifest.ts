@@ -2,7 +2,6 @@ import { writeFileSync } from "fs"
 import { join } from "path"
 import { artifacts, ethers } from "hardhat"
 import * as anchors from "../helpers/recovery-anchors"
-import { loadRecoveryManifest } from "../helpers/recovery-manifest"
 import {
   ADMIN_SLOT,
   IMPLEMENTATION_SLOT,
@@ -29,8 +28,6 @@ import {
 // Portal path; zeroing their debt would leave that stBTC unredeemable —
 // recreating for them the exact stranded position this recovery cures for
 // Threshold. Excluded depositors are recorded in the manifest for review.
-
-const currentManifest = loadRecoveryManifest()
 
 const RECEIPT_MINTED_TOPIC = ethers.id(
   "ReceiptMinted(address,address,uint256,uint256)",
@@ -180,9 +177,7 @@ async function main() {
   // itself by the bytecode verifier.
   const addresses = {
     portal: ethers.getAddress(anchors.PORTAL),
-    portalLogicOwner: ethers.getAddress(
-      currentManifest.addresses.portalLogicOwner,
-    ),
+    portalLogicOwner: ethers.getAddress(anchors.PORTAL_LOGIC_OWNER),
     receiptPayer: ethers.getAddress(anchors.RECEIPT_PAYER),
     collateralRecipient: ethers.getAddress(anchors.COLLATERAL_RECIPIENT),
   }

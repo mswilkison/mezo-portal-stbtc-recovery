@@ -1,5 +1,10 @@
 import { readFileSync } from "fs"
 import { artifacts, ethers } from "hardhat"
+import {
+  createEthersExternalStbtcReader,
+  evaluateExternalStbtcGate,
+  screenExternalStbtcHoldings,
+} from "../helpers/external-stbtc"
 import * as anchors from "../helpers/recovery-anchors"
 import {
   loadRecoveryManifest,
@@ -44,8 +49,9 @@ const FEE_DRIFT_PAD_SECONDS = 3600n
 // third parties a process-level veto the contract itself does not have.
 // RECOVERY_STAGE=execute is the mandatory rerun immediately before
 // `executeBatch`: it always runs against latest state and additionally
-// requires the exact stBTC allowance, a ready timelock operation, and a
-// nonzero projected settlement.
+// requires the exact stBTC allowance, a ready timelock operation, a nonzero
+// projected settlement, and the latest-state external-holdings screen plus
+// its explicit manual review confirmation.
 const STAGE = process.env.RECOVERY_STAGE ?? "prepare"
 
 function fail(message: string): never {
@@ -81,6 +87,13 @@ function stringify(value: unknown): string {
 function warn(message: string): void {
   // eslint-disable-next-line no-console
   console.error(`WARNING: ${message}`)
+}
+
+function appendDeferredFailure(
+  current: string | undefined,
+  next: string,
+): string {
+  return current ? `${current}; additionally, ${next}` : next
 }
 
 async function storageAt(
@@ -200,6 +213,11 @@ async function main() {
     "manifest portal vs reviewed anchor",
     addresses.portal,
     anchors.PORTAL,
+  )
+  expectEqual(
+    "manifest portalLogicOwner vs reviewed anchor",
+    addresses.portalLogicOwner,
+    anchors.PORTAL_LOGIC_OWNER,
   )
   expectEqual(
     "manifest originalImplementation vs reviewed anchor",
@@ -829,6 +847,61 @@ async function main() {
     }
   }
 
+  // The atomic contract guard sees only stBTC.balanceOf(depositor). At the
+  // mandatory execute stage, repeat the automated external-position screen
+  // against this exact pinned block and require an explicit manual review of
+  // positions chain history cannot enumerate (LP tokens received from third
+  // parties, staked gauge/vault shares, and other controlled addresses).
+  // Failure is deferred until governanceBatch exists so operators always get
+  // verified cancellation calldata for an already scheduled operation.
+  let externalStbtcReview: unknown = {
+    requiredAtStage: "execute",
+    status: "not run during prepare stage",
+  }
+  if (STAGE === "execute") {
+    try {
+      const externalReport = await screenExternalStbtcHoldings(
+        Array.from(byDepositor.keys()),
+        createEthersExternalStbtcReader(
+          ethers.provider,
+          addresses.tbtc,
+          addresses.stbtc,
+          block.number,
+        ),
+      )
+      const externalGate = evaluateExternalStbtcGate(
+        externalReport,
+        process.env.RECOVERY_EXTERNAL_STBTC_REVIEW,
+      )
+      externalStbtcReview = {
+        ...externalGate,
+        blockNumber: block.number,
+        blockHash: block.hash,
+      }
+      if (!externalGate.passed) {
+        failureAfterOutput = appendDeferredFailure(
+          failureAfterOutput,
+          `external stBTC holdings review failed: ${externalGate.blockingReasons.join(
+            "; ",
+          )}. Cancel the operation using governanceBatch.cancelTransaction`,
+        )
+      }
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : `${error}`
+      externalStbtcReview = {
+        passed: false,
+        blockNumber: block.number,
+        blockHash: block.hash,
+        error: detail,
+      }
+      failureAfterOutput = appendDeferredFailure(
+        failureAfterOutput,
+        `external stBTC holdings screen could not be completed: ${detail}. ` +
+          "Cancel the operation using governanceBatch.cancelTransaction",
+      )
+    }
+  }
+
   const recoveryFactory = await ethers.getContractFactory("PortalStbtcRecovery")
   const constructorArgs = [
     addresses.portal,
@@ -914,6 +987,7 @@ async function main() {
       owners: ownerReports,
       entries: projected,
     },
+    externalStbtcReview,
     strandingExclusions: exclusionReports,
     receiptPayerApproval: {
       from: addresses.receiptPayer,
