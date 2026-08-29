@@ -158,6 +158,42 @@ describeFn("PortalStbtcRecovery - mainnet fork", function () {
       }),
     )
 
+    // Exclusions are reviewed selection evidence too. Independently derive
+    // their balances and repayable debt from every listed deposit so altered
+    // debt totals or invalid listed records cannot survive the pinned fork
+    // check. The preflight separately derives the complete id set from logs.
+    await Promise.all(
+      (manifest.strandingExclusions ?? []).map(async (exclusion) => {
+        const balance = BigInt(await stbtc.balanceOf(exclusion.depositor))
+        const { totalDebt } = await recomputeActiveReceiptDebt(
+          exclusion.depositIds,
+          async (depositId) => {
+            const deposit = await portal.deposits(
+              exclusion.depositor,
+              addresses.tbtc,
+              depositId,
+            )
+            expect(
+              deposit.receiptMinted,
+              `${exclusion.depositor}/${depositId.toString()} is not active`,
+            ).to.be.greaterThan(0)
+            return {
+              receiptMintedWei: BigInt(deposit.receiptMinted),
+              migrating: Number(deposit.tbtcMigrationState) !== 0,
+            }
+          },
+        )
+        expect(
+          balance,
+          `${exclusion.depositor} excluded stBTC balance`,
+        ).to.equal(BigInt(exclusion.stbtcBalanceWei))
+        expect(
+          totalDebt,
+          `${exclusion.depositor} excluded active debt`,
+        ).to.equal(BigInt(exclusion.activeDebtWei))
+      }),
+    )
+
     await network.provider.send("hardhat_setBalance", [
       addresses.receiptPayer,
       ethers.toBeHex(ethers.parseEther("1")),

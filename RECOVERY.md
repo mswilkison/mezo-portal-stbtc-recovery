@@ -303,6 +303,7 @@ code read, and contract call to that same block.
    received without a direct stBTC transfer. Then run:
 
    ```sh
+   CHECK_BLOCK=<recent finalized block> \
    MAINNET_RPC_URL=<archive rpc> \
    RECOVERY_EXTERNAL_STBTC_REVIEW=I_CONFIRM_NO_EXTERNAL_STBTC_CLAIMS \
    npm run check:external-stbtc
@@ -310,10 +311,18 @@ code read, and contract call to that same block.
 
    This is the review the on-chain guard structurally cannot perform. The
    confirmation is an operator attestation, not an automated proof; do not
-   persist it in `.env`. Its typed Curve and Uniswap checks must report no
-   claim or unresolved state, and the command as a whole must report PASSED
-   before the manifest is approved. If ownership or venue coverage is
-   uncertain, exclude or reduce that depositor instead.
+   persist it in `.env`. The scan reconciles each selected wallet's complete
+   stBTC Transfer history against its pinned balance, reads archive logs in
+   adaptive chunks, and recognizes the reviewed Portal sink only while its
+   proxy points to the pinned implementation. Its typed Portal, Curve, and
+   Uniswap checks must report no claim or unresolved state, and the command
+   as a whole must report PASSED before the manifest is approved. If
+   ownership or venue coverage is
+   uncertain, exclude or reduce that depositor instead. A single RPC can
+   still omit a matching inbound/outbound pair without violating the net
+   reconciliation, so run the same pinned `CHECK_BLOCK` through a second,
+   independently operated archive provider and compare the block hash and
+   complete report before approval.
 
 5. Run the preflight against a current archive RPC. It intentionally aborts
    if the implementation, proxy administration, token configuration, timelock

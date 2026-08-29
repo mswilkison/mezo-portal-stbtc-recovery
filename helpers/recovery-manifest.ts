@@ -165,6 +165,35 @@ export function validateManifestShape(manifest: RecoveryManifest): void {
     problems.push(
       "strandingExclusions must be present (use [] when nothing was excluded)",
     )
+  } else {
+    const exclusionDepositors = new Set<string>()
+    manifest.strandingExclusions.forEach((exclusion, index) => {
+      const at = `strandingExclusions[${index}]`
+      requireDecimalString(`${at}.stbtcBalanceWei`, exclusion.stbtcBalanceWei)
+      requireDecimalString(`${at}.activeDebtWei`, exclusion.activeDebtWei)
+      if (
+        !Array.isArray(exclusion.depositIds) ||
+        exclusion.depositIds.length === 0
+      ) {
+        problems.push(`${at}.depositIds must be a non-empty array`)
+      } else {
+        exclusion.depositIds.forEach((depositId, depositIndex) =>
+          requireDecimalString(`${at}.depositIds[${depositIndex}]`, depositId),
+        )
+      }
+
+      if (typeof exclusion.depositor !== "string") {
+        problems.push(`${at}.depositor must be a string`)
+      } else {
+        const normalized = exclusion.depositor.toLowerCase()
+        if (exclusionDepositors.has(normalized)) {
+          problems.push(
+            `${at}.depositor duplicates another stranding exclusion`,
+          )
+        }
+        exclusionDepositors.add(normalized)
+      }
+    })
   }
   if (!manifest.observedState?.feeInfo) {
     problems.push("observedState.feeInfo must be present")

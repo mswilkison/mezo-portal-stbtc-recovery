@@ -3,6 +3,7 @@ import { artifacts, ethers } from "hardhat"
 import {
   createEthersExternalStbtcReader,
   evaluateExternalStbtcGate,
+  getLogsInChunks,
   screenExternalStbtcHoldings,
 } from "../helpers/external-stbtc"
 import * as anchors from "../helpers/recovery-anchors"
@@ -14,6 +15,7 @@ import {
   ADMIN_SLOT,
   IMPLEMENTATION_SLOT,
   SettlementProjectionInput,
+  assertExactActiveDepositIds,
   buildRecoveryBatchPayloads,
   emitRecoveryPreflightResult,
   effectiveFeeIntegralAt,
@@ -34,6 +36,9 @@ const manifest = loadRecoveryManifest()
 const PROPOSER_ROLE = ethers.id("PROPOSER_ROLE")
 const EXECUTOR_ROLE = ethers.id("EXECUTOR_ROLE")
 const CANCELLER_ROLE = ethers.id("CANCELLER_ROLE")
+const RECEIPT_MINTED_TOPIC = ethers.id(
+  "ReceiptMinted(address,address,uint256,uint256)",
+)
 
 // Fee accrual between the preflight block and the executeBatch transaction;
 // used only to pad the projection's under-collateralization classification
@@ -704,30 +709,143 @@ async function main() {
     }),
   )
 
+  // At the pinned snapshot, derive each excluded owner's complete set of
+  // still-live receipt deposits from Portal history. Recomputing only the ids
+  // supplied by the manifest would allow an id and its debt to be omitted
+  // together. This targeted scan is intentionally snapshot-only: later debt
+  // drift is handled by the recovery contract's skip/clamp behavior.
+  const exclusionAddresses = (manifest.strandingExclusions ?? []).map(
+    (exclusion) => ethers.getAddress(exclusion.depositor),
+  )
+  const snapshotActiveExclusionIds = new Map<string, bigint[]>()
+  if (atSnapshotBlock && exclusionAddresses.length > 0) {
+    const exclusionSet = new Set(exclusionAddresses)
+    const candidates = new Map<string, Set<bigint>>()
+    const depositorTopics = exclusionAddresses.map((depositor) =>
+      ethers.zeroPadValue(depositor, 32),
+    )
+    const receiptLogs = await getLogsInChunks(
+      ethers.provider,
+      {
+        address: addresses.portal,
+        topics: [
+          RECEIPT_MINTED_TOPIC,
+          depositorTopics,
+          ethers.zeroPadValue(addresses.tbtc, 32),
+        ],
+      },
+      anchors.STBTC_DEPLOYMENT_BLOCK,
+      block.number,
+    )
+
+    receiptLogs.forEach((log) => {
+      if (log.topics.length < 4) {
+        fail(`malformed ReceiptMinted log ${log.transactionHash}`)
+      }
+      const depositor = ethers.getAddress(`0x${log.topics[1].slice(-40)}`)
+      if (!exclusionSet.has(depositor)) {
+        fail(`unexpected depositor ${depositor} in filtered ReceiptMinted logs`)
+      }
+      const depositIds = candidates.get(depositor) ?? new Set<bigint>()
+      depositIds.add(BigInt(log.topics[3]))
+      candidates.set(depositor, depositIds)
+    })
+
+    await Promise.all(
+      exclusionAddresses.map(async (depositor) => {
+        const candidateIds = Array.from(candidates.get(depositor) ?? []).sort(
+          (a, b) => {
+            if (a === b) {
+              return 0
+            }
+            return a < b ? -1 : 1
+          },
+        )
+        const liveIds = (
+          await Promise.all(
+            candidateIds.map(async (depositId) => {
+              const deposit = await portal.deposits(
+                depositor,
+                addresses.tbtc,
+                depositId,
+                callOverrides,
+              )
+              return BigInt(deposit.receiptMinted) > 0n ? depositId : undefined
+            }),
+          )
+        ).filter((depositId): depositId is bigint => depositId !== undefined)
+        snapshotActiveExclusionIds.set(depositor, liveIds)
+      }),
+    )
+  }
+
   // The exclusions are the other half of the reviewed selection story: they
-  // are why capacity that exists was not used. Re-derive them so a manifest
-  // whose exclusions were trimmed or falsified cannot pass review.
+  // are why capacity that exists was not used. Re-read every listed deposit
+  // so falsified debt totals or truncated per-owner metadata fail at the
+  // snapshot. Completeness of the exclusion set itself remains established
+  // by the generator's globally reconciled scan and governance's manifest
+  // diff, not by trusting these summary fields.
   const exclusionReports = await Promise.all(
     (manifest.strandingExclusions ?? []).map(async (exclusion) => {
       const depositor = ethers.getAddress(exclusion.depositor)
+      if (byDepositor.has(depositor)) {
+        fail(`${depositor} appears in both settlements and strandingExclusions`)
+      }
+
       const liveBalance = BigInt(
         await stbtc.balanceOf(depositor, callOverrides),
       )
+      const inactiveDepositIds: bigint[] = []
+      const { depositIds, totalDebt: liveActiveDebt } =
+        await recomputeActiveReceiptDebt(
+          exclusion.depositIds,
+          async (depositId) => {
+            const deposit = await portal.deposits(
+              depositor,
+              addresses.tbtc,
+              depositId,
+              callOverrides,
+            )
+            const receiptMintedWei = BigInt(deposit.receiptMinted)
+            if (receiptMintedWei === 0n) {
+              inactiveDepositIds.push(depositId)
+            }
+            return {
+              receiptMintedWei,
+              migrating: Number(deposit.tbtcMigrationState) !== 0,
+            }
+          },
+        )
       if (atSnapshotBlock) {
+        assertExactActiveDepositIds(
+          `excluded depositor ${depositor}`,
+          depositIds,
+          snapshotActiveExclusionIds.get(depositor) ?? [],
+        )
         expectEqual(
           `excluded depositor ${depositor} recorded stBTC balance`,
           liveBalance,
           exclusion.stbtcBalanceWei,
         )
-      }
-      if (byDepositor.has(depositor)) {
-        fail(`${depositor} appears in both settlements and strandingExclusions`)
+        expectEqual(
+          `excluded depositor ${depositor} active debt`,
+          liveActiveDebt,
+          exclusion.activeDebtWei,
+        )
+        if (inactiveDepositIds.length > 0) {
+          fail(
+            `excluded depositor ${depositor} lists deposit ids with no ` +
+              `receipt debt at the snapshot: ${inactiveDepositIds.join(", ")}`,
+          )
+        }
       }
       return {
         depositor,
         recordedStbtcBalanceWei: BigInt(exclusion.stbtcBalanceWei),
         liveStbtcBalanceWei: liveBalance,
         recordedActiveDebtWei: BigInt(exclusion.activeDebtWei),
+        liveActiveDebtWei: liveActiveDebt,
+        activeDepositIds: depositIds,
       }
     }),
   )

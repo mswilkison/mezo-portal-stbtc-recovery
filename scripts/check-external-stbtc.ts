@@ -63,6 +63,8 @@ async function main() {
     print(
       `  minted/received ${ethers.formatEther(
         depositor.totalReceivedWei,
+      )} stBTC, sent ${ethers.formatEther(
+        depositor.totalSentWei,
       )} stBTC, wallet balance now ${ethers.formatEther(
         depositor.walletBalanceWei,
       )} (wallet balance is handled atomically by the recovery contract)`,

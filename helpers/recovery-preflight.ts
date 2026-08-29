@@ -108,6 +108,26 @@ export async function recomputeActiveReceiptDebt(
   }
 }
 
+// The debt total alone does not prove that reviewed exclusion metadata is
+// complete: an omitted deposit id and a correspondingly reduced total would
+// agree. Compare the reviewed ids with the independently event-derived live
+// set before trusting the exclusion at the snapshot block.
+export function assertExactActiveDepositIds(
+  label: string,
+  reviewedIds: readonly bigint[],
+  eventDerivedIds: readonly bigint[],
+): void {
+  if (
+    reviewedIds.length !== eventDerivedIds.length ||
+    reviewedIds.some((depositId, index) => depositId !== eventDerivedIds[index])
+  ) {
+    throw new Error(
+      `${label} active deposit ids do not match Portal history: reviewed ` +
+        `[${reviewedIds.join(", ")}], live [${eventDerivedIds.join(", ")}]`,
+    )
+  }
+}
+
 export type SettlementProjectionInput = {
   depositor: string
   depositId: bigint

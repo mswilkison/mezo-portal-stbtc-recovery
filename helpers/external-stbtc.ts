@@ -1,5 +1,6 @@
 import {
   Contract,
+  Filter,
   Log,
   Provider,
   TransactionReceipt,
@@ -12,6 +13,10 @@ import {
 import * as anchors from "./recovery-anchors"
 
 const TRANSFER_TOPIC = id("Transfer(address,address,uint256)")
+const IMPLEMENTATION_SLOT =
+  "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc"
+const INITIAL_LOG_CHUNK = 500_000
+const MINIMUM_LOG_CHUNK = 1_000
 const UNISWAP_V3_MINT_TOPIC = id(
   "Mint(address,address,int24,int24,uint128,uint256,uint256)",
 )
@@ -51,7 +56,7 @@ export type ExternalStbtcTransfer = {
 }
 
 export type ExternalStbtcDestinationResolution = {
-  adapter: "curve-router-v1.1" | "uniswap-v3-pool"
+  adapter: "portal-sink" | "curve-router-v1.1" | "uniswap-v3-pool"
   status: "noClaim" | "claim" | "unresolved"
   evidence: string
 }
@@ -114,6 +119,7 @@ export type ExternalStbtcDestinationReport = {
 export type ExternalStbtcDepositorReport = {
   depositor: string
   totalReceivedWei: bigint
+  totalSentWei: bigint
   walletBalanceWei: bigint
   destinations: ExternalStbtcDestinationReport[]
   positions: ExternalStbtcPositionReport[]
@@ -135,6 +141,58 @@ export type ExternalStbtcGate = {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : `${error}`
+}
+
+// Archive providers impose different eth_getLogs range caps. Query bounded,
+// inclusive ranges and adapt downward on rejection while preserving exact
+// chronological coverage. Errors at the minimum range remain fatal so the
+// execution gate can never mistake incomplete history for an empty result.
+export async function getLogsInChunks(
+  provider: Pick<Provider, "getLogs">,
+  filter: Filter,
+  fromBlock: number,
+  toBlock: number,
+  initialChunk = INITIAL_LOG_CHUNK,
+  minimumChunk = MINIMUM_LOG_CHUNK,
+): Promise<Log[]> {
+  if (
+    !Number.isSafeInteger(fromBlock) ||
+    !Number.isSafeInteger(toBlock) ||
+    fromBlock < 0 ||
+    toBlock < fromBlock ||
+    !Number.isSafeInteger(initialChunk) ||
+    !Number.isSafeInteger(minimumChunk) ||
+    minimumChunk <= 0 ||
+    initialChunk < minimumChunk
+  ) {
+    throw new Error("invalid archive log range or chunk size")
+  }
+
+  const logs: Log[] = []
+  let start = fromBlock
+  let chunk = initialChunk
+  while (start <= toBlock) {
+    const end = Math.min(start + chunk - 1, toBlock)
+    try {
+      // eslint-disable-next-line no-await-in-loop
+      const page = await provider.getLogs({
+        ...filter,
+        fromBlock: start,
+        toBlock: end,
+      })
+      logs.push(...page)
+      start = end + 1
+      if (chunk < initialChunk) {
+        chunk = Math.min(initialChunk, chunk * 2)
+      }
+    } catch (error) {
+      if (chunk === minimumChunk) {
+        throw error
+      }
+      chunk = Math.max(minimumChunk, Math.floor(chunk / 2))
+    }
+  }
+  return logs
 }
 
 // Automates only what chain history can establish without knowing which
@@ -163,6 +221,19 @@ export async function screenExternalStbtcHoldings(
     ])
     const [sentTransfers, totalReceivedWei, walletBalanceWei] =
       await depositorReads
+    const totalSentWei = sentTransfers.reduce(
+      (total, transfer) => total + transfer.amountWei,
+      0n,
+    )
+    const historyBalanceWei = totalReceivedWei - totalSentWei
+    if (historyBalanceWei !== walletBalanceWei) {
+      unverifiableReasons.push(
+        `${depositor}'s stBTC Transfer history does not reconcile: received ` +
+          `${totalReceivedWei.toString()} - sent ${totalSentWei.toString()} = ` +
+          `${historyBalanceWei.toString()}, but pinned balanceOf is ` +
+          `${walletBalanceWei.toString()}`,
+      )
+    }
 
     const amountsByDestination = new Map<string, bigint>()
     sentTransfers.forEach(({ destination, amountWei }) => {
@@ -294,6 +365,7 @@ export async function screenExternalStbtcHoldings(
     reports.push({
       depositor,
       totalReceivedWei,
+      totalSentWei,
       walletBalanceWei,
       destinations,
       positions,
@@ -377,6 +449,43 @@ function requireRuntimeHash(
   }
 }
 
+function addressFromStorageWord(word: string): string {
+  return canonicalAddress(`0x${word.slice(-40)}`)
+}
+
+// The Portal is an intentional terminal sink for stBTC: repayReceipt pulls
+// tokens here and burns them, while an unsolicited direct transfer creates
+// no depositor-owned share or withdrawal claim. Exempt it from the unknown
+// ERC-20-share probe only while the proxy still points to the exact reviewed
+// implementation whose behavior the recovery is built against.
+export async function verifyPortalSinkIdentity(
+  provider: Pick<Provider, "getCode" | "getStorage">,
+  blockNumber: number,
+): Promise<string> {
+  const [proxyCode, implementationWord] = await Promise.all([
+    provider.getCode(anchors.PORTAL, blockNumber),
+    provider.getStorage(anchors.PORTAL, IMPLEMENTATION_SLOT, blockNumber),
+  ])
+  if (proxyCode === "0x") {
+    throw new Error("Portal proxy has no code at the pinned block")
+  }
+  const implementation = addressFromStorageWord(implementationWord)
+  if (!sameAddress(implementation, anchors.ORIGINAL_IMPLEMENTATION)) {
+    throw new Error(
+      `Portal implementation ${implementation} does not match reviewed ${
+        anchors.ORIGINAL_IMPLEMENTATION
+      }`,
+    )
+  }
+  const implementationCode = await provider.getCode(implementation, blockNumber)
+  requireRuntimeHash(
+    "Portal implementation",
+    implementationCode,
+    anchors.IMPLEMENTATION_RUNTIME_HASH,
+  )
+  return implementation
+}
+
 function transferMatches(
   log: Log,
   token: string,
@@ -428,6 +537,38 @@ export function createEthersExternalStbtcReader(
     UNISWAP_V3_POSITION_MANAGER_ABI,
     provider,
   )
+
+  let historyBoundaryCheck: Promise<void> | undefined
+  const verifyHistoryBoundary = (): Promise<void> => {
+    if (!historyBoundaryCheck) {
+      historyBoundaryCheck = (async () => {
+        if (blockNumber < anchors.STBTC_DEPLOYMENT_BLOCK) {
+          throw new Error(
+            `pinned block ${blockNumber} predates stBTC deployment block ${anchors.STBTC_DEPLOYMENT_BLOCK.toString()}`,
+          )
+        }
+        const [beforeCode, deploymentCode] = await Promise.all([
+          provider.getCode(stbtcAddress, anchors.STBTC_DEPLOYMENT_BLOCK - 1),
+          provider.getCode(stbtcAddress, anchors.STBTC_DEPLOYMENT_BLOCK),
+        ])
+        if (beforeCode !== "0x" || deploymentCode === "0x") {
+          throw new Error(
+            `stBTC code does not match reviewed deployment boundary ${anchors.STBTC_DEPLOYMENT_BLOCK.toString()}`,
+          )
+        }
+      })()
+    }
+    return historyBoundaryCheck
+  }
+  const getHistoricalLogs = async (filter: Filter): Promise<Log[]> => {
+    await verifyHistoryBoundary()
+    return getLogsInChunks(
+      provider,
+      filter,
+      anchors.STBTC_DEPLOYMENT_BLOCK,
+      blockNumber,
+    )
+  }
 
   let protocolIdentityCheck: Promise<void> | undefined
   const verifyProtocolIdentities = (): Promise<void> => {
@@ -596,11 +737,9 @@ export function createEthersExternalStbtcReader(
 
   return {
     async getSentTransfers(depositor) {
-      const logs = await provider.getLogs({
+      const logs = await getHistoricalLogs({
         address: stbtcAddress,
         topics: [TRANSFER_TOPIC, paddedAddress(depositor)],
-        fromBlock: 0,
-        toBlock: blockNumber,
       })
       return logs.map((log) => ({
         destination: addressFromTopic(log.topics[2]),
@@ -611,11 +750,9 @@ export function createEthersExternalStbtcReader(
       }))
     },
     async getTotalReceivedWei(depositor) {
-      const logs = await provider.getLogs({
+      const logs = await getHistoricalLogs({
         address: stbtcAddress,
         topics: [TRANSFER_TOPIC, null, paddedAddress(depositor)],
-        fromBlock: 0,
-        toBlock: blockNumber,
       })
       return logs.reduce((total, log) => total + BigInt(log.data), 0n)
     },
@@ -634,6 +771,28 @@ export function createEthersExternalStbtcReader(
       return `${await contract.symbol(callOverrides)}`
     },
     async resolveKnownDestination(depositor, destination, transfers) {
+      if (sameAddress(destination, anchors.PORTAL)) {
+        try {
+          const implementation = await verifyPortalSinkIdentity(
+            provider,
+            blockNumber,
+          )
+          return {
+            adapter: "portal-sink",
+            status: "noClaim",
+            evidence:
+              `Portal proxy points to reviewed implementation ${implementation}; ` +
+              "transfers to it create no depositor-owned external claim",
+          }
+        } catch (error) {
+          return {
+            adapter: "portal-sink",
+            status: "unresolved",
+            evidence: errorMessage(error),
+          }
+        }
+      }
+
       if (sameAddress(destination, anchors.CURVE_ROUTER_V1_1)) {
         try {
           await verifyProtocolIdentities()
@@ -685,17 +844,13 @@ export function createEthersExternalStbtcReader(
     async getUniswapV3Positions(depositor) {
       await verifyProtocolIdentities()
       const [incoming, outgoing] = await Promise.all([
-        provider.getLogs({
+        getHistoricalLogs({
           address: anchors.UNISWAP_V3_POSITION_MANAGER,
           topics: [TRANSFER_TOPIC, null, paddedAddress(depositor)],
-          fromBlock: 0,
-          toBlock: blockNumber,
         }),
-        provider.getLogs({
+        getHistoricalLogs({
           address: anchors.UNISWAP_V3_POSITION_MANAGER,
           topics: [TRANSFER_TOPIC, paddedAddress(depositor)],
-          fromBlock: 0,
-          toBlock: blockNumber,
         }),
       ])
       // A self-transfer matches both queries. Deduplicate by log identity and
@@ -790,11 +945,9 @@ export function createEthersExternalStbtcReader(
       // read the live position key at the same pinned block. This also finds
       // positions funded by somebody else, which stBTC transfer history from
       // the depositor alone cannot discover.
-      const directMintLogs = await provider.getLogs({
+      const directMintLogs = await getHistoricalLogs({
         address: anchors.UNISWAP_V3_TBTC_STBTC_POOL,
         topics: [UNISWAP_V3_MINT_TOPIC, paddedAddress(depositor)],
-        fromBlock: 0,
-        toBlock: blockNumber,
       })
       const directRanges = new Map<
         string,

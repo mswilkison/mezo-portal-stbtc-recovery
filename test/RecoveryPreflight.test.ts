@@ -1,11 +1,15 @@
 import { expect } from "chai"
+import { Provider, zeroPadValue } from "ethers"
 import { readFileSync } from "fs"
+import { artifacts } from "hardhat"
 import { join } from "path"
 import {
   EXTERNAL_STBTC_REVIEW_CONFIRMATION,
   ExternalStbtcReader,
   evaluateExternalStbtcGate,
+  getLogsInChunks,
   screenExternalStbtcHoldings,
+  verifyPortalSinkIdentity,
 } from "../helpers/external-stbtc"
 import * as anchors from "../helpers/recovery-anchors"
 import {
@@ -15,6 +19,7 @@ import {
 } from "../helpers/recovery-manifest"
 import {
   annualFeeRatePerSecond,
+  assertExactActiveDepositIds,
   emitRecoveryPreflightResult,
   effectiveFeeIntegralAt,
   hasExactRecoveryAllowance,
@@ -42,6 +47,34 @@ describe("recovery preflight helpers", () => {
     )
   })
 
+  it("rejects malformed or duplicated stranding exclusions", () => {
+    const valid = loadRecoveryManifest()
+    const exclusion = valid.strandingExclusions![0]
+    const malformedDebt = {
+      ...valid,
+      strandingExclusions: [{ ...exclusion, activeDebtWei: "not-wei" }],
+    }
+    expect(() => validateManifestShape(malformedDebt)).to.throw(
+      "strandingExclusions[0].activeDebtWei must be a decimal wei string",
+    )
+
+    const emptyIds = {
+      ...valid,
+      strandingExclusions: [{ ...exclusion, depositIds: [] }],
+    }
+    expect(() => validateManifestShape(emptyIds)).to.throw(
+      "strandingExclusions[0].depositIds must be a non-empty array",
+    )
+
+    const duplicate = {
+      ...valid,
+      strandingExclusions: [exclusion, { ...exclusion }],
+    }
+    expect(() => validateManifestShape(duplicate)).to.throw(
+      "strandingExclusions[1].depositor duplicates another stranding exclusion",
+    )
+  })
+
   it("keeps manifest generation independent of the current pin", () => {
     const generatorSource = readFileSync(
       join(__dirname, "..", "scripts", "generate-stbtc-recovery-manifest.ts"),
@@ -57,17 +90,32 @@ describe("recovery preflight helpers", () => {
     const venue = "0x0000000000000000000000000000000000000002"
     const reader = (
       overrides: Partial<ExternalStbtcReader> = {},
-    ): ExternalStbtcReader => ({
-      getSentTransfers: async () => [],
-      getTotalReceivedWei: async () => 0n,
-      getStbtcBalance: async () => 0n,
-      getCode: async () => "0x",
-      getTokenBalance: async () => 0n,
-      getTokenSymbol: async () => "LP",
-      resolveKnownDestination: async () => undefined,
-      getUniswapV3Positions: async () => [],
-      ...overrides,
-    })
+    ): ExternalStbtcReader => {
+      const result: ExternalStbtcReader = {
+        getSentTransfers: async () => [],
+        getTotalReceivedWei: async () => 0n,
+        getStbtcBalance: async () => 0n,
+        getCode: async () => "0x",
+        getTokenBalance: async () => 0n,
+        getTokenSymbol: async () => "LP",
+        resolveKnownDestination: async () => undefined,
+        getUniswapV3Positions: async () => [],
+        ...overrides,
+      }
+      if (!overrides.getTotalReceivedWei) {
+        result.getTotalReceivedWei = async (address) => {
+          const [sent, balance] = await Promise.all([
+            result.getSentTransfers(address),
+            result.getStbtcBalance(address),
+          ])
+          return (
+            sent.reduce((total, transfer) => total + transfer.amountWei, 0n) +
+            balance
+          )
+        }
+      }
+      return result
+    }
 
     it("requires the non-enumerable positions to be reviewed manually", async () => {
       const report = await screenExternalStbtcHoldings([depositor], reader())
@@ -76,6 +124,56 @@ describe("recovery preflight helpers", () => {
       // received from a third party, staked, or held at a related address.
       expect(evaluateExternalStbtcGate(report, undefined).passed).to.equal(
         false,
+      )
+      expect(
+        evaluateExternalStbtcGate(report, EXTERNAL_STBTC_REVIEW_CONFIRMATION)
+          .passed,
+      ).to.equal(true)
+    })
+
+    it("blocks when Transfer history does not reconcile to the pinned balance", async () => {
+      const report = await screenExternalStbtcHoldings(
+        [depositor],
+        reader({
+          getSentTransfers: async () => [{ destination: venue, amountWei: 4n }],
+          getTotalReceivedWei: async () => 10n,
+          getStbtcBalance: async (address) =>
+            address.toLowerCase() === depositor.toLowerCase() ? 5n : 0n,
+        }),
+      )
+
+      expect(report.depositors[0].totalSentWei).to.equal(4n)
+      expect(report.unverifiableReasons[0]).to.include(
+        "Transfer history does not reconcile",
+      )
+      expect(
+        evaluateExternalStbtcGate(report, EXTERNAL_STBTC_REVIEW_CONFIRMATION)
+          .passed,
+      ).to.equal(false)
+    })
+
+    it("accepts the reviewed Portal as a non-claim sink", async () => {
+      const report = await screenExternalStbtcHoldings(
+        [depositor],
+        reader({
+          getSentTransfers: async () => [
+            { destination: anchors.PORTAL, amountWei: 1n },
+          ],
+          getCode: async () => "0x01",
+          getTokenBalance: async () => {
+            throw new Error("Portal has no ERC-20 balanceOf")
+          },
+          resolveKnownDestination: async () => ({
+            adapter: "portal-sink",
+            status: "noClaim",
+            evidence: "reviewed implementation",
+          }),
+        }),
+      )
+
+      expect(report.unverifiableReasons).to.deep.equal([])
+      expect(report.depositors[0].destinations[0].adapter).to.equal(
+        "portal-sink",
       )
       expect(
         evaluateExternalStbtcGate(report, EXTERNAL_STBTC_REVIEW_CONFIRMATION)
@@ -332,6 +430,58 @@ describe("recovery preflight helpers", () => {
         "position manager code drift",
       )
     })
+
+    it("adapts capped archive log ranges without gaps", async () => {
+      const successfulRanges: number[][] = []
+      let rejectedWideRange = false
+      const provider = {
+        getLogs: async (filter: { fromBlock?: number; toBlock?: number }) => {
+          const fromBlock = Number(filter.fromBlock)
+          const toBlock = Number(filter.toBlock)
+          if (toBlock - fromBlock + 1 > 3) {
+            rejectedWideRange = true
+            throw new Error("range capped")
+          }
+          successfulRanges.push([fromBlock, toBlock])
+          return []
+        },
+      } as unknown as Provider
+
+      expect(await getLogsInChunks(provider, {}, 1, 10, 8, 1)).to.deep.equal([])
+      expect(rejectedWideRange).to.equal(true)
+      expect(successfulRanges).to.deep.equal([
+        [1, 2],
+        [3, 4],
+        [5, 6],
+        [7, 8],
+        [9, 10],
+      ])
+    })
+
+    it("pins the Portal sink to the reviewed implementation", async () => {
+      const portalArtifact = await artifacts.readArtifact("Portal")
+      const provider = {
+        getStorage: async () =>
+          zeroPadValue(anchors.ORIGINAL_IMPLEMENTATION, 32),
+        getCode: async (address: string) =>
+          address.toLowerCase() === anchors.PORTAL.toLowerCase()
+            ? "0x01"
+            : portalArtifact.deployedBytecode,
+      } as unknown as Provider
+
+      expect(await verifyPortalSinkIdentity(provider, 25_850_299)).to.equal(
+        anchors.ORIGINAL_IMPLEMENTATION,
+      )
+
+      const driftedProvider = {
+        ...provider,
+        getStorage: async () =>
+          zeroPadValue("0x0000000000000000000000000000000000000001", 32),
+      } as unknown as Provider
+      await expect(
+        verifyPortalSinkIdentity(driftedProvider, 25_850_299),
+      ).to.be.rejectedWith("does not match reviewed")
+    })
   })
 
   it("pins RPC and contract reads to the same block", () => {
@@ -501,6 +651,18 @@ describe("recovery preflight helpers", () => {
     await expect(
       recomputeActiveReceiptDebt(["2", "1"], record),
     ).to.be.rejectedWith("strictly ascending")
+  })
+
+  it("rejects a truncated exclusion deposit-id list", () => {
+    expect(() =>
+      assertExactActiveDepositIds("excluded owner", [1n], [1n, 2n]),
+    ).to.throw(
+      "excluded owner active deposit ids do not match Portal history: " +
+        "reviewed [1], live [1, 2]",
+    )
+    expect(() =>
+      assertExactActiveDepositIds("excluded owner", [1n, 2n], [1n, 2n]),
+    ).not.to.throw()
   })
 
   describe("settlement projection", () => {
