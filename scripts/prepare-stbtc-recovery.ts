@@ -19,6 +19,7 @@ import {
   buildRecoveryBatchPayloads,
   emitRecoveryPreflightResult,
   effectiveFeeIntegralAt,
+  exceedsRecoveryReductionTolerance,
   hasExactRecoveryAllowance,
   maximumSettlementFromLiveDebt,
   pinnedBlockContext,
@@ -941,9 +942,12 @@ async function main() {
     // accumulated and the choice is execute-reduced or cancel. Wei-level
     // noise (up to the generator's dust threshold per selected owner) is
     // tolerated.
-    const reductionTolerance = 1000000000000n * BigInt(ownerReports.length)
     if (
-      projectedResidualWei > reductionTolerance &&
+      exceedsRecoveryReductionTolerance(
+        projectedResidualWei,
+        BigInt(manifest.strandingDustWei),
+        ownerReports.length,
+      ) &&
       process.env.RECOVERY_ACCEPT_REDUCED_RECOVERY !== "1"
     ) {
       if (STAGE === "prepare") {

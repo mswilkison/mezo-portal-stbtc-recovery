@@ -2,6 +2,7 @@ import { writeFileSync } from "fs"
 import { join } from "path"
 import { artifacts, ethers } from "hardhat"
 import * as anchors from "../helpers/recovery-anchors"
+import type { RecoveryManifest } from "../helpers/recovery-manifest"
 import {
   ADMIN_SLOT,
   IMPLEMENTATION_SLOT,
@@ -509,7 +510,7 @@ async function main() {
     fail("selection failed to reach the recovery amount")
   }
 
-  const manifest = {
+  const manifest: RecoveryManifest = {
     chainId: 1,
     snapshotBlock: pinBlock,
     snapshotTimestamp: new Date(Number(block.timestamp) * 1000)
@@ -524,6 +525,7 @@ async function main() {
       "and must not be left with unredeemable stBTC); the final deposit is " +
       "settled partially. Excluded depositors are listed under " +
       "strandingExclusions.",
+    strandingDustWei: dustWei.toString(),
     addresses: {
       portal: addresses.portal,
       originalImplementation,

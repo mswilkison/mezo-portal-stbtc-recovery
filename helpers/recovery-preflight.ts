@@ -32,6 +32,24 @@ export function hasExactRecoveryAllowance(
   return allowance === recoveryAmount
 }
 
+export function exceedsRecoveryReductionTolerance(
+  projectedResidualWei: bigint,
+  strandingDustWei: bigint,
+  selectedOwnerCount: number,
+): boolean {
+  if (projectedResidualWei < 0n) {
+    throw new Error("projected recovery residual must be non-negative")
+  }
+  if (strandingDustWei < 0n) {
+    throw new Error("stranding dust threshold must be non-negative")
+  }
+  if (!Number.isSafeInteger(selectedOwnerCount) || selectedOwnerCount < 0) {
+    throw new Error("selected owner count must be a non-negative safe integer")
+  }
+
+  return projectedResidualWei > strandingDustWei * BigInt(selectedOwnerCount)
+}
+
 // The Portal's lazy fee accounting, in one place. The generator records
 // these values into the manifest and the preflight recomputes them for its
 // snapshot equality checks and projections; a fee-model change must not be

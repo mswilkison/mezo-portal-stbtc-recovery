@@ -78,6 +78,9 @@ export type RecoveryManifest = {
   snapshotBlock: number
   snapshotTimestamp?: string
   selectionPolicy?: string
+  // Exact generator policy input. The preflight uses the same per-owner
+  // threshold to distinguish tolerated dust drift from a material reduction.
+  strandingDustWei: string
   addresses: {
     portal: string
     originalImplementation: string
@@ -124,6 +127,7 @@ export function validateManifestShape(manifest: RecoveryManifest): void {
   requireInteger("chainId", manifest.chainId)
   requireInteger("snapshotBlock", manifest.snapshotBlock)
   requireDecimalString("recoveryAmountWei", manifest.recoveryAmountWei)
+  requireDecimalString("strandingDustWei", manifest.strandingDustWei)
 
   if (
     !Array.isArray(manifest.settlements) ||

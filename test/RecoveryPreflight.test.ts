@@ -22,6 +22,7 @@ import {
   assertExactActiveDepositIds,
   emitRecoveryPreflightResult,
   effectiveFeeIntegralAt,
+  exceedsRecoveryReductionTolerance,
   hasExactRecoveryAllowance,
   maximumSettlementFromLiveDebt,
   pinnedBlockContext,
@@ -45,6 +46,47 @@ describe("recovery preflight helpers", () => {
     expect(valid.addresses.portalLogicOwner).to.equal(
       anchors.PORTAL_LOGIC_OWNER,
     )
+  })
+
+  it("requires a structured, validated manifest dust threshold", () => {
+    const valid = loadRecoveryManifest()
+    expect(valid.strandingDustWei).to.equal("1000000000000")
+    const missing = { ...valid } as Partial<RecoveryManifest>
+    delete missing.strandingDustWei
+
+    expect(() => validateManifestShape(missing as RecoveryManifest)).to.throw(
+      "strandingDustWei must be a decimal wei string",
+    )
+
+    const malformedValues: unknown[] = [
+      1000000000000,
+      "-1",
+      "1e12",
+      "0x10",
+      "1.5",
+      "",
+    ]
+    malformedValues.forEach((strandingDustWei) => {
+      expect(() =>
+        validateManifestShape({
+          ...valid,
+          strandingDustWei,
+        } as unknown as RecoveryManifest),
+      ).to.throw("strandingDustWei must be a decimal wei string")
+    })
+
+    expect(() =>
+      validateManifestShape({
+        ...valid,
+        strandingDustWei: "0",
+      } as RecoveryManifest),
+    ).not.to.throw()
+    expect(() =>
+      validateManifestShape({
+        ...valid,
+        strandingDustWei: "2000000000000",
+      } as RecoveryManifest),
+    ).not.to.throw()
   })
 
   it("rejects malformed or duplicated stranding exclusions", () => {
@@ -83,6 +125,19 @@ describe("recovery preflight helpers", () => {
 
     expect(generatorSource).not.to.include("loadRecoveryManifest")
     expect(generatorSource).to.include("anchors.PORTAL_LOGIC_OWNER")
+    expect(generatorSource).to.include("strandingDustWei: dustWei.toString()")
+  })
+
+  it("derives the reduction gate from the manifest dust threshold", () => {
+    const preflightSource = readFileSync(
+      join(__dirname, "..", "scripts", "prepare-stbtc-recovery.ts"),
+      "utf8",
+    )
+
+    expect(preflightSource).to.include("BigInt(manifest.strandingDustWei)")
+    expect(preflightSource).not.to.include(
+      "1000000000000n * BigInt(ownerReports.length)",
+    )
   })
 
   it("defers execute-stage aborts until cancellation output is built", () => {
@@ -568,6 +623,42 @@ describe("recovery preflight helpers", () => {
     expect(hasExactRecoveryAllowance(amount - 1n, amount)).to.equal(false)
     expect(hasExactRecoveryAllowance(amount + 1n, amount)).to.equal(false)
     expect(hasExactRecoveryAllowance(2n ** 256n - 1n, amount)).to.equal(false)
+  })
+
+  it("uses the manifest dust threshold for reduced-recovery acceptance", () => {
+    const defaultDust = 1000000000000n
+
+    expect(
+      exceedsRecoveryReductionTolerance(defaultDust, defaultDust, 1),
+    ).to.equal(false)
+    expect(
+      exceedsRecoveryReductionTolerance(defaultDust + 1n, defaultDust, 1),
+    ).to.equal(true)
+
+    // A lower custom policy must not inherit the old 1e12-wei bypass window.
+    expect(exceedsRecoveryReductionTolerance(6n, 5n, 1)).to.equal(true)
+    // A higher custom policy must continue to tolerate its approved dust.
+    expect(
+      exceedsRecoveryReductionTolerance(defaultDust + 1n, 2n * defaultDust, 1),
+    ).to.equal(false)
+
+    expect(exceedsRecoveryReductionTolerance(0n, 0n, 1)).to.equal(false)
+    expect(exceedsRecoveryReductionTolerance(1n, 0n, 1)).to.equal(true)
+    expect(exceedsRecoveryReductionTolerance(30n, 10n, 3)).to.equal(false)
+    expect(exceedsRecoveryReductionTolerance(31n, 10n, 3)).to.equal(true)
+
+    expect(() => exceedsRecoveryReductionTolerance(-1n, 0n, 1)).to.throw(
+      "projected recovery residual must be non-negative",
+    )
+    expect(() => exceedsRecoveryReductionTolerance(0n, -1n, 1)).to.throw(
+      "stranding dust threshold must be non-negative",
+    )
+    expect(() => exceedsRecoveryReductionTolerance(0n, 0n, -1)).to.throw(
+      "selected owner count must be a non-negative safe integer",
+    )
+    expect(() => exceedsRecoveryReductionTolerance(0n, 0n, 1.5)).to.throw(
+      "selected owner count must be a non-negative safe integer",
+    )
   })
 
   it("bounds funding and debt sufficiency by live selected debt", () => {
