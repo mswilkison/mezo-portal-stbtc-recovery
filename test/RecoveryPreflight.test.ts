@@ -85,6 +85,49 @@ describe("recovery preflight helpers", () => {
     expect(generatorSource).to.include("anchors.PORTAL_LOGIC_OWNER")
   })
 
+  it("defers execute-stage aborts until cancellation output is built", () => {
+    const preflightSource = readFileSync(
+      join(__dirname, "..", "scripts", "prepare-stbtc-recovery.ts"),
+      "utf8",
+    )
+
+    const allowanceGate = preflightSource.indexOf(
+      "if (!hasExactRecoveryAllowance",
+    )
+    const feeProjection = preflightSource.indexOf(
+      "const feeState",
+      allowanceGate,
+    )
+    const allowanceBlock = preflightSource.slice(allowanceGate, feeProjection)
+    expect(allowanceGate).to.be.greaterThan(-1)
+    expect(allowanceBlock).to.include("appendDeferredFailure")
+    expect(allowanceBlock).not.to.include("fail(message)")
+
+    const operationGate = preflightSource.indexOf(
+      'if (STAGE === "execute" && operationState !== "ready")',
+    )
+    const governanceBatch = preflightSource.indexOf(
+      "output.governanceBatch =",
+      operationGate,
+    )
+    const operationBlock = preflightSource.slice(operationGate, governanceBatch)
+    expect(operationGate).to.be.greaterThan(-1)
+    expect(operationBlock).to.include("appendDeferredFailure")
+    expect(operationBlock).not.to.include("fail(")
+
+    const finalStatus = preflightSource.indexOf(
+      "output.preflightPassed =",
+      governanceBatch,
+    )
+    const emission = preflightSource.indexOf(
+      "emitRecoveryPreflightResult(",
+      governanceBatch,
+    )
+    expect(governanceBatch).to.be.greaterThan(operationGate)
+    expect(finalStatus).to.be.greaterThan(governanceBatch)
+    expect(emission).to.be.greaterThan(finalStatus)
+  })
+
   describe("external stBTC holdings gate", () => {
     const depositor = "0x0000000000000000000000000000000000000001"
     const venue = "0x0000000000000000000000000000000000000002"
@@ -150,6 +193,30 @@ describe("recovery preflight helpers", () => {
         evaluateExternalStbtcGate(report, EXTERNAL_STBTC_REVIEW_CONFIRMATION)
           .passed,
       ).to.equal(false)
+    })
+
+    it("ignores permissionless zero-value transfer destinations", async () => {
+      let shareBalanceCalls = 0
+      const report = await screenExternalStbtcHoldings(
+        [depositor],
+        reader({
+          getSentTransfers: async () => [{ destination: venue, amountWei: 0n }],
+          getCode: async () => "0x01",
+          getTokenBalance: async () => {
+            shareBalanceCalls += 1
+            throw new Error("balanceOf reverted")
+          },
+        }),
+      )
+
+      expect(shareBalanceCalls).to.equal(0)
+      expect(report.depositors[0].totalSentWei).to.equal(0n)
+      expect(report.depositors[0].destinations).to.deep.equal([])
+      expect(report.unverifiableReasons).to.deep.equal([])
+      expect(
+        evaluateExternalStbtcGate(report, EXTERNAL_STBTC_REVIEW_CONFIRMATION)
+          .passed,
+      ).to.equal(true)
     })
 
     it("accepts the reviewed Portal as a non-claim sink", async () => {

@@ -221,7 +221,14 @@ export async function screenExternalStbtcHoldings(
     ])
     const [sentTransfers, totalReceivedWei, walletBalanceWei] =
       await depositorReads
-    const totalSentWei = sentTransfers.reduce(
+    // Standard ERC-20 transferFrom permits an unapproved caller to emit a
+    // zero-value Transfer from this depositor. Such a log moves no stBTC and
+    // creates no claim, so it must not introduce a destination whose
+    // balanceOf behavior can veto the mandatory screen.
+    const nonzeroSentTransfers = sentTransfers.filter(
+      ({ amountWei }) => amountWei !== 0n,
+    )
+    const totalSentWei = nonzeroSentTransfers.reduce(
       (total, transfer) => total + transfer.amountWei,
       0n,
     )
@@ -236,7 +243,7 @@ export async function screenExternalStbtcHoldings(
     }
 
     const amountsByDestination = new Map<string, bigint>()
-    sentTransfers.forEach(({ destination, amountWei }) => {
+    nonzeroSentTransfers.forEach(({ destination, amountWei }) => {
       const normalized = getAddress(destination)
       amountsByDestination.set(
         normalized,
@@ -254,7 +261,7 @@ export async function screenExternalStbtcHoldings(
         isContract,
       }
 
-      const transfers = sentTransfers.filter(
+      const transfers = nonzeroSentTransfers.filter(
         (transfer) =>
           getAddress(transfer.destination) === getAddress(destination),
       )

@@ -191,10 +191,10 @@ export function maximumSettlementFromLiveDebt(
   return maximumTotalWei
 }
 
-// The execute-stage reduced-recovery gate must still terminate nonzero, but
-// only after the serialized governance output (including cancel calldata) is
-// emitted. Keeping the ordering in one tested helper prevents a future
-// refactor from restoring the abort-before-calldata failure mode.
+// Execute-stage abort gates must still terminate nonzero, but only after the
+// serialized governance output (including cancel calldata) is emitted.
+// Keeping the ordering in one tested helper prevents a future refactor from
+// restoring the abort-before-calldata failure mode.
 export function emitRecoveryPreflightResult(
   serializedOutput: string,
   failureAfterOutput: string | undefined,

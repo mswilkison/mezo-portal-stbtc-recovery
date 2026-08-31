@@ -433,6 +433,7 @@ async function main() {
     0n,
   )
   expectEqual("manifest settlement total", manifestTotal, roundAmount)
+  let failureAfterOutput: string | undefined
 
   // Sufficiency checks live after the projection inputs are assembled. Token
   // funding and receipt-debt accounting use the selected deposits' live
@@ -450,9 +451,11 @@ async function main() {
       `proxy (${addresses.portal}) — not the recovery implementation — ` +
       "for exactly this round's settlement total"
     if (STAGE === "execute") {
-      fail(message)
+      failureAfterOutput = appendDeferredFailure(failureAfterOutput, message)
     }
-    warn(`${message} (expected while preparing; required before execution)`)
+    if (STAGE === "prepare") {
+      warn(`${message} (expected while preparing; required before execution)`)
+    }
   } else if (STAGE === "prepare") {
     // The allowance is already in place at the prepare stage, which means it
     // was granted before the delay elapsed — the ordering RECOVERY.md warns
@@ -914,7 +917,6 @@ async function main() {
     )
   }
 
-  let failureAfterOutput: string | undefined
   if (projectedTotalWei === 0n) {
     const message =
       "no settlement would apply at the current state — executeBatch would " +
@@ -922,9 +924,11 @@ async function main() {
     if (STAGE === "prepare") {
       fail(`${message}; regenerate the manifest`)
     }
-    failureAfterOutput =
+    failureAfterOutput = appendDeferredFailure(
+      failureAfterOutput,
       `${message}; cancel the operation using the cancelTransaction calldata ` +
-      "printed in governanceBatch and re-pin the manifest"
+        "printed in governanceBatch and re-pin the manifest",
+    )
   } else if (projectedResidualWei > 0n) {
     const message =
       `projected settlement is ${projectedTotalWei.toString()} of the ` +
@@ -950,11 +954,13 @@ async function main() {
             "RECOVERY_ACCEPT_REDUCED_RECOVERY=1",
         )
       }
-      failureAfterOutput =
+      failureAfterOutput = appendDeferredFailure(
+        failureAfterOutput,
         `${message}. Cancel the scheduled operation using the ` +
-        "cancelTransaction calldata printed in governanceBatch and re-pin, " +
-        "or — only with explicit governance acceptance of the reduced " +
-        "round — set RECOVERY_ACCEPT_REDUCED_RECOVERY=1 and rerun"
+          "cancelTransaction calldata printed in governanceBatch and re-pin, " +
+          "or — only with explicit governance acceptance of the reduced " +
+          "round — set RECOVERY_ACCEPT_REDUCED_RECOVERY=1 and rerun",
+      )
     } else {
       warn(message)
       warn(
@@ -1279,7 +1285,8 @@ async function main() {
     }
 
     if (STAGE === "execute" && operationState !== "ready") {
-      fail(
+      failureAfterOutput = appendDeferredFailure(
+        failureAfterOutput,
         `timelock operation ${operationId} is "${operationState}" ` +
           `(timestamp ${operationTimestamp.toString()}); executeBatch ` +
           "requires it to be ready",
@@ -1346,6 +1353,12 @@ async function main() {
       },
     }
   }
+
+  // Operation readiness is known only after deriving the governance batch.
+  // Refresh these fields after every deferred gate and before serialization
+  // so late lifecycle failures cannot leave a misleading passing result.
+  output.preflightPassed = failureAfterOutput === undefined
+  output.blockingFailure = failureAfterOutput
 
   emitRecoveryPreflightResult(
     stringify(output),
