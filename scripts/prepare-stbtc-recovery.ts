@@ -1,7 +1,10 @@
 import { readFileSync } from "fs"
+import type { Block } from "ethers"
 import { artifacts, ethers } from "hardhat"
 import {
+  ExternalStbtcScreenReport,
   createEthersExternalStbtcReader,
+  createExternalStbtcLogHistory,
   evaluateExternalStbtcGate,
   getLogsInChunks,
   screenExternalStbtcHoldings,
@@ -18,8 +21,10 @@ import {
   SettlementProjectionInput,
   assertExactActiveDepositIds,
   assertPinnedBlockHashUnchanged,
+  assertStillLatestBlock,
   buildRecoveryBatchPayloads,
   emitRecoveryPreflightResult,
+  evaluateAtConvergedLatest,
   effectiveFeeIntegralAt,
   exceedsRecoveryReductionTolerance,
   hasExactRecoveryAllowance,
@@ -154,42 +159,6 @@ async function main() {
       "RECOVERY_STAGE=execute must validate latest state; unset RECOVERY_BLOCK",
     )
   }
-  const block = await ethers.provider.getBlock(requestedBlock ?? "latest")
-  if (!block) {
-    fail(`block ${requestedBlock ?? "latest"} was not found`)
-  }
-  // Resolve `latest` exactly once. Every subsequent storage read, eth_call,
-  // code read, fee calculation, and operation-state check is pinned to this
-  // block's hash. Historical log ranges still use its number as their endpoint,
-  // so a final canonical hash recheck below rejects a persistent replacement.
-  const { rpcBlockTag: blockTag, callOverrides } = pinnedBlockContext(
-    block.number,
-    block.hash,
-  )
-  const atSnapshotBlock = block.number === manifest.snapshotBlock
-
-  // Selected-deposit drift handling: a mismatch against the reviewed
-  // manifest is fatal at the snapshot block (the manifest itself would be
-  // wrong) but only reported elsewhere — the projection below computes what
-  // the drift-tolerant contract would actually settle.
-  const driftMessages: string[] = []
-  function expectMatch(
-    label: string,
-    actual: bigint | number | string,
-    expected: bigint | number | string,
-  ): void {
-    if (actual.toString().toLowerCase() !== expected.toString().toLowerCase()) {
-      if (atSnapshotBlock) {
-        fail(
-          `${label}: expected ${expected.toString()}, got ${actual.toString()}`,
-        )
-      }
-      driftMessages.push(
-        `${label}: manifest ${expected.toString()}, live ${actual.toString()}`,
-      )
-    }
-  }
-
   // Full EIP-55 checksum validation. The manifest must carry checksummed
   // addresses; a single corrupted character (collateralRecipient is the one
   // address no on-chain state anchors) must fail here, never be laundered
@@ -253,6 +222,130 @@ async function main() {
     compiledPortalHash,
     anchors.IMPLEMENTATION_RUNTIME_HASH,
   )
+
+  // The execute-only external screen is the long pole: its first pass reads
+  // complete history from stBTC deployment. Run it before every mutable live
+  // gate, retain the raw logs, and catch up only missing tail ranges until the
+  // evaluated block remains latest. All core checks below are then pinned to
+  // that converged block. A late head check before serialization closes the
+  // shorter window occupied by those core checks.
+  let externalStbtcReview: unknown = {
+    requiredAtStage: "execute",
+    status: "not run during prepare stage",
+  }
+  let externalStbtcFailure: string | undefined
+  let block: Block
+  if (STAGE === "execute") {
+    const depositors = Array.from(
+      new Set(
+        manifest.settlements.map((settlement) =>
+          ethers.getAddress(settlement.depositor),
+        ),
+      ),
+    )
+    const history = createExternalStbtcLogHistory(
+      addresses.tbtc,
+      addresses.stbtc,
+    )
+    try {
+      const converged = await evaluateAtConvergedLatest<
+        ExternalStbtcScreenReport,
+        Block
+      >(ethers.provider, async (candidate) =>
+        screenExternalStbtcHoldings(
+          depositors,
+          createEthersExternalStbtcReader(
+            ethers.provider,
+            addresses.tbtc,
+            addresses.stbtc,
+            candidate.number,
+            candidate.hash,
+            history,
+          ),
+        ),
+      )
+      block = converged.block
+      const externalGate = evaluateExternalStbtcGate(
+        converged.result,
+        process.env.RECOVERY_EXTERNAL_STBTC_REVIEW,
+      )
+      externalStbtcReview = {
+        ...externalGate,
+        blockNumber: block.number,
+        blockHash: block.hash,
+        historyScan: {
+          initialBlockNumber: converged.initialBlock.number,
+          initialBlockHash: converged.initialBlock.hash,
+          passes: converged.passes,
+          incrementalPasses: converged.passes - 1,
+          completeThroughBlock: block.number,
+        },
+      }
+      if (!externalGate.passed) {
+        externalStbtcFailure = `external stBTC holdings review failed: ${externalGate.blockingReasons.join(
+          "; ",
+        )}. Cancel the operation using governanceBatch.cancelTransaction`
+      }
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : `${error}`
+      externalStbtcReview = {
+        passed: false,
+        error: detail,
+        historyScan: { status: "failed before latest-state convergence" },
+      }
+      externalStbtcFailure =
+        "external stBTC holdings screen could not reach a fresh, complete " +
+        `latest-state result: ${detail}. Cancel the operation using ` +
+        "governanceBatch.cancelTransaction"
+
+      // Continue at a newly resolved block so deterministic governance and
+      // cancellation calldata can still be emitted. The retained external
+      // failure makes a passing result impossible.
+      const fallbackBlock = await ethers.provider.getBlock("latest")
+      if (!fallbackBlock) {
+        fail("latest block was not found after external-screen failure")
+      }
+      block = fallbackBlock
+    }
+  } else {
+    const prepareBlock = await ethers.provider.getBlock(
+      requestedBlock ?? "latest",
+    )
+    if (!prepareBlock) {
+      fail(`block ${requestedBlock ?? "latest"} was not found`)
+    }
+    block = prepareBlock
+  }
+
+  // Every storage read, eth_call, code read, fee calculation, operation-state
+  // check, and final output field below is derived from this one block hash.
+  const { rpcBlockTag: blockTag, callOverrides } = pinnedBlockContext(
+    block.number,
+    block.hash,
+  )
+  const atSnapshotBlock = block.number === manifest.snapshotBlock
+
+  // Selected-deposit drift handling: a mismatch against the reviewed
+  // manifest is fatal at the snapshot block (the manifest itself would be
+  // wrong) but only reported elsewhere — the projection below computes what
+  // the drift-tolerant contract would actually settle.
+  const driftMessages: string[] = []
+  function expectMatch(
+    label: string,
+    actual: bigint | number | string,
+    expected: bigint | number | string,
+  ): void {
+    if (actual.toString().toLowerCase() !== expected.toString().toLowerCase()) {
+      if (atSnapshotBlock) {
+        fail(
+          `${label}: expected ${expected.toString()}, got ${actual.toString()}`,
+        )
+      }
+      driftMessages.push(
+        `${label}: manifest ${expected.toString()}, live ${actual.toString()}`,
+      )
+    }
+  }
 
   const implementation = addressFromStorageWord(
     await storageAt(addresses.portal, IMPLEMENTATION_SLOT, blockTag),
@@ -440,6 +533,12 @@ async function main() {
   )
   expectEqual("manifest settlement total", manifestTotal, roundAmount)
   let failureAfterOutput: string | undefined
+  if (externalStbtcFailure) {
+    failureAfterOutput = appendDeferredFailure(
+      failureAfterOutput,
+      externalStbtcFailure,
+    )
+  }
 
   // Sufficiency checks live after the projection inputs are assembled. Token
   // funding and receipt-debt accounting use the selected deposits' live
@@ -980,62 +1079,6 @@ async function main() {
     }
   }
 
-  // The atomic contract guard sees only stBTC.balanceOf(depositor). At the
-  // mandatory execute stage, repeat the automated external-position screen
-  // against this exact pinned block and require an explicit manual review of
-  // positions chain history cannot enumerate (LP tokens received from third
-  // parties, staked gauge/vault shares, and other controlled addresses).
-  // Failure is deferred until governanceBatch exists so operators always get
-  // verified cancellation calldata for an already scheduled operation.
-  let externalStbtcReview: unknown = {
-    requiredAtStage: "execute",
-    status: "not run during prepare stage",
-  }
-  if (STAGE === "execute") {
-    try {
-      const externalReport = await screenExternalStbtcHoldings(
-        Array.from(byDepositor.keys()),
-        createEthersExternalStbtcReader(
-          ethers.provider,
-          addresses.tbtc,
-          addresses.stbtc,
-          block.number,
-          callOverrides.blockTag,
-        ),
-      )
-      const externalGate = evaluateExternalStbtcGate(
-        externalReport,
-        process.env.RECOVERY_EXTERNAL_STBTC_REVIEW,
-      )
-      externalStbtcReview = {
-        ...externalGate,
-        blockNumber: block.number,
-        blockHash: block.hash,
-      }
-      if (!externalGate.passed) {
-        failureAfterOutput = appendDeferredFailure(
-          failureAfterOutput,
-          `external stBTC holdings review failed: ${externalGate.blockingReasons.join(
-            "; ",
-          )}. Cancel the operation using governanceBatch.cancelTransaction`,
-        )
-      }
-    } catch (error) {
-      const detail = error instanceof Error ? error.message : `${error}`
-      externalStbtcReview = {
-        passed: false,
-        blockNumber: block.number,
-        blockHash: block.hash,
-        error: detail,
-      }
-      failureAfterOutput = appendDeferredFailure(
-        failureAfterOutput,
-        `external stBTC holdings screen could not be completed: ${detail}. ` +
-          "Cancel the operation using governanceBatch.cancelTransaction",
-      )
-    }
-  }
-
   const recoveryFactory = await ethers.getContractFactory("PortalStbtcRecovery")
   const constructorArgs = [
     addresses.portal,
@@ -1074,6 +1117,7 @@ async function main() {
     blockHash: block.hash,
     blockTimestamp: block.timestamp,
     blockHashRevalidated: false,
+    latestHeadRevalidated: STAGE === "prepare" ? "not required" : false,
   }
   const output: Record<string, unknown> = {
     stage: STAGE,
@@ -1368,8 +1412,9 @@ async function main() {
 
   // Range scans cannot use a block-hash endpoint. Re-fetch the pinned height
   // and the manifest's generating snapshot only after every dependent read is
-  // complete. Fail closed before a result can be emitted as passing if either
-  // original hash is no longer canonical.
+  // complete. Execute also requires this exact evaluated block to remain the
+  // latest head. Fail closed before a result can be emitted as passing if any
+  // of those identities changed.
   try {
     await assertManifestSnapshotCanonical(ethers.provider, manifest)
     await assertPinnedBlockHashUnchanged(
@@ -1378,6 +1423,10 @@ async function main() {
       block.hash,
     )
     verifiedAt.blockHashRevalidated = true
+    if (STAGE === "execute") {
+      await assertStillLatestBlock(ethers.provider, block.number, block.hash)
+      verifiedAt.latestHeadRevalidated = true
+    }
   } catch (error) {
     const detail = error instanceof Error ? error.message : `${error}`
     const scheduledOperationGuidance = recoveryImplementation
@@ -1386,7 +1435,7 @@ async function main() {
       : ""
     failureAfterOutput = appendDeferredFailure(
       failureAfterOutput,
-      `canonical block-hash recheck failed: ${detail}. Discard this preflight ` +
+      `final block canonicality/freshness check failed: ${detail}. Discard this preflight ` +
         `result${scheduledOperationGuidance}, and rerun`,
     )
   }

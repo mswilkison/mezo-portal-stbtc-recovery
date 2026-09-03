@@ -141,6 +141,114 @@ export type ExternalStbtcGate = {
   report: ExternalStbtcScreenReport
 }
 
+type ExternalStbtcLogHistoryEntry = {
+  filterFingerprint: string
+  throughBlock: number
+  logs: Log[]
+}
+
+// An execute-stage scan keeps raw logs rather than a summarized report: later
+// heads must still be able to reconstruct transfer provenance, NFT ownership,
+// and every directly minted Uniswap range. Entries are advanced only across
+// the missing numeric tail and remain bound to the reviewed token pair and
+// deployment boundary for the lifetime of one preflight process.
+export type ExternalStbtcLogHistory = {
+  tbtcAddress: string
+  stbtcAddress: string
+  fromBlock: number
+  entries: Map<string, ExternalStbtcLogHistoryEntry>
+}
+
+export function createExternalStbtcLogHistory(
+  tbtcAddress: string,
+  stbtcAddress: string,
+  fromBlock = anchors.STBTC_DEPLOYMENT_BLOCK,
+): ExternalStbtcLogHistory {
+  if (!Number.isSafeInteger(fromBlock) || fromBlock < 0) {
+    throw new Error(`invalid stBTC history start block ${fromBlock.toString()}`)
+  }
+  return {
+    tbtcAddress: getAddress(tbtcAddress),
+    stbtcAddress: getAddress(stbtcAddress),
+    fromBlock,
+    entries: new Map(),
+  }
+}
+
+function historyFilterFingerprint(filter: Filter): string {
+  const normalize = (value: unknown): unknown => {
+    if (value === undefined || value === null) {
+      return value ?? null
+    }
+    if (Array.isArray(value)) {
+      return value.map(normalize)
+    }
+    if (typeof value === "string") {
+      return value.toLowerCase()
+    }
+    throw new Error("unsupported archive-log filter in stBTC history cache")
+  }
+  return JSON.stringify({
+    address: normalize(filter.address),
+    topics: normalize(filter.topics),
+  })
+}
+
+export async function extendExternalStbtcLogHistory(
+  provider: Pick<Provider, "getLogs">,
+  history: ExternalStbtcLogHistory,
+  cacheKey: string,
+  filter: Filter,
+  throughBlock: number,
+): Promise<Log[]> {
+  if (!cacheKey) {
+    throw new Error("stBTC history cache key must not be empty")
+  }
+  if (!Number.isSafeInteger(throughBlock) || throughBlock < history.fromBlock) {
+    throw new Error(`invalid stBTC history endpoint ${throughBlock.toString()}`)
+  }
+
+  const fingerprint = historyFilterFingerprint(filter)
+  const existing = history.entries.get(cacheKey)
+  if (existing && existing.filterFingerprint !== fingerprint) {
+    throw new Error(`stBTC history cache key ${cacheKey} changed filters`)
+  }
+  if (existing && throughBlock < existing.throughBlock) {
+    throw new Error(
+      `stBTC history cache cannot move ${cacheKey} backward from ` +
+        `${existing.throughBlock.toString()} to ${throughBlock.toString()}`,
+    )
+  }
+  if (existing && throughBlock === existing.throughBlock) {
+    return [...existing.logs]
+  }
+
+  const fromBlock = existing ? existing.throughBlock + 1 : history.fromBlock
+  // eslint-disable-next-line @typescript-eslint/no-use-before-define
+  const tail = await getLogsInChunks(provider, filter, fromBlock, throughBlock)
+  tail.forEach((log) => {
+    if (log.blockNumber < fromBlock || log.blockNumber > throughBlock) {
+      throw new Error(
+        `archive RPC returned log ${log.transactionHash}:${log.index} ` +
+          `outside requested range ${fromBlock.toString()}-${throughBlock.toString()}`,
+      )
+    }
+    if (log.removed) {
+      throw new Error(
+        `archive RPC returned removed log ${log.transactionHash}:${log.index}`,
+      )
+    }
+  })
+
+  const logs = existing ? [...existing.logs, ...tail] : [...tail]
+  history.entries.set(cacheKey, {
+    filterFingerprint: fingerprint,
+    throughBlock,
+    logs,
+  })
+  return [...logs]
+}
+
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : `${error}`
 }
@@ -524,9 +632,20 @@ export function createEthersExternalStbtcReader(
   stbtcAddress: string,
   blockNumber: number,
   blockHash: string | null,
+  history?: ExternalStbtcLogHistory,
 ): ExternalStbtcReader {
   if (blockHash === null) {
     throw new Error(`pinned block ${blockNumber} has no hash`)
+  }
+  if (
+    history &&
+    (history.tbtcAddress !== getAddress(tbtcAddress) ||
+      history.stbtcAddress !== getAddress(stbtcAddress) ||
+      history.fromBlock !== anchors.STBTC_DEPLOYMENT_BLOCK)
+  ) {
+    throw new Error(
+      "stBTC history cache is bound to a different token pair or deployment boundary",
+    )
   }
   const stbtc = new Contract(stbtcAddress, ERC20_ABI, provider)
   const callOverrides = { blockTag: blockHash }
@@ -573,8 +692,20 @@ export function createEthersExternalStbtcReader(
     }
     return historyBoundaryCheck
   }
-  const getHistoricalLogs = async (filter: Filter): Promise<Log[]> => {
+  const getHistoricalLogs = async (
+    cacheKey: string,
+    filter: Filter,
+  ): Promise<Log[]> => {
     await verifyHistoryBoundary()
+    if (history) {
+      return extendExternalStbtcLogHistory(
+        provider,
+        history,
+        cacheKey,
+        filter,
+        blockNumber,
+      )
+    }
     return getLogsInChunks(
       provider,
       filter,
@@ -752,10 +883,13 @@ export function createEthersExternalStbtcReader(
 
   return {
     async getSentTransfers(depositor) {
-      const logs = await getHistoricalLogs({
-        address: stbtcAddress,
-        topics: [TRANSFER_TOPIC, paddedAddress(depositor)],
-      })
+      const logs = await getHistoricalLogs(
+        `stbtc-sent:${canonicalAddress(depositor)}`,
+        {
+          address: stbtcAddress,
+          topics: [TRANSFER_TOPIC, paddedAddress(depositor)],
+        },
+      )
       return logs.map((log) => ({
         destination: addressFromTopic(log.topics[2]),
         amountWei: BigInt(log.data),
@@ -766,10 +900,13 @@ export function createEthersExternalStbtcReader(
       }))
     },
     async getTotalReceivedWei(depositor) {
-      const logs = await getHistoricalLogs({
-        address: stbtcAddress,
-        topics: [TRANSFER_TOPIC, null, paddedAddress(depositor)],
-      })
+      const logs = await getHistoricalLogs(
+        `stbtc-received:${canonicalAddress(depositor)}`,
+        {
+          address: stbtcAddress,
+          topics: [TRANSFER_TOPIC, null, paddedAddress(depositor)],
+        },
+      )
       return logs.reduce((total, log) => total + BigInt(log.data), 0n)
     },
     async getStbtcBalance(address) {
@@ -860,11 +997,14 @@ export function createEthersExternalStbtcReader(
     async getUniswapV3Positions(depositor) {
       await verifyProtocolIdentities()
       const [incoming, outgoing] = await Promise.all([
-        getHistoricalLogs({
-          address: anchors.UNISWAP_V3_POSITION_MANAGER,
-          topics: [TRANSFER_TOPIC, null, paddedAddress(depositor)],
-        }),
-        getHistoricalLogs({
+        getHistoricalLogs(
+          `uniswap-nft-received:${canonicalAddress(depositor)}`,
+          {
+            address: anchors.UNISWAP_V3_POSITION_MANAGER,
+            topics: [TRANSFER_TOPIC, null, paddedAddress(depositor)],
+          },
+        ),
+        getHistoricalLogs(`uniswap-nft-sent:${canonicalAddress(depositor)}`, {
           address: anchors.UNISWAP_V3_POSITION_MANAGER,
           topics: [TRANSFER_TOPIC, paddedAddress(depositor)],
         }),
@@ -961,10 +1101,13 @@ export function createEthersExternalStbtcReader(
       // read the live position key at the same pinned block. This also finds
       // positions funded by somebody else, which stBTC transfer history from
       // the depositor alone cannot discover.
-      const directMintLogs = await getHistoricalLogs({
-        address: anchors.UNISWAP_V3_TBTC_STBTC_POOL,
-        topics: [UNISWAP_V3_MINT_TOPIC, paddedAddress(depositor)],
-      })
+      const directMintLogs = await getHistoricalLogs(
+        `uniswap-core-mint:${canonicalAddress(depositor)}`,
+        {
+          address: anchors.UNISWAP_V3_TBTC_STBTC_POOL,
+          topics: [UNISWAP_V3_MINT_TOPIC, paddedAddress(depositor)],
+        },
+      )
       const directRanges = new Map<
         string,
         { tickLower: number; tickUpper: number }

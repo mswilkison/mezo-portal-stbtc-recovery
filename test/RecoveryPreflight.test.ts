@@ -1,12 +1,14 @@
 import { expect } from "chai"
-import { Provider, zeroPadValue } from "ethers"
+import { Filter, Log, Provider, zeroPadValue } from "ethers"
 import { readFileSync } from "fs"
 import { artifacts } from "hardhat"
 import { join } from "path"
 import {
   EXTERNAL_STBTC_REVIEW_CONFIRMATION,
   ExternalStbtcReader,
+  createExternalStbtcLogHistory,
   evaluateExternalStbtcGate,
+  extendExternalStbtcLogHistory,
   getLogsInChunks,
   screenExternalStbtcHoldings,
   verifyPortalSinkIdentity,
@@ -22,8 +24,10 @@ import {
   annualFeeRatePerSecond,
   assertExactActiveDepositIds,
   assertPinnedBlockHashUnchanged,
+  assertStillLatestBlock,
   emitRecoveryPreflightResult,
   effectiveFeeIntegralAt,
+  evaluateAtConvergedLatest,
   exceedsRecoveryReductionTolerance,
   hasExactRecoveryAllowance,
   maximumSettlementFromLiveDebt,
@@ -661,6 +665,80 @@ describe("recovery preflight helpers", () => {
       ])
     })
 
+    it("extends cached external history across only the missing block tail", async () => {
+      const ranges: number[][] = []
+      const provider = {
+        getLogs: async (filter: Filter) => {
+          const fromBlock = Number(filter.fromBlock)
+          const toBlock = Number(filter.toBlock)
+          ranges.push([fromBlock, toBlock])
+          return [
+            {
+              blockNumber: toBlock,
+              transactionHash: `0x${toBlock.toString(16).padStart(64, "0")}`,
+              index: 0,
+              removed: false,
+            } as Log,
+          ]
+        },
+      } as unknown as Pick<Provider, "getLogs">
+      const manifest = loadRecoveryManifest()
+      const history = createExternalStbtcLogHistory(
+        manifest.addresses.tbtc,
+        manifest.addresses.stbtc,
+        10,
+      )
+      const filter = { address: manifest.addresses.stbtc }
+
+      const baseline = await extendExternalStbtcLogHistory(
+        provider,
+        history,
+        "sent:depositor",
+        filter,
+        12,
+      )
+      const unchanged = await extendExternalStbtcLogHistory(
+        provider,
+        history,
+        "sent:depositor",
+        filter,
+        12,
+      )
+      const refreshed = await extendExternalStbtcLogHistory(
+        provider,
+        history,
+        "sent:depositor",
+        filter,
+        15,
+      )
+
+      expect(ranges).to.deep.equal([
+        [10, 12],
+        [13, 15],
+      ])
+      expect(baseline.map((log) => log.blockNumber)).to.deep.equal([12])
+      expect(unchanged.map((log) => log.blockNumber)).to.deep.equal([12])
+      expect(refreshed.map((log) => log.blockNumber)).to.deep.equal([12, 15])
+      await expect(
+        extendExternalStbtcLogHistory(
+          provider,
+          history,
+          "sent:depositor",
+          filter,
+          14,
+        ),
+      ).to.be.rejectedWith("cannot move sent:depositor backward")
+      await expect(
+        extendExternalStbtcLogHistory(
+          provider,
+          history,
+          "sent:depositor",
+          { address: manifest.addresses.tbtc },
+          16,
+        ),
+      ).to.be.rejectedWith("changed filters")
+    })
+
     it("pins the Portal sink to the reviewed implementation", async () => {
       const portalArtifact = await artifacts.readArtifact("Portal")
       const provider = {
@@ -750,6 +828,146 @@ describe("recovery preflight helpers", () => {
     ).to.be.rejectedWith("pinned block 25850299 has no hash")
   })
 
+  it("refreshes a long scan at newer heads and returns only the converged pass", async () => {
+    const block = (number: number) => ({
+      number,
+      hash: `0x${number.toString(16).padStart(64, "0")}`,
+    })
+    const canonical = new Map([
+      [10, block(10)],
+      [11, block(11)],
+    ])
+    const latest = [block(10), block(11), block(11)]
+    let latestRead = 0
+    const provider = {
+      getBlock: async (blockTag: number | "latest") => {
+        if (blockTag === "latest") {
+          const resolved = latest[latestRead] ?? latest[latest.length - 1]
+          latestRead += 1
+          return resolved
+        }
+        return canonical.get(blockTag) ?? null
+      },
+    }
+    const evaluated: number[] = []
+
+    const converged = await evaluateAtConvergedLatest(
+      provider,
+      async (candidate) => {
+        evaluated.push(candidate.number)
+        return {
+          walletBalanceWei: BigInt(candidate.number),
+          externalTransferCount: candidate.number - 9,
+        }
+      },
+      3,
+    )
+
+    expect(evaluated).to.deep.equal([10, 11])
+    expect(converged.initialBlock.number).to.equal(10)
+    expect(converged.block.number).to.equal(11)
+    expect(converged.passes).to.equal(2)
+    expect(converged.result).to.deep.equal({
+      walletBalanceWei: 11n,
+      externalTransferCount: 2,
+    })
+  })
+
+  it("fails closed when latest-state evaluation cannot converge", async () => {
+    const block = (number: number) => ({
+      number,
+      hash: `0x${number.toString(16).padStart(64, "0")}`,
+    })
+    const latest = [block(20), block(21), block(22), block(23)]
+    let latestRead = 0
+    const provider = {
+      getBlock: async (blockTag: number | "latest") => {
+        if (blockTag === "latest") {
+          const resolved = latest[latestRead] ?? latest[latest.length - 1]
+          latestRead += 1
+          return resolved
+        }
+        return block(blockTag)
+      },
+    }
+    const evaluated: number[] = []
+
+    await expect(
+      evaluateAtConvergedLatest(
+        provider,
+        async (candidate) => {
+          evaluated.push(candidate.number)
+          return candidate.number
+        },
+        3,
+      ),
+    ).to.be.rejectedWith("advanced during all 3 state evaluation passes")
+    expect(evaluated).to.deep.equal([20, 21, 22])
+  })
+
+  it("rejects a reorged history boundary before scanning another tail", async () => {
+    const original = {
+      number: 30,
+      hash: `0x${"30".repeat(32)}`,
+    }
+    const replacement = {
+      number: 30,
+      hash: `0x${"31".repeat(32)}`,
+    }
+    const next = {
+      number: 31,
+      hash: `0x${"32".repeat(32)}`,
+    }
+    let heightThirtyReads = 0
+    let latestReads = 0
+    const provider = {
+      getBlock: async (blockTag: number | "latest") => {
+        if (blockTag === "latest") {
+          latestReads += 1
+          return latestReads === 1 ? original : next
+        }
+        if (blockTag === 30) {
+          heightThirtyReads += 1
+          return heightThirtyReads === 1 ? original : replacement
+        }
+        return next
+      },
+    }
+    const evaluated: number[] = []
+
+    await expect(
+      evaluateAtConvergedLatest(provider, async (candidate) => {
+        evaluated.push(candidate.number)
+        return candidate.number
+      }),
+    ).to.be.rejectedWith("pinned block 30 was reorged during the scan")
+    expect(evaluated).to.deep.equal([30])
+  })
+
+  it("rejects state that stopped being latest before serialization", async () => {
+    const initialHash = `0x${"11".repeat(32)}`
+    const replacementHash = `0x${"22".repeat(32)}`
+
+    await expect(
+      assertStillLatestBlock(
+        {
+          getBlock: async () => ({ number: 100, hash: initialHash }),
+        },
+        100,
+        initialHash,
+      ),
+    ).not.to.be.rejected
+    await expect(
+      assertStillLatestBlock(
+        {
+          getBlock: async () => ({ number: 101, hash: replacementHash }),
+        },
+        100,
+        initialHash,
+      ),
+    ).to.be.rejectedWith("state became stale before preflight completion")
+  })
+
   it("rechecks every number-pinned workflow before accepting its output", () => {
     const preflightSource = readFileSync(
       join(__dirname, "..", "scripts", "prepare-stbtc-recovery.ts"),
@@ -757,6 +975,15 @@ describe("recovery preflight helpers", () => {
     )
     const recheck = preflightSource.lastIndexOf(
       "await assertPinnedBlockHashUnchanged",
+    )
+    const convergedExternalScan = preflightSource.indexOf(
+      "await evaluateAtConvergedLatest",
+    )
+    const firstMutableCoreRead = preflightSource.indexOf(
+      "const implementation =",
+    )
+    const latestHeadRecheck = preflightSource.lastIndexOf(
+      "await assertStillLatestBlock",
     )
     const finalStatus = preflightSource.indexOf(
       "output.preflightPassed =",
@@ -768,7 +995,14 @@ describe("recovery preflight helpers", () => {
     )
 
     expect(recheck).to.be.greaterThan(-1)
+    expect(convergedExternalScan).to.be.greaterThan(-1)
+    expect(firstMutableCoreRead).to.be.greaterThan(convergedExternalScan)
+    expect(
+      preflightSource.lastIndexOf("screenExternalStbtcHoldings("),
+    ).to.be.lessThan(firstMutableCoreRead)
     expect(finalStatus).to.be.greaterThan(recheck)
+    expect(latestHeadRecheck).to.be.greaterThan(recheck)
+    expect(finalStatus).to.be.greaterThan(latestHeadRecheck)
     expect(emission).to.be.greaterThan(finalStatus)
     expect(preflightSource.slice(recheck, finalStatus)).to.include(
       "appendDeferredFailure",

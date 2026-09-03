@@ -1,9 +1,14 @@
 import { ethers } from "ethers"
 
+export type RecoveryBlockIdentity = {
+  number: number
+  hash: string | null
+}
+
 type BlockIdentityProvider = {
   getBlock(
-    blockNumber: number,
-  ): Promise<{ number: number; hash: string | null } | null>
+    blockNumber: number | "latest",
+  ): Promise<RecoveryBlockIdentity | null>
 }
 
 export const IMPLEMENTATION_SLOT =
@@ -65,6 +70,132 @@ export async function assertPinnedBlockHashUnchanged(
     throw new Error(
       `pinned block ${blockNumber} was reorged during the scan: started at ` +
         `${expectedBlockHash}, now canonical at ${canonicalBlock.hash}`,
+    )
+  }
+}
+
+function requireBlockIdentity(
+  block: RecoveryBlockIdentity | null,
+  label: string,
+): asserts block is { number: number; hash: string } {
+  if (
+    !block ||
+    !Number.isSafeInteger(block.number) ||
+    block.number < 0 ||
+    block.hash === null ||
+    !ethers.isHexString(block.hash, 32)
+  ) {
+    throw new Error(
+      `${label} could not be resolved with a valid block identity`,
+    )
+  }
+}
+
+function sameBlockIdentity(
+  left: { number: number; hash: string },
+  right: { number: number; hash: string },
+): boolean {
+  return (
+    left.number === right.number &&
+    left.hash.toLowerCase() === right.hash.toLowerCase()
+  )
+}
+
+// A deployment-to-head archive scan can span several new blocks. Re-run its
+// caller-supplied evaluation at successively newer heads until the evaluated
+// block is still `latest` immediately afterward. The caller may retain a
+// canonical history cache between passes, making every pass after the first
+// an incremental tail scan. Each committed boundary is revalidated before it
+// is reused, and the loop is bounded so an advancing or inconsistent RPC
+// fails closed rather than hanging an execute-stage preflight forever.
+export async function evaluateAtConvergedLatest<
+  T,
+  B extends RecoveryBlockIdentity,
+>(
+  provider: BlockIdentityProvider,
+  evaluateAtBlock: (block: B & { hash: string }) => Promise<T>,
+  maxPasses = 5,
+): Promise<{
+  initialBlock: B & { hash: string }
+  block: B & { hash: string }
+  result: T
+  passes: number
+}> {
+  if (!Number.isSafeInteger(maxPasses) || maxPasses <= 0) {
+    throw new Error("latest-state convergence pass limit must be positive")
+  }
+
+  const initialCandidate = (await provider.getBlock("latest")) as B | null
+  requireBlockIdentity(initialCandidate, "latest block")
+  let candidate = initialCandidate as B & { hash: string }
+  const initialBlock = candidate
+  let committedBlock: (B & { hash: string }) | undefined
+
+  for (let pass = 1; pass <= maxPasses; pass += 1) {
+    if (committedBlock) {
+      // eslint-disable-next-line no-await-in-loop
+      await assertPinnedBlockHashUnchanged(
+        provider,
+        committedBlock.number,
+        committedBlock.hash,
+      )
+    }
+
+    // eslint-disable-next-line no-await-in-loop
+    const result = await evaluateAtBlock(candidate)
+    // eslint-disable-next-line no-await-in-loop
+    await assertPinnedBlockHashUnchanged(
+      provider,
+      candidate.number,
+      candidate.hash,
+    )
+
+    // eslint-disable-next-line no-await-in-loop
+    const resolvedLatest = (await provider.getBlock("latest")) as B | null
+    requireBlockIdentity(resolvedLatest, "latest block after state evaluation")
+    const latest = resolvedLatest as B & { hash: string }
+    if (sameBlockIdentity(candidate, latest)) {
+      return { initialBlock, block: candidate, result, passes: pass }
+    }
+    if (latest.number <= candidate.number) {
+      throw new Error(
+        "latest block changed inconsistently during state evaluation: " +
+          `evaluated ${candidate.number} (${candidate.hash}), resolved ` +
+          `${latest.number} (${latest.hash}) afterward`,
+      )
+    }
+
+    committedBlock = candidate
+    candidate = latest
+  }
+
+  throw new Error(
+    `latest block advanced during all ${maxPasses.toString()} state ` +
+      "evaluation passes; rerun against a responsive archive RPC",
+  )
+}
+
+// Execute-stage state checks may themselves outlive the converged archive
+// tail scan. A green result is emitted only if no newer head appeared while
+// those final hash-pinned checks were running.
+export async function assertStillLatestBlock(
+  provider: BlockIdentityProvider,
+  expectedBlockNumber: number,
+  expectedBlockHash: string | null,
+): Promise<void> {
+  if (expectedBlockHash === null) {
+    throw new Error(`validated block ${expectedBlockNumber} has no hash`)
+  }
+  const latest = await provider.getBlock("latest")
+  requireBlockIdentity(latest, "latest block at preflight completion")
+  if (
+    latest.number !== expectedBlockNumber ||
+    latest.hash.toLowerCase() !== expectedBlockHash.toLowerCase()
+  ) {
+    throw new Error(
+      "execute-stage state became stale before preflight completion: " +
+        `validated block ${expectedBlockNumber} (${expectedBlockHash}), ` +
+        `latest is ${latest.number} (${latest.hash})`,
     )
   }
 }

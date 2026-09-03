@@ -245,10 +245,11 @@ drift and projects the clamped execution outcome instead of aborting,
 because the contract tolerates drift by design — a hard failure there would
 hand third parties a process-level veto the contract itself does not have.
 `RECOVERY_STAGE=execute` is the mandatory rerun immediately before
-`executeBatch`: it always validates latest state (`RECOVERY_BLOCK` is
-refused), and hard-fails unless the exact allowance is in place, the
-operation is ready, and the projected settlement is nonzero. A materially
-reduced projection (a residual greater than the manifest's
+`executeBatch`: it refuses `RECOVERY_BLOCK`, completes the external-history
+scan before reading any mutable execution gate, and then validates those
+gates at a fresh latest block. It hard-fails unless the exact allowance is in
+place, the operation is ready, and the projected settlement is nonzero. A
+materially reduced projection (a residual greater than the manifest's
 `strandingDustWei` multiplied by the selected-owner count) requires the same
 explicit `RECOVERY_ACCEPT_REDUCED_RECOVERY=1` acknowledgment at both stages —
 at the execute stage an unaccepted reduction or all-zero projection prints
@@ -286,19 +287,39 @@ preflight, standalone external-position scan, and fork test resolve
 operational preflight or scan runs at a later block. Long-running operator
 workflows recheck the manifest snapshot again before reporting success.
 
-Each run also resolves its operational block once and pins every snapshot
-storage read, code read, and contract call to that block's hash. Historical
-log ranges and the stBTC deployment-boundary check require numeric heights,
-so every operator workflow re-fetches the endpoint height after all dependent
-reads and requires its canonical hash to match the hash resolved at the start.
-The preflight performs this check before serialization, records
-`verifiedAt.blockHashRevalidated: true` only on success, and exits nonzero with
-`preflightPassed: false` if the original hash is no longer canonical or could
-not be revalidated. The standalone external-position scan performs the same
-check before reporting PASSED, and the manifest generator performs it before
-writing a manifest. Because a numeric range response cannot prove that an RPC
-never served a transient alternate fork, the independent-provider comparison
-in step 4 remains mandatory.
+Prepare, manifest-generation, and explicit-block standalone scans each resolve
+one operational block and pin every snapshot storage read, code read, and
+contract call to its hash. Historical log ranges and the stBTC
+deployment-boundary check require numeric heights, so each workflow re-fetches
+the endpoint after all dependent reads and requires its canonical hash to
+match.
+
+Execute adds a freshness phase around its longer external-position work. Its
+first pass scans complete raw Transfer, NFT ownership, and direct Uniswap Mint
+history from stBTC deployment through an initial head. If that scan outlives
+the head, the preflight keeps the raw history and reruns the complete external
+evaluation at the newer hash while querying only each missing numeric tail.
+It accepts at most five passes and only when the evaluated block is still the
+exact latest block immediately after a pass; a reorged committed boundary,
+head regression/replacement, incomplete query, or failure to converge is
+blocking. Only then does it read the Portal implementation and configuration,
+roles, balances, allowance, deposits, fees, deployed recovery bytecode, and
+timelock operation at that same block hash. Immediately before serialization
+it revalidates the manifest snapshot and operational hash again and requires
+the operational block still to be latest. A pass reports
+`verifiedAt.blockHashRevalidated: true`,
+`verifiedAt.latestHeadRevalidated: true`, and the external review's
+`historyScan` boundaries/pass count. A head that advances during the final
+live checks produces `preflightPassed: false` instead of certifying old state.
+
+These checks are a fresh point-in-time observation, not a transaction lock. A
+new block or transaction can still land after the final RPC response; the
+contract rechecks its own settlement guards atomically, but it cannot enforce
+the off-chain external-position review or freeze governance/token
+configuration. Submit immediately after a green execute preflight and rerun it
+after any operational delay. Because a numeric range response also cannot
+prove that an RPC never served a transient alternate fork, the
+independent-provider comparison in step 4 remains mandatory.
 
 1. Thesis rebases this feature commit onto the exact canonical commit backing
    the live implementation. `npm run test:recovery` includes a provenance
@@ -388,16 +409,21 @@ in step 4 remains mandatory.
     from step 4 and reruns the preflight with both
     `RECOVERY_STAGE=execute` and
     `RECOVERY_EXTERNAL_STBTC_REVIEW=I_CONFIRM_NO_EXTERNAL_STBTC_CLAIMS`.
-    The execute preflight reruns the automated external-position screen at
-    the same hash-pinned latest block as every other snapshot read, then
-    re-fetches that height and rejects the run if the original hash is no
-    longer canonical. A failed canonicality check or detected claim,
-    unreadable relevant `balanceOf`, protocol identity/transaction mismatch,
-    active or uncollected Uniswap V3 NFT/core position, missing manual
-    confirmation, stale allowance, unready operation, zero projection, or
-    unaccepted material reduction prints the verified cancellation calldata
-    and exits nonzero. Only execute the batch after this latest-state run
-    reports `preflightPassed: true`.
+    The execute preflight first performs the full automated external-position
+    scan. If new blocks arrive, it extends the cached raw history only across
+    the missing tails and reruns all live external reads until that evaluated
+    block remains latest. It then runs every Portal, token, recovery
+    implementation, projection, role, allowance, and operation-state check at
+    that same hash and requires the hash still to be the exact latest head just
+    before output. A failed convergence, final freshness/canonicality check,
+    detected claim, unreadable relevant `balanceOf`, protocol
+    identity/transaction mismatch, active or uncollected Uniswap V3 NFT/core
+    position, missing manual confirmation, stale allowance, unready operation,
+    zero projection, or unaccepted material reduction prints the verified
+    cancellation calldata and exits nonzero. Only submit the batch immediately
+    after this run reports `preflightPassed: true`; rerun after any delay. The
+    final head comparison narrows but cannot eliminate the transaction-submission
+    race described above.
 11. Verify the `StbtcRecoveryCompleted` event and any
     `ReceiptDebtSettlementSkipped` events, the Threshold Safe tBTC increase,
     the stBTC burn, debt and collateral changes, and restoration of
@@ -460,6 +486,11 @@ MAINNET_RPC_URL=https://your-archive-rpc.example \
   at `2026-08-28T00:57:59Z`; it is not perpetual authorization. Current-state
   preflight is mandatory immediately before governance action, and the
   execute-stage preflight is mandatory immediately before `executeBatch`.
+- Execute-stage freshness is point-in-time. The preflight catches changes that
+  occur during its archive scan and final live checks, but state can change
+  after its last `latest` read and before transaction inclusion. Submit
+  immediately; the contract's atomic guards remain authoritative for the
+  on-chain settlement state.
 - The stranding dust threshold (`1e12 wei`) and the balance-aware selection
   policy are governance-visible parameters recorded in the manifest;
   approving the manifest approves the policy. The contract's per-owner live
