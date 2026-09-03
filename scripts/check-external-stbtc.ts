@@ -6,7 +6,7 @@ import {
   screenExternalStbtcHoldings,
 } from "../helpers/external-stbtc"
 import { loadRecoveryManifest } from "../helpers/recovery-manifest"
-import { pinnedBlockContext } from "../helpers/recovery-preflight"
+import { assertPinnedBlockHashUnchanged } from "../helpers/recovery-preflight"
 
 // Produces the automated half of the selected-depositor external-stBTC
 // review. Transfer history can find direct recipient venues, but it cannot
@@ -33,8 +33,7 @@ async function main() {
   if (!block) {
     throw new Error(`external stBTC review block ${requestedBlock} not found`)
   }
-  const { callOverrides } = pinnedBlockContext(block.number)
-  const blockNumber = Number(callOverrides.blockTag)
+  const blockNumber = block.number
   const stbtcAddress = manifest.addresses.stbtc
   const depositors = Array.from(
     new Set(manifest.settlements.map((s) => ethers.getAddress(s.depositor))),
@@ -44,8 +43,14 @@ async function main() {
     manifest.addresses.tbtc,
     stbtcAddress,
     blockNumber,
+    block.hash,
   )
   const report = await screenExternalStbtcHoldings(depositors, reader)
+  await assertPinnedBlockHashUnchanged(
+    ethers.provider,
+    block.number,
+    block.hash,
+  )
   const gate = evaluateExternalStbtcGate(
     report,
     process.env.RECOVERY_EXTERNAL_STBTC_REVIEW,
@@ -54,7 +59,8 @@ async function main() {
   // eslint-disable-next-line no-console
   const print = console.log
   print(
-    `stBTC external-holdings screen at block ${blockNumber} (${block.hash})`,
+    `stBTC external-holdings screen at block ${blockNumber} (${block.hash}, ` +
+      "canonical hash revalidated after scan)",
   )
   print(`token ${stbtcAddress}, ${depositors.length} settled depositors\n`)
 

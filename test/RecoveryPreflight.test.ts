@@ -20,6 +20,7 @@ import {
 import {
   annualFeeRatePerSecond,
   assertExactActiveDepositIds,
+  assertPinnedBlockHashUnchanged,
   emitRecoveryPreflightResult,
   effectiveFeeIntegralAt,
   exceedsRecoveryReductionTolerance,
@@ -606,14 +607,109 @@ describe("recovery preflight helpers", () => {
     })
   })
 
-  it("pins RPC and contract reads to the same block", () => {
-    expect(pinnedBlockContext(25_850_299)).to.deep.equal({
-      rpcBlockTag: "0x18a71bb",
-      callOverrides: { blockTag: 25_850_299 },
+  it("pins snapshot reads to the resolved block hash", () => {
+    const blockHash = `0x${"11".repeat(32)}`
+    expect(pinnedBlockContext(25_850_299, blockHash)).to.deep.equal({
+      rpcBlockTag: { blockHash, requireCanonical: true },
+      callOverrides: { blockTag: blockHash },
     })
-    expect(() => pinnedBlockContext(-1)).to.throw(
+    expect(() => pinnedBlockContext(-1, blockHash)).to.throw(
       "invalid preflight block number",
     )
+    expect(() => pinnedBlockContext(25_850_299, null)).to.throw(
+      "invalid preflight block hash",
+    )
+    expect(() => pinnedBlockContext(25_850_299, "0x1234")).to.throw(
+      "invalid preflight block hash",
+    )
+  })
+
+  it("accepts a pinned height whose canonical hash is unchanged", async () => {
+    const blockHash = `0x${"11".repeat(32)}`
+    const provider = {
+      getBlock: async (blockNumber: number) => ({
+        number: blockNumber,
+        hash: blockHash,
+      }),
+    }
+
+    await expect(
+      assertPinnedBlockHashUnchanged(provider, 25_850_299, blockHash),
+    ).not.to.be.rejected
+  })
+
+  it("rejects a reorg of the pinned height", async () => {
+    const initialHash = `0x${"11".repeat(32)}`
+    const replacementHash = `0x${"22".repeat(32)}`
+    const provider = {
+      getBlock: async (blockNumber: number) => ({
+        number: blockNumber,
+        hash: replacementHash,
+      }),
+    }
+
+    await expect(
+      assertPinnedBlockHashUnchanged(provider, 25_850_299, initialHash),
+    ).to.be.rejectedWith(
+      "pinned block 25850299 was reorged during the scan: started at " +
+        `${initialHash}, now canonical at ${replacementHash}`,
+    )
+  })
+
+  it("fails closed when canonical block identity cannot be revalidated", async () => {
+    const initialHash = `0x${"11".repeat(32)}`
+    const missingProvider = {
+      getBlock: async () => null,
+    }
+
+    await expect(
+      assertPinnedBlockHashUnchanged(missingProvider, 25_850_299, initialHash),
+    ).to.be.rejectedWith("could not be re-fetched with a canonical hash")
+    await expect(
+      assertPinnedBlockHashUnchanged(missingProvider, 25_850_299, null),
+    ).to.be.rejectedWith("pinned block 25850299 has no hash")
+  })
+
+  it("rechecks every number-pinned workflow before accepting its output", () => {
+    const preflightSource = readFileSync(
+      join(__dirname, "..", "scripts", "prepare-stbtc-recovery.ts"),
+      "utf8",
+    )
+    const recheck = preflightSource.lastIndexOf(
+      "await assertPinnedBlockHashUnchanged",
+    )
+    const finalStatus = preflightSource.indexOf(
+      "output.preflightPassed =",
+      recheck,
+    )
+    const emission = preflightSource.indexOf(
+      "emitRecoveryPreflightResult(",
+      finalStatus,
+    )
+
+    expect(recheck).to.be.greaterThan(-1)
+    expect(finalStatus).to.be.greaterThan(recheck)
+    expect(emission).to.be.greaterThan(finalStatus)
+    expect(preflightSource.slice(recheck, finalStatus)).to.include(
+      "appendDeferredFailure",
+    )
+
+    ;[
+      ["check-external-stbtc.ts", "const gate = evaluateExternalStbtcGate"],
+      ["generate-stbtc-recovery-manifest.ts", "writeFileSync(outPath"],
+    ].forEach(([script, acceptanceMarker]) => {
+      const source = readFileSync(
+        join(__dirname, "..", "scripts", script),
+        "utf8",
+      )
+      const scriptRecheck = source.lastIndexOf(
+        "await assertPinnedBlockHashUnchanged",
+      )
+      expect(scriptRecheck).to.be.greaterThan(-1)
+      expect(source.indexOf(acceptanceMarker, scriptRecheck)).to.be.greaterThan(
+        scriptRecheck,
+      )
+    })
   })
 
   it("accepts only the exact recovery allowance", () => {

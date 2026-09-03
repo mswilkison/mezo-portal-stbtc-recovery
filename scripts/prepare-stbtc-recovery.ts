@@ -16,6 +16,7 @@ import {
   IMPLEMENTATION_SLOT,
   SettlementProjectionInput,
   assertExactActiveDepositIds,
+  assertPinnedBlockHashUnchanged,
   buildRecoveryBatchPayloads,
   emitRecoveryPreflightResult,
   effectiveFeeIntegralAt,
@@ -105,7 +106,7 @@ function appendDeferredFailure(
 async function storageAt(
   address: string,
   slot: string,
-  blockTag: string,
+  blockTag: { blockHash: string; requireCanonical: true },
 ): Promise<string> {
   return ethers.provider.send("eth_getStorageAt", [address, slot, blockTag])
 }
@@ -157,9 +158,11 @@ async function main() {
   }
   // Resolve `latest` exactly once. Every subsequent storage read, eth_call,
   // code read, fee calculation, and operation-state check is pinned to this
-  // block so a slow preflight can never mix state from adjacent blocks.
+  // block's hash. Historical log ranges still use its number as their endpoint,
+  // so a final canonical hash recheck below rejects a persistent replacement.
   const { rpcBlockTag: blockTag, callOverrides } = pinnedBlockContext(
     block.number,
+    block.hash,
   )
   const atSnapshotBlock = block.number === manifest.snapshotBlock
 
@@ -264,7 +267,7 @@ async function main() {
 
   const implementationCode = await ethers.provider.getCode(
     implementation,
-    block.number,
+    callOverrides.blockTag,
   )
   expectEqual(
     "Portal implementation runtime hash",
@@ -995,6 +998,7 @@ async function main() {
           addresses.tbtc,
           addresses.stbtc,
           block.number,
+          callOverrides.blockTag,
         ),
       )
       const externalGate = evaluateExternalStbtcGate(
@@ -1063,15 +1067,17 @@ async function main() {
 
   const manifestHash = ethers.keccak256(readFileSync(recoveryManifestPath))
 
+  const verifiedAt = {
+    blockNumber: block.number,
+    blockHash: block.hash,
+    blockTimestamp: block.timestamp,
+    blockHashRevalidated: false,
+  }
   const output: Record<string, unknown> = {
     stage: STAGE,
     preflightPassed: failureAfterOutput === undefined,
     blockingFailure: failureAfterOutput,
-    verifiedAt: {
-      blockNumber: block.number,
-      blockHash: block.hash,
-      blockTimestamp: block.timestamp,
-    },
+    verifiedAt,
     provenance: {
       manifestPath: recoveryManifestPath,
       manifestHash,
@@ -1139,7 +1145,7 @@ async function main() {
     const recoveryAddress = ethers.getAddress(recoveryImplementation)
     const recoveryCode = await ethers.provider.getCode(
       recoveryAddress,
-      block.number,
+      callOverrides.blockTag,
     )
     if (recoveryCode === "0x") {
       fail(`no code at RECOVERY_IMPLEMENTATION ${recoveryAddress}`)
@@ -1234,7 +1240,7 @@ async function main() {
       ethers.provider,
       recoveryAddress,
       expectedRecoveryImmutables,
-      block.number,
+      callOverrides.blockTag,
     )
 
     const misdirectedAllowance = BigInt(
@@ -1358,9 +1364,32 @@ async function main() {
     }
   }
 
-  // Operation readiness is known only after deriving the governance batch.
-  // Refresh these fields after every deferred gate and before serialization
-  // so late lifecycle failures cannot leave a misleading passing result.
+  // Range scans cannot use a block-hash endpoint. Re-fetch the pinned height
+  // only after every dependent read is complete, and fail closed before a
+  // result can be emitted as passing if the original hash is no longer canonical.
+  try {
+    await assertPinnedBlockHashUnchanged(
+      ethers.provider,
+      block.number,
+      block.hash,
+    )
+    verifiedAt.blockHashRevalidated = true
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : `${error}`
+    const scheduledOperationGuidance = recoveryImplementation
+      ? ", cancel any scheduled operation using " +
+        "governanceBatch.cancelTransaction"
+      : ""
+    failureAfterOutput = appendDeferredFailure(
+      failureAfterOutput,
+      `canonical block-hash recheck failed: ${detail}. Discard this preflight ` +
+        `result${scheduledOperationGuidance}, and rerun`,
+    )
+  }
+
+  // Operation readiness and canonicality are known only after deriving the
+  // governance batch and completing every RPC read. Refresh these fields
+  // before serialization so late failures cannot leave a misleading pass.
   output.preflightPassed = failureAfterOutput === undefined
   output.blockingFailure = failureAfterOutput
 

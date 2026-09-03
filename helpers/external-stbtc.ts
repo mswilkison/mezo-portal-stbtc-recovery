@@ -1,4 +1,5 @@
 import {
+  BlockTag,
   Contract,
   Filter,
   Log,
@@ -52,6 +53,7 @@ export type ExternalStbtcTransfer = {
   amountWei: bigint
   transactionHash?: string
   blockNumber?: number
+  blockHash?: string
   logIndex?: number
 }
 
@@ -467,11 +469,11 @@ function addressFromStorageWord(word: string): string {
 // implementation whose behavior the recovery is built against.
 export async function verifyPortalSinkIdentity(
   provider: Pick<Provider, "getCode" | "getStorage">,
-  blockNumber: number,
+  blockTag: BlockTag,
 ): Promise<string> {
   const [proxyCode, implementationWord] = await Promise.all([
-    provider.getCode(anchors.PORTAL, blockNumber),
-    provider.getStorage(anchors.PORTAL, IMPLEMENTATION_SLOT, blockNumber),
+    provider.getCode(anchors.PORTAL, blockTag),
+    provider.getStorage(anchors.PORTAL, IMPLEMENTATION_SLOT, blockTag),
   ])
   if (proxyCode === "0x") {
     throw new Error("Portal proxy has no code at the pinned block")
@@ -484,7 +486,7 @@ export async function verifyPortalSinkIdentity(
       }`,
     )
   }
-  const implementationCode = await provider.getCode(implementation, blockNumber)
+  const implementationCode = await provider.getCode(implementation, blockTag)
   requireRuntimeHash(
     "Portal implementation",
     implementationCode,
@@ -521,9 +523,13 @@ export function createEthersExternalStbtcReader(
   tbtcAddress: string,
   stbtcAddress: string,
   blockNumber: number,
+  blockHash: string | null,
 ): ExternalStbtcReader {
+  if (blockHash === null) {
+    throw new Error(`pinned block ${blockNumber} has no hash`)
+  }
   const stbtc = new Contract(stbtcAddress, ERC20_ABI, provider)
-  const callOverrides = { blockTag: blockNumber }
+  const callOverrides = { blockTag: blockHash }
   const curveRouter = new Contract(
     anchors.CURVE_ROUTER_V1_1,
     CURVE_ROUTER_ABI,
@@ -583,10 +589,10 @@ export function createEthersExternalStbtcReader(
       protocolIdentityCheck = (async () => {
         const [curveCode, factoryCode, poolCode, positionManagerCode] =
           await Promise.all([
-            provider.getCode(anchors.CURVE_ROUTER_V1_1, blockNumber),
-            provider.getCode(anchors.UNISWAP_V3_FACTORY, blockNumber),
-            provider.getCode(anchors.UNISWAP_V3_TBTC_STBTC_POOL, blockNumber),
-            provider.getCode(anchors.UNISWAP_V3_POSITION_MANAGER, blockNumber),
+            provider.getCode(anchors.CURVE_ROUTER_V1_1, blockHash),
+            provider.getCode(anchors.UNISWAP_V3_FACTORY, blockHash),
+            provider.getCode(anchors.UNISWAP_V3_TBTC_STBTC_POOL, blockHash),
+            provider.getCode(anchors.UNISWAP_V3_POSITION_MANAGER, blockHash),
           ])
         requireRuntimeHash(
           "Curve router v1.1",
@@ -628,13 +634,15 @@ export function createEthersExternalStbtcReader(
     }
     if (
       receipt.blockNumber > blockNumber ||
+      !transfer.blockHash ||
+      receipt.blockHash.toLowerCase() !== transfer.blockHash.toLowerCase() ||
       !sameAddress(receipt.from, depositor) ||
       !receipt.to ||
       !sameAddress(receipt.to, anchors.CURVE_ROUTER_V1_1)
     ) {
       throw new Error(
         `Curve transaction ${transfer.transactionHash} has unexpected ` +
-          "block, sender, or receiver",
+          "block number, block hash, sender, or receiver",
       )
     }
     const logs = receiptLogs(receipt)
@@ -753,6 +761,7 @@ export function createEthersExternalStbtcReader(
         amountWei: BigInt(log.data),
         transactionHash: log.transactionHash,
         blockNumber: log.blockNumber,
+        blockHash: log.blockHash,
         logIndex: log.index,
       }))
     },
@@ -767,7 +776,7 @@ export function createEthersExternalStbtcReader(
       return BigInt(await stbtc.balanceOf(address, callOverrides))
     },
     async getCode(address) {
-      return provider.getCode(address, blockNumber)
+      return provider.getCode(address, blockHash)
     },
     async getTokenBalance(token, holder) {
       const contract = new Contract(token, ERC20_ABI, provider)
@@ -782,7 +791,7 @@ export function createEthersExternalStbtcReader(
         try {
           const implementation = await verifyPortalSinkIdentity(
             provider,
-            blockNumber,
+            blockHash,
           )
           return {
             adapter: "portal-sink",

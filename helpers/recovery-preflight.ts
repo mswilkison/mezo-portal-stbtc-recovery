@@ -1,5 +1,11 @@
 import { ethers } from "ethers"
 
+type BlockIdentityProvider = {
+  getBlock(
+    blockNumber: number,
+  ): Promise<{ number: number; hash: string | null } | null>
+}
+
 export const IMPLEMENTATION_SLOT =
   "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc"
 export const ADMIN_SLOT =
@@ -11,17 +17,55 @@ const PROXY_ADMIN_INTERFACE = new ethers.Interface([
   "function upgradeAndCall(address proxy,address implementation,bytes data) payable",
 ])
 
-export function pinnedBlockContext(blockNumber: number): {
-  rpcBlockTag: string
-  callOverrides: { blockTag: number }
+export function pinnedBlockContext(
+  blockNumber: number,
+  blockHash: string | null,
+): {
+  rpcBlockTag: { blockHash: string; requireCanonical: true }
+  callOverrides: { blockTag: string }
 } {
   if (!Number.isSafeInteger(blockNumber) || blockNumber < 0) {
     throw new Error(`invalid preflight block number ${blockNumber}`)
   }
+  if (blockHash === null || !ethers.isHexString(blockHash, 32)) {
+    throw new Error(`invalid preflight block hash ${blockHash ?? "null"}`)
+  }
 
   return {
-    rpcBlockTag: ethers.toQuantity(blockNumber),
-    callOverrides: { blockTag: blockNumber },
+    rpcBlockTag: { blockHash, requireCanonical: true },
+    callOverrides: { blockTag: blockHash },
+  }
+}
+
+// Historical log ranges require numeric endpoints, so re-check the resolved
+// block after every dependent read even though snapshot state calls are pinned
+// to its hash. A result is safe to accept only if that hash is still canonical
+// at the chosen height when the scan completes.
+export async function assertPinnedBlockHashUnchanged(
+  provider: BlockIdentityProvider,
+  blockNumber: number,
+  expectedBlockHash: string | null,
+): Promise<void> {
+  if (expectedBlockHash === null) {
+    throw new Error(`pinned block ${blockNumber} has no hash`)
+  }
+
+  const canonicalBlock = await provider.getBlock(blockNumber)
+  if (!canonicalBlock || canonicalBlock.hash === null) {
+    throw new Error(
+      `pinned block ${blockNumber} could not be re-fetched with a canonical hash`,
+    )
+  }
+  if (canonicalBlock.number !== blockNumber) {
+    throw new Error(
+      `pinned block ${blockNumber} re-fetch returned height ${canonicalBlock.number}`,
+    )
+  }
+  if (canonicalBlock.hash.toLowerCase() !== expectedBlockHash.toLowerCase()) {
+    throw new Error(
+      `pinned block ${blockNumber} was reorged during the scan: started at ` +
+        `${expectedBlockHash}, now canonical at ${canonicalBlock.hash}`,
+    )
   }
 }
 

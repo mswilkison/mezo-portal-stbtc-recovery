@@ -241,15 +241,15 @@ hand third parties a process-level veto the contract itself does not have.
 `executeBatch`: it always validates latest state (`RECOVERY_BLOCK` is
 refused), and hard-fails unless the exact allowance is in place, the
 operation is ready, and the projected settlement is nonzero. A materially
-reduced projection (beyond wei-level noise) requires the same explicit
-`RECOVERY_ACCEPT_REDUCED_RECOVERY=1` acknowledgment at both stages — at the
-execute stage an unaccepted reduction or all-zero projection prints
+reduced projection (a residual greater than the manifest's
+`strandingDustWei` multiplied by the selected-owner count) requires the same
+explicit `RECOVERY_ACCEPT_REDUCED_RECOVERY=1` acknowledgment at both stages —
+at the execute stage an unaccepted reduction or all-zero projection prints
 `preflightPassed: false` with the verified cancellation calldata before
-exiting nonzero — so
-drift discovered after scheduling cannot silently execute a smaller round
-than governance signed off on. Structural checks — implementation, proxy
-administration, tokens, runtime hash, and the reviewed anchors — are hard
-failures at every stage.
+exiting nonzero — so drift discovered after scheduling cannot silently
+execute a smaller round than governance signed off on. Structural checks —
+implementation, proxy administration, tokens, runtime hash, and the reviewed
+anchors — are hard failures at every stage.
 
 Token funding and receipt-debt consistency are checked against a live
 settlement upper bound: permanently unavailable deposits are excluded and
@@ -272,8 +272,19 @@ prints an explicit warning. `CANCELLER_ROLE` is a hard failure at the
 execute stage, because losing the documented abort path matters exactly when
 a scheduled batch must not execute.
 
-Each run resolves its block once and pins every subsequent storage read,
-code read, and contract call to that same block.
+Each run resolves its block once and pins every snapshot storage read, code
+read, and contract call to that block's hash. Historical log ranges and the
+stBTC deployment-boundary check require numeric heights, so every operator
+workflow also re-fetches the endpoint height after all dependent reads and
+requires its canonical hash to match the hash resolved at the start. The
+preflight performs this check before serialization, records
+`verifiedAt.blockHashRevalidated: true` only on success, and exits nonzero with
+`preflightPassed: false` if the original hash is no longer canonical or could
+not be revalidated. The standalone external-position scan performs the same
+check before reporting PASSED, and the manifest generator performs it before
+writing a manifest. Because a numeric range response cannot prove that an RPC
+never served a transient alternate fork, the independent-provider comparison
+in step 4 remains mandatory.
 
 1. Thesis rebases this feature commit onto the exact canonical commit backing
    the live implementation. `npm run test:recovery` includes a provenance
@@ -314,15 +325,16 @@ code read, and contract call to that same block.
    persist it in `.env`. The scan reconciles each selected wallet's complete
    stBTC Transfer history against its pinned balance, reads archive logs in
    adaptive chunks, and recognizes the reviewed Portal sink only while its
-   proxy points to the pinned implementation. Its typed Portal, Curve, and
-   Uniswap checks must report no claim or unresolved state, and the command
-   as a whole must report PASSED before the manifest is approved. If
-   ownership or venue coverage is
-   uncertain, exclude or reduce that depositor instead. A single RPC can
-   still omit a matching inbound/outbound pair without violating the net
-   reconciliation, so run the same pinned `CHECK_BLOCK` through a second,
-   independently operated archive provider and compare the block hash and
-   complete report before approval.
+   proxy points to the pinned implementation. Before reporting PASSED it
+   re-fetches `CHECK_BLOCK` and rejects the report if the initially resolved
+   hash is no longer canonical when the scan completes. Its typed Portal,
+   Curve, and Uniswap checks must report no claim or unresolved state, and the
+   command as a whole must report PASSED before the manifest is approved. If
+   ownership or venue coverage is uncertain, exclude or reduce that depositor
+   instead. A single RPC can still omit a matching inbound/outbound pair
+   without violating the net reconciliation, so run the same pinned
+   `CHECK_BLOCK` through a second, independently operated archive provider and
+   compare the block hash and complete report before approval.
 
 5. Run the preflight against a current archive RPC. It intentionally aborts
    if the implementation, proxy administration, token configuration, timelock
@@ -330,10 +342,10 @@ code read, and contract call to that same block.
    every active deposit listed for each selected owner, computes current
    debt from those live records instead of trusting the snapshot total, and
    projects the clamped settlement the contract would produce. At the
-   prepare stage a materially reduced projection (beyond wei-level noise)
-   aborts with instructions to regenerate the manifest, unless governance
-   explicitly accepts recovering less this round with
-   `RECOVERY_ACCEPT_REDUCED_RECOVERY=1`.
+   prepare stage a materially reduced projection (a residual greater than
+   `strandingDustWei * selectedOwnerCount`) aborts with instructions to
+   regenerate the manifest, unless governance explicitly accepts recovering
+   less this round with `RECOVERY_ACCEPT_REDUCED_RECOVERY=1`.
 6. Deploy and verify `PortalStbtcRecovery` using the constructor arguments
    printed by the preflight.
 7. Rerun the preflight with `RECOVERY_IMPLEMENTATION` set. It verifies the
@@ -353,7 +365,7 @@ code read, and contract call to that same block.
    freeze is process-enforced: the execute-stage preflight re-verifies the
    live implementation immediately before `executeBatch`, and executors must
    not skip or race it. If anything must change, cancel first (calldata is
-   printed in step 6), then re-pin.
+   printed in step 7), then re-pin.
 9. After the configured delay elapses, Threshold approves the Portal—not
    Thesis or the recovery implementation—for exactly the recovery amount.
    Approving before or during the delay would leave a standing allowance to
@@ -363,14 +375,15 @@ code read, and contract call to that same block.
     `RECOVERY_STAGE=execute` and
     `RECOVERY_EXTERNAL_STBTC_REVIEW=I_CONFIRM_NO_EXTERNAL_STBTC_CLAIMS`.
     The execute preflight reruns the automated external-position screen at
-    the same pinned latest block as every other read; a detected claim,
+    the same hash-pinned latest block as every other snapshot read, then
+    re-fetches that height and rejects the run if the original hash is no
+    longer canonical. A failed canonicality check or detected claim,
     unreadable relevant `balanceOf`, protocol identity/transaction mismatch,
-    active or uncollected Uniswap V3 NFT/core position,
-    missing manual confirmation, stale allowance, unready operation, zero
-    projection, or unaccepted material reduction prints the verified
-    cancellation calldata and exits nonzero. Only execute the batch after
-    this latest-state run reports
-    `preflightPassed: true`.
+    active or uncollected Uniswap V3 NFT/core position, missing manual
+    confirmation, stale allowance, unready operation, zero projection, or
+    unaccepted material reduction prints the verified cancellation calldata
+    and exits nonzero. Only execute the batch after this latest-state run
+    reports `preflightPassed: true`.
 11. Verify the `StbtcRecoveryCompleted` event and any
     `ReceiptDebtSettlementSkipped` events, the Threshold Safe tBTC increase,
     the stBTC burn, debt and collateral changes, and restoration of
@@ -385,7 +398,7 @@ code read, and contract call to that same block.
     verification externally instead of trusting the deployed getter.
 
 If the attempt is abandoned at any point after scheduling: cancel the
-timelock operation (step 6 prints the calldata — operations never expire on
+timelock operation (step 7 prints the calldata — operations never expire on
 their own, and a stale batch would re-install the old implementation if
 executed after an unrelated Portal upgrade), and revoke any approval already
 granted. The default operation salt commits to the manifest file's hash, so a

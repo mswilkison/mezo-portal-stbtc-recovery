@@ -6,7 +6,9 @@ import type { RecoveryManifest } from "../helpers/recovery-manifest"
 import {
   ADMIN_SLOT,
   IMPLEMENTATION_SLOT,
+  assertPinnedBlockHashUnchanged,
   effectiveFeeIntegralAt,
+  pinnedBlockContext,
   projectedFeeOwed,
 } from "../helpers/recovery-preflight"
 
@@ -169,7 +171,10 @@ async function main() {
   if (!block) {
     fail(`block ${pinBlock} not found`)
   }
-  const blockTag = { blockTag: pinBlock }
+  const { rpcBlockTag, callOverrides: blockTag } = pinnedBlockContext(
+    block.number,
+    block.hash,
+  )
 
   // Counterparties come from the reviewed anchors, NOT from the previous
   // manifest. Copying them forward made the manifest its own authority for
@@ -190,7 +195,7 @@ async function main() {
       await ethers.provider.send("eth_getStorageAt", [
         addresses.portal,
         IMPLEMENTATION_SLOT,
-        ethers.toQuantity(pinBlock),
+        rpcBlockTag,
       ])
     ).slice(-40)}`,
   )
@@ -199,14 +204,14 @@ async function main() {
       await ethers.provider.send("eth_getStorageAt", [
         addresses.portal,
         ADMIN_SLOT,
-        ethers.toQuantity(pinBlock),
+        rpcBlockTag,
       ])
     ).slice(-40)}`,
   )
 
   const implementationCode = await ethers.provider.getCode(
     originalImplementation,
-    pinBlock,
+    blockTag.blockTag,
   )
   const implementationRuntimeHash = ethers.keccak256(implementationCode)
   const portalArtifact = await artifacts.readArtifact("Portal")
@@ -590,6 +595,11 @@ async function main() {
   const outPath =
     process.env.OUT ??
     join(__dirname, "..", "recovery", `mainnet-${pinBlock}.json`)
+  await assertPinnedBlockHashUnchanged(
+    ethers.provider,
+    block.number,
+    block.hash,
+  )
   writeFileSync(outPath, `${JSON.stringify(manifest, null, 2)}\n`)
 
   log(
