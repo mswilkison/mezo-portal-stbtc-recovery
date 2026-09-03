@@ -8,6 +8,7 @@ import {
 } from "../helpers/external-stbtc"
 import * as anchors from "../helpers/recovery-anchors"
 import {
+  assertManifestSnapshotCanonical,
   loadRecoveryManifest,
   recoveryManifestPath,
 } from "../helpers/recovery-manifest"
@@ -141,6 +142,7 @@ function operationSalt(manifestHash: string): {
 async function main() {
   const network = await ethers.provider.getNetwork()
   expectEqual("chain ID", network.chainId, manifest.chainId)
+  await assertManifestSnapshotCanonical(ethers.provider, manifest)
 
   const requestedBlock = process.env.RECOVERY_BLOCK
     ? Number(process.env.RECOVERY_BLOCK)
@@ -1365,9 +1367,11 @@ async function main() {
   }
 
   // Range scans cannot use a block-hash endpoint. Re-fetch the pinned height
-  // only after every dependent read is complete, and fail closed before a
-  // result can be emitted as passing if the original hash is no longer canonical.
+  // and the manifest's generating snapshot only after every dependent read is
+  // complete. Fail closed before a result can be emitted as passing if either
+  // original hash is no longer canonical.
   try {
+    await assertManifestSnapshotCanonical(ethers.provider, manifest)
     await assertPinnedBlockHashUnchanged(
       ethers.provider,
       block.number,

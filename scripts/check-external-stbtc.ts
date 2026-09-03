@@ -5,7 +5,10 @@ import {
   evaluateExternalStbtcGate,
   screenExternalStbtcHoldings,
 } from "../helpers/external-stbtc"
-import { loadRecoveryManifest } from "../helpers/recovery-manifest"
+import {
+  assertManifestSnapshotCanonical,
+  loadRecoveryManifest,
+} from "../helpers/recovery-manifest"
 import { assertPinnedBlockHashUnchanged } from "../helpers/recovery-preflight"
 
 // Produces the automated half of the selected-depositor external-stBTC
@@ -26,6 +29,7 @@ import { assertPinnedBlockHashUnchanged } from "../helpers/recovery-preflight"
 
 async function main() {
   const manifest = loadRecoveryManifest()
+  await assertManifestSnapshotCanonical(ethers.provider, manifest)
   const requestedBlock = process.env.CHECK_BLOCK
     ? Number(process.env.CHECK_BLOCK)
     : await ethers.provider.getBlockNumber()
@@ -46,6 +50,7 @@ async function main() {
     block.hash,
   )
   const report = await screenExternalStbtcHoldings(depositors, reader)
+  await assertManifestSnapshotCanonical(ethers.provider, manifest)
   await assertPinnedBlockHashUnchanged(
     ethers.provider,
     block.number,

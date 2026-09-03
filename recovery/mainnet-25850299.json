@@ -1,6 +1,7 @@
 {
   "chainId": 1,
   "snapshotBlock": 25850299,
+  "snapshotBlockHash": "0x3ce97866ebf2413f71148da785efa3746e1208623d950e8910afa9e9cfe31ad5",
   "snapshotTimestamp": "2026-08-28T00:57:59Z",
   "selectionPolicy": "Largest active tBTC receipt debts first, restricted to depositors holding at most 1000000000000 wei of stBTC, with each owner's total selection additionally capped at their non-migrating debt minus their holdings (a depositor still holding stBTC can redeem it against their own debt through the normal repayment path and must not be left with unredeemable stBTC); the final deposit is settled partially. Excluded depositors are listed under strandingExclusions.",
   "strandingDustWei": "1000000000000",

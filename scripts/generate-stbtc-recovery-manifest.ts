@@ -171,6 +171,9 @@ async function main() {
   if (!block) {
     fail(`block ${pinBlock} not found`)
   }
+  if (block.hash === null) {
+    fail(`block ${pinBlock} has no hash`)
+  }
   const { rpcBlockTag, callOverrides: blockTag } = pinnedBlockContext(
     block.number,
     block.hash,
@@ -518,6 +521,7 @@ async function main() {
   const manifest: RecoveryManifest = {
     chainId: 1,
     snapshotBlock: pinBlock,
+    snapshotBlockHash: block.hash,
     snapshotTimestamp: new Date(Number(block.timestamp) * 1000)
       .toISOString()
       .replace(/\.\d{3}Z$/, "Z"),

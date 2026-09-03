@@ -1,14 +1,13 @@
 import { join } from "path"
 
-// Single source of truth for the pinned recovery manifest. The hardhat
+// Single source of truth for the selected recovery manifest. The hardhat
 // config, the preflight script, and the fork test must all import the
 // manifest from here so that re-pinning to a new snapshot only ever touches
 // this file and the manifest it points at.
 //
-// The filename below is the ONLY place the pin appears: the parsed object,
-// the resolved path (used for the operation-salt and provenance hashes), and
-// the exported filename all derive from this one constant, so they can never
-// disagree about which manifest is being validated, hashed, and encoded.
+// The filename below is the only code-level selector. The snapshot height and
+// hash live together inside that manifest; consumers validate both before
+// trusting its settlement selection.
 export const recoveryManifestFile = "mainnet-25850299.json"
 
 export const recoveryManifestPath = join(
@@ -76,6 +75,7 @@ export type ManifestObservedState = {
 export type RecoveryManifest = {
   chainId: number
   snapshotBlock: number
+  snapshotBlockHash: string
   snapshotTimestamp?: string
   selectionPolicy?: string
   // Exact generator policy input. The preflight uses the same per-owner
@@ -103,6 +103,42 @@ export type RecoveryManifest = {
 
 let cachedManifest: RecoveryManifest | undefined
 
+type ManifestSnapshotProvider = {
+  getBlock(
+    blockNumber: number,
+  ): Promise<{ number: number; hash: string | null } | null>
+}
+
+// Loading proves that the persisted hash is well-formed; this chain-aware
+// boundary proves that the manifest still describes the canonical block at
+// its recorded height. It is deliberately separate from the operational
+// block used for current-state drift checks.
+export async function assertManifestSnapshotCanonical(
+  provider: ManifestSnapshotProvider,
+  manifest: Pick<RecoveryManifest, "snapshotBlock" | "snapshotBlockHash">,
+): Promise<void> {
+  const block = await provider.getBlock(manifest.snapshotBlock)
+  if (!block || block.hash === null) {
+    throw new Error(
+      `manifest snapshot block ${manifest.snapshotBlock} could not be ` +
+        "resolved with a canonical hash; regenerate the recovery manifest",
+    )
+  }
+  if (block.number !== manifest.snapshotBlock) {
+    throw new Error(
+      `manifest snapshot block ${manifest.snapshotBlock} resolved to ` +
+        `unexpected height ${block.number}; regenerate the recovery manifest`,
+    )
+  }
+  if (block.hash.toLowerCase() !== manifest.snapshotBlockHash.toLowerCase()) {
+    throw new Error(
+      `manifest snapshot block ${manifest.snapshotBlock} hash mismatch: ` +
+        `expected ${manifest.snapshotBlockHash}, canonical ${block.hash}; ` +
+        "discard and regenerate the recovery manifest",
+    )
+  }
+}
+
 // The manifest is JSON cast to a type, so nothing enforces its shape at
 // runtime. That matters most for the numeric fields: the preflight decides
 // whether to apply its fatal snapshot-block checks with a strict `===`
@@ -126,6 +162,12 @@ export function validateManifestShape(manifest: RecoveryManifest): void {
 
   requireInteger("chainId", manifest.chainId)
   requireInteger("snapshotBlock", manifest.snapshotBlock)
+  if (
+    typeof manifest.snapshotBlockHash !== "string" ||
+    !/^0x[0-9a-fA-F]{64}$/.test(manifest.snapshotBlockHash)
+  ) {
+    problems.push("snapshotBlockHash must be a 32-byte hex string")
+  }
   requireDecimalString("recoveryAmountWei", manifest.recoveryAmountWei)
   requireDecimalString("strandingDustWei", manifest.strandingDustWei)
 

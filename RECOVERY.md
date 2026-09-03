@@ -123,15 +123,22 @@ at any block, so reviewers can regenerate and diff it instead of trusting
 the committed file; the generator reserves each selected owner's own
 holdings out of their selectable debt and refuses to emit a manifest whose
 event scan does not reconcile with the Portal's own `totalMinted`
-bookkeeping.
+bookkeeping. It stores the resolved block's exact hash and revalidates that
+hash immediately before writing. Every workflow that trusts the settlement
+selection resolves the stored height before use and rejects the manifest if
+its recorded hash is no longer canonical. Long-running RPC workflows repeat
+that check before accepting their result. A replacement block requires a newly
+generated and reviewed manifest even when selected fields happen to match.
 The generator takes every non-chain-derived address, including the default
 governance role-holder, from `helpers/recovery-anchors.ts`; it does not load
 the old manifest, so a missing or malformed pin cannot prevent regeneration.
 
 The pinned manifest is
 [`recovery/mainnet-25850299.json`](./recovery/mainnet-25850299.json)
-(referenced everywhere through `helpers/recovery-manifest.ts`). At block
-`25850299`, there were 87 active tBTC debt positions totaling
+(referenced everywhere through `helpers/recovery-manifest.ts`). It binds the
+selection to block `25850299`, hash
+`0x3ce97866ebf2413f71148da785efa3746e1208623d950e8910afa9e9cfe31ad5`.
+At that snapshot there were 87 active tBTC debt positions totaling
 `1.939721887006317423 tBTC`. The policy reaches Threshold's amount with ten
 settlements across six depositors — nine full and one partial — and excludes
 eight depositors that currently hold stBTC. Thesis/Mezo must explicitly
@@ -272,12 +279,19 @@ prints an explicit warning. `CANCELLER_ROLE` is a hard failure at the
 execute stage, because losing the documented abort path matters exactly when
 a scheduled batch must not execute.
 
-Each run resolves its block once and pins every snapshot storage read, code
-read, and contract call to that block's hash. Historical log ranges and the
-stBTC deployment-boundary check require numeric heights, so every operator
-workflow also re-fetches the endpoint height after all dependent reads and
-requires its canonical hash to match the hash resolved at the start. The
-preflight performs this check before serialization, records
+The manifest's required `snapshotBlockHash` binds its selection evidence to
+the exact block used by the generator. Before trusting that selection, the
+preflight, standalone external-position scan, and fork test resolve
+`snapshotBlock` and require the canonical hash to match, even when the
+operational preflight or scan runs at a later block. Long-running operator
+workflows recheck the manifest snapshot again before reporting success.
+
+Each run also resolves its operational block once and pins every snapshot
+storage read, code read, and contract call to that block's hash. Historical
+log ranges and the stBTC deployment-boundary check require numeric heights,
+so every operator workflow re-fetches the endpoint height after all dependent
+reads and requires its canonical hash to match the hash resolved at the start.
+The preflight performs this check before serialization, records
 `verifiedAt.blockHashRevalidated: true` only on success, and exits nonzero with
 `preflightPassed: false` if the original hash is no longer canonical or could
 not be revalidated. The standalone external-position scan performs the same
@@ -303,7 +317,7 @@ in step 4 remains mandatory.
 2. Review/audit `PortalStbtcRecovery.sol`, the settlement entries, the
    stranding exclusions, and the one-for-one accounting policy. Optionally
    regenerate the manifest (`npm run generate:recovery-manifest`) and diff it
-   against the committed one.
+   against the committed one, including its exact snapshot block hash.
 3. Run the unit, upgrade-layout, and pinned mainnet-fork tests
    (`npm run test:recovery` covers the first two — the storage-layout test
    is included there and is deliberately skipped by `npm run test:upgrades`,
@@ -441,8 +455,9 @@ MAINNET_RPC_URL=https://your-archive-rpc.example \
 - The live Portal source reconstruction (verified by the compiled-hash
   provenance test), storage layout, local atomic batch, drift handling, and
   failure rollback are tested.
-- The mainnet manifest is pinned to block `25850299` at
-  `2026-08-28T00:57:59Z`; it is not perpetual authorization. Current-state
+- The mainnet manifest is pinned to block `25850299`, hash
+  `0x3ce97866ebf2413f71148da785efa3746e1208623d950e8910afa9e9cfe31ad5`,
+  at `2026-08-28T00:57:59Z`; it is not perpetual authorization. Current-state
   preflight is mandatory immediately before governance action, and the
   execute-stage preflight is mandatory immediately before `executeBatch`.
 - The stranding dust threshold (`1e12 wei`) and the balance-aware selection

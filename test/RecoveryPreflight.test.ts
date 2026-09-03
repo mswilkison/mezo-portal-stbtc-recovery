@@ -14,6 +14,7 @@ import {
 import * as anchors from "../helpers/recovery-anchors"
 import {
   RecoveryManifest,
+  assertManifestSnapshotCanonical,
   loadRecoveryManifest,
   validateManifestShape,
 } from "../helpers/recovery-manifest"
@@ -47,6 +48,84 @@ describe("recovery preflight helpers", () => {
     expect(valid.addresses.portalLogicOwner).to.equal(
       anchors.PORTAL_LOGIC_OWNER,
     )
+  })
+
+  it("requires a well-formed snapshot block hash", () => {
+    const valid = loadRecoveryManifest()
+    const missing = { ...valid } as Partial<RecoveryManifest>
+    delete missing.snapshotBlockHash
+
+    expect(() => validateManifestShape(missing as RecoveryManifest)).to.throw(
+      "snapshotBlockHash must be a 32-byte hex string",
+    )
+
+    const malformedValues: unknown[] = [
+      null,
+      123,
+      "",
+      "0x1234",
+      `0x${"11".repeat(31)}`,
+      `0x${"11".repeat(33)}`,
+      `0x${"gg".repeat(32)}`,
+    ]
+    malformedValues.forEach((snapshotBlockHash) => {
+      expect(() =>
+        validateManifestShape({
+          ...valid,
+          snapshotBlockHash,
+        } as unknown as RecoveryManifest),
+      ).to.throw("snapshotBlockHash must be a 32-byte hex string")
+    })
+
+    expect(() =>
+      validateManifestShape({
+        ...valid,
+        snapshotBlockHash: `0x${"AB".repeat(32)}`,
+      }),
+    ).not.to.throw()
+  })
+
+  it("rejects a manifest whose generating block was replaced", async () => {
+    const valid = loadRecoveryManifest()
+    const replacementHash = `0x${"22".repeat(32)}`
+    const canonicalProvider = {
+      getBlock: async (blockNumber: number) => ({
+        number: blockNumber,
+        hash: valid.snapshotBlockHash.toUpperCase(),
+      }),
+    }
+    const replacementProvider = {
+      getBlock: async (blockNumber: number) => ({
+        number: blockNumber,
+        hash: replacementHash,
+      }),
+    }
+    let transitionReads = 0
+    const transitioningProvider = {
+      getBlock: async (blockNumber: number) => {
+        const hash =
+          transitionReads === 0 ? valid.snapshotBlockHash : replacementHash
+        transitionReads += 1
+        return { number: blockNumber, hash }
+      },
+    }
+
+    await expect(assertManifestSnapshotCanonical(canonicalProvider, valid)).not
+      .to.be.rejected
+    await expect(
+      assertManifestSnapshotCanonical(replacementProvider, valid),
+    ).to.be.rejectedWith(
+      `manifest snapshot block ${valid.snapshotBlock} hash mismatch: ` +
+        `expected ${valid.snapshotBlockHash}, canonical ${replacementHash}`,
+    )
+    await expect(assertManifestSnapshotCanonical(transitioningProvider, valid))
+      .not.to.be.rejected
+    await expect(
+      assertManifestSnapshotCanonical(transitioningProvider, valid),
+    ).to.be.rejectedWith("hash mismatch")
+    await expect(
+      assertManifestSnapshotCanonical({ getBlock: async () => null }, valid),
+    ).to.be.rejectedWith("could not be resolved with a canonical hash")
   })
 
   it("requires a structured, validated manifest dust threshold", () => {
@@ -127,6 +206,7 @@ describe("recovery preflight helpers", () => {
     expect(generatorSource).not.to.include("loadRecoveryManifest")
     expect(generatorSource).to.include("anchors.PORTAL_LOGIC_OWNER")
     expect(generatorSource).to.include("strandingDustWei: dustWei.toString()")
+    expect(generatorSource).to.include("snapshotBlockHash: block.hash")
   })
 
   it("derives the reduction gate from the manifest dust threshold", () => {
@@ -693,6 +773,23 @@ describe("recovery preflight helpers", () => {
     expect(preflightSource.slice(recheck, finalStatus)).to.include(
       "appendDeferredFailure",
     )
+    const firstPersistedSnapshotCheck = preflightSource.indexOf(
+      "await assertManifestSnapshotCanonical",
+    )
+    const finalPersistedSnapshotCheck = preflightSource.lastIndexOf(
+      "await assertManifestSnapshotCanonical",
+    )
+    expect(firstPersistedSnapshotCheck).to.be.greaterThan(-1)
+    expect(finalPersistedSnapshotCheck).to.be.greaterThan(
+      firstPersistedSnapshotCheck,
+    )
+    expect(preflightSource.indexOf("const atSnapshotBlock")).to.be.greaterThan(
+      firstPersistedSnapshotCheck,
+    )
+    expect(finalPersistedSnapshotCheck).to.be.greaterThan(
+      preflightSource.indexOf("output.governanceBatch ="),
+    )
+    expect(finalStatus).to.be.greaterThan(finalPersistedSnapshotCheck)
 
     ;[
       ["check-external-stbtc.ts", "const gate = evaluateExternalStbtcGate"],
@@ -709,6 +806,24 @@ describe("recovery preflight helpers", () => {
       expect(source.indexOf(acceptanceMarker, scriptRecheck)).to.be.greaterThan(
         scriptRecheck,
       )
+      if (script === "check-external-stbtc.ts") {
+        const firstPersistedCheck = source.indexOf(
+          "await assertManifestSnapshotCanonical",
+        )
+        const finalPersistedCheck = source.lastIndexOf(
+          "await assertManifestSnapshotCanonical",
+        )
+        const report = source.indexOf(
+          "const report = await screenExternalStbtcHoldings",
+          firstPersistedCheck,
+        )
+        expect(firstPersistedCheck).to.be.greaterThan(-1)
+        expect(report).to.be.greaterThan(firstPersistedCheck)
+        expect(finalPersistedCheck).to.be.greaterThan(report)
+        expect(source.indexOf(acceptanceMarker)).to.be.greaterThan(
+          finalPersistedCheck,
+        )
+      }
     })
   })
 

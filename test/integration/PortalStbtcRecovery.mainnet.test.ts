@@ -1,7 +1,10 @@
 import { expect } from "chai"
 import { ethers, network, upgrades } from "hardhat"
 import { time } from "@nomicfoundation/hardhat-network-helpers"
-import { loadRecoveryManifest } from "../../helpers/recovery-manifest"
+import {
+  assertManifestSnapshotCanonical,
+  loadRecoveryManifest,
+} from "../../helpers/recovery-manifest"
 import {
   buildRecoveryBatchPayloads,
   recomputeActiveReceiptDebt,
@@ -21,6 +24,7 @@ describeFn("PortalStbtcRecovery - mainnet fork", function () {
   it("recovers Threshold's exact stBTC balance and atomically restores Portal", async () => {
     // A wrong fork pin must fail loudly instead of silently validating a
     // different block than the one governance reviewed.
+    await assertManifestSnapshotCanonical(ethers.provider, manifest)
     expect(
       (await ethers.provider.getBlock("latest"))!.number,
       "forked block does not match the manifest snapshot " +
