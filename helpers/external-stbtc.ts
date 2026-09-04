@@ -2,6 +2,7 @@ import {
   BlockTag,
   Contract,
   Filter,
+  Interface,
   Log,
   Provider,
   TransactionReceipt,
@@ -21,12 +22,16 @@ const MINIMUM_LOG_CHUNK = 1_000
 const UNISWAP_V3_MINT_TOPIC = id(
   "Mint(address,address,int24,int24,uint128,uint256,uint256)",
 )
+const UNISWAP_V3_POOL_CREATED_TOPIC = id(
+  "PoolCreated(address,address,uint24,int24,address)",
+)
 const ERC20_ABI = [
   "function balanceOf(address) view returns (uint256)",
   "function symbol() view returns (string)",
 ]
 const CURVE_ROUTER_ABI = ["function version() view returns (string)"]
 const UNISWAP_V3_FACTORY_ABI = [
+  "event PoolCreated(address indexed token0,address indexed token1,uint24 indexed fee,int24 tickSpacing,address pool)",
   "function getPool(address tokenA,address tokenB,uint24 fee) view returns (address pool)",
 ]
 const UNISWAP_V3_POOL_ABI = [
@@ -42,7 +47,7 @@ const UNISWAP_V3_POSITION_MANAGER_ABI = [
 ]
 
 // This exact, deliberately explicit value is an operator attestation, not an
-// automated proof. It must be supplied only after the selected depositors'
+// automated proof. It must be supplied only after the screened depositors'
 // other controlled addresses and LP/share/gauge/vault positions have been
 // checked immediately before execution.
 export const EXTERNAL_STBTC_REVIEW_CONFIRMATION =
@@ -147,6 +152,7 @@ export type ExternalStbtcGate = {
 
 type ExternalStbtcLogHistoryEntry = {
   filterFingerprint: string
+  fromBlock: number
   throughBlock: number
   logs: Log[]
 }
@@ -204,11 +210,15 @@ export async function extendExternalStbtcLogHistory(
   cacheKey: string,
   filter: Filter,
   throughBlock: number,
+  fromBlock = history.fromBlock,
 ): Promise<Log[]> {
   if (!cacheKey) {
     throw new Error("stBTC history cache key must not be empty")
   }
-  if (!Number.isSafeInteger(throughBlock) || throughBlock < history.fromBlock) {
+  if (!Number.isSafeInteger(fromBlock) || fromBlock < 0) {
+    throw new Error(`invalid stBTC history start block ${fromBlock.toString()}`)
+  }
+  if (!Number.isSafeInteger(throughBlock) || throughBlock < fromBlock) {
     throw new Error(`invalid stBTC history endpoint ${throughBlock.toString()}`)
   }
 
@@ -216,6 +226,9 @@ export async function extendExternalStbtcLogHistory(
   const existing = history.entries.get(cacheKey)
   if (existing && existing.filterFingerprint !== fingerprint) {
     throw new Error(`stBTC history cache key ${cacheKey} changed filters`)
+  }
+  if (existing && existing.fromBlock !== fromBlock) {
+    throw new Error(`stBTC history cache key ${cacheKey} changed start block`)
   }
   if (existing && throughBlock < existing.throughBlock) {
     throw new Error(
@@ -227,14 +240,14 @@ export async function extendExternalStbtcLogHistory(
     return [...existing.logs]
   }
 
-  const fromBlock = existing ? existing.throughBlock + 1 : history.fromBlock
+  const nextBlock = existing ? existing.throughBlock + 1 : fromBlock
   // eslint-disable-next-line @typescript-eslint/no-use-before-define
-  const tail = await getLogsInChunks(provider, filter, fromBlock, throughBlock)
+  const tail = await getLogsInChunks(provider, filter, nextBlock, throughBlock)
   tail.forEach((log) => {
-    if (log.blockNumber < fromBlock || log.blockNumber > throughBlock) {
+    if (log.blockNumber < nextBlock || log.blockNumber > throughBlock) {
       throw new Error(
         `archive RPC returned log ${log.transactionHash}:${log.index} ` +
-          `outside requested range ${fromBlock.toString()}-${throughBlock.toString()}`,
+          `outside requested range ${nextBlock.toString()}-${throughBlock.toString()}`,
       )
     }
     if (log.removed) {
@@ -247,6 +260,7 @@ export async function extendExternalStbtcLogHistory(
   const logs = existing ? [...existing.logs, ...tail] : [...tail]
   history.entries.set(cacheKey, {
     filterFingerprint: fingerprint,
+    fromBlock,
     throughBlock,
     logs,
   })
@@ -502,7 +516,7 @@ export async function screenExternalStbtcHoldings(
     limitation:
       "transfer destinations are not exhaustive: manually verify LP/share " +
       "tokens received from third parties, staked gauge/vault positions, " +
-      "and every other address controlled by each selected depositor",
+      "and every other address controlled by each screened depositor",
   }
 }
 
@@ -524,7 +538,7 @@ export function evaluateExternalStbtcGate(
     blockingReasons.push(
       "manual external-holdings verification is missing; set " +
         `RECOVERY_EXTERNAL_STBTC_REVIEW=${EXTERNAL_STBTC_REVIEW_CONFIRMATION} ` +
-        "only after checking every selected depositor's other controlled " +
+        "only after checking every screened depositor's other controlled " +
         "addresses and LP/share/gauge/vault positions",
     )
   }
@@ -595,6 +609,9 @@ export type UniswapV3CoreReader = {
   // Every `Mint` log whose indexed owner is the depositor, from ANY emitting
   // contract, over the complete stBTC history range.
   getDirectMintLogs(owner: string): Promise<Log[]>
+  // Complete canonical-factory PoolCreated history for stBTC in either
+  // token slot, including pools created before the token was deployed.
+  getStbtcPoolCreationLogs(): Promise<Log[]>
   // factory()/token0()/token1()/fee() of an emitting contract; must throw
   // when the emitter does not answer like a Uniswap V3 pool.
   getPoolIdentity(pool: string): Promise<UniswapV3PoolIdentity>
@@ -613,27 +630,57 @@ export type UniswapV3CoreReader = {
 // Uniswap V3 core lets any contract mint a position to an arbitrary owner
 // without the canonical NFT manager, and the owner is indexed in every pool's
 // Mint event. Enumerate every range ever minted to the depositor in ANY pool
-// (an address-less log query), classify each emitting pool at the pinned
-// block, and re-read the live position key for every range in a pool that
-// holds stBTC. Restricting the query to the one anchored tBTC/stBTC pool
+// (an address-less log query), authenticate emitters against the canonical
+// factory's stBTC PoolCreated history, and re-read the live position key for
+// every authenticated range. Restricting the query to the anchored tBTC/stBTC pool
 // would miss a range in any other stBTC pool — including one somebody else
 // funded, which the depositor's own stBTC transfer history cannot discover
-// either. An stBTC-holding emitter that is not a canonical-factory pool, or
-// an emitter that cannot be classified at all, is an unclassifiable claim
-// and fails closed (throws, so the screen reports UNRESOLVED) rather than
-// being skipped.
+// either. Unauthenticated event data establishes no claim and is ignored by
+// this adapter; transfer-destination and manual review cover other venues.
+// Failed reads for authenticated stBTC pools remain blocking.
 export async function enumerateDirectCorePositions(
   depositor: string,
   stbtcAddress: string,
   reader: UniswapV3CoreReader,
 ): Promise<ExternalStbtcCorePositionReport[]> {
   const owner = canonicalAddress(depositor)
-  const mintLogs = await reader.getDirectMintLogs(owner)
+  const [mintLogs, creationLogs] = await Promise.all([
+    reader.getDirectMintLogs(owner),
+    reader.getStbtcPoolCreationLogs(),
+  ])
+  const factoryInterface = new Interface(UNISWAP_V3_FACTORY_ABI)
+  const canonicalPools = new Map<string, UniswapV3PoolIdentity>()
+  creationLogs.forEach((log) => {
+    if (!sameAddress(log.address, anchors.UNISWAP_V3_FACTORY)) {
+      throw new Error("PoolCreated history contains a non-canonical factory")
+    }
+    const creation = factoryInterface.parseLog(log)
+    if (!creation || creation.name !== "PoolCreated") {
+      throw new Error("malformed canonical Uniswap V3 PoolCreated log")
+    }
+    const token0 = canonicalAddress(creation.args.token0)
+    const token1 = canonicalAddress(creation.args.token1)
+    if (
+      sameAddress(token0, stbtcAddress) ||
+      sameAddress(token1, stbtcAddress)
+    ) {
+      canonicalPools.set(canonicalAddress(creation.args.pool), {
+        factory: anchors.UNISWAP_V3_FACTORY,
+        token0,
+        token1,
+        fee: Number(creation.args.fee),
+      })
+    }
+  })
   const rangesByPool = new Map<
     string,
     Map<string, { tickLower: number; tickUpper: number }>
   >()
   mintLogs.forEach((log) => {
+    const pool = canonicalAddress(log.address)
+    if (!canonicalPools.has(pool)) {
+      return
+    }
     const logId = `${log.transactionHash}:${log.index}`
     if (log.topics.length < 4 || log.topics[0] !== UNISWAP_V3_MINT_TOPIC) {
       throw new Error(`malformed Uniswap V3 Mint log ${logId}`)
@@ -643,7 +690,6 @@ export async function enumerateDirectCorePositions(
         `Uniswap V3 Mint log ${logId} is not credited to ${owner}`,
       )
     }
-    const pool = canonicalAddress(log.address)
     const tickLower = signedInt24(log.topics[2])
     const tickUpper = signedInt24(log.topics[3])
     const ranges =
@@ -676,50 +722,53 @@ export async function enumerateDirectCorePositions(
     }
     const token0 = canonicalAddress(identity.token0)
     const token1 = canonicalAddress(identity.token1)
-    // A direct position in a pool without stBTC is not an stBTC claim.
+    const creation = canonicalPools.get(pool)
     if (
-      sameAddress(token0, stbtcAddress) ||
-      sameAddress(token1, stbtcAddress)
+      !creation ||
+      token0 !== creation.token0 ||
+      token1 !== creation.token1 ||
+      identity.fee !== creation.fee
     ) {
-      if (!sameAddress(identity.factory, anchors.UNISWAP_V3_FACTORY)) {
-        throw new Error(
-          `stBTC pool ${pool} holding a direct position for ${owner} ` +
-            `reports non-canonical factory ${identity.factory}`,
-        )
-      }
-      const registeredPool = await reader.getRegisteredPool(
+      throw new Error(`stBTC pool ${pool} identity disagrees with PoolCreated`)
+    }
+    if (!sameAddress(identity.factory, anchors.UNISWAP_V3_FACTORY)) {
+      throw new Error(
+        `stBTC pool ${pool} holding a direct position for ${owner} ` +
+          `reports non-canonical factory ${identity.factory}`,
+      )
+    }
+    const registeredPool = await reader.getRegisteredPool(
+      token0,
+      token1,
+      identity.fee,
+    )
+    if (!sameAddress(registeredPool, pool)) {
+      throw new Error(
+        `stBTC pool ${pool} holding a direct position for ${owner} is ` +
+          `not the canonical factory's ${token0}/${token1}/${identity.fee} ` +
+          `pool (${registeredPool})`,
+      )
+    }
+    // eslint-disable-next-line no-restricted-syntax
+    for (const { tickLower, tickUpper } of ranges.values()) {
+      const key = solidityPackedKeccak256(
+        ["address", "int24", "int24"],
+        [owner, tickLower, tickUpper],
+      )
+      const position = await reader.getCorePosition(pool, key)
+      reports.push({
+        adapter: "uniswap-v3-core",
+        pool,
         token0,
         token1,
-        identity.fee,
-      )
-      if (!sameAddress(registeredPool, pool)) {
-        throw new Error(
-          `stBTC pool ${pool} holding a direct position for ${owner} is ` +
-            `not the canonical factory's ${token0}/${token1}/${identity.fee} ` +
-            `pool (${registeredPool})`,
-        )
-      }
-      // eslint-disable-next-line no-restricted-syntax
-      for (const { tickLower, tickUpper } of ranges.values()) {
-        const key = solidityPackedKeccak256(
-          ["address", "int24", "int24"],
-          [owner, tickLower, tickUpper],
-        )
-        const position = await reader.getCorePosition(pool, key)
-        reports.push({
-          adapter: "uniswap-v3-core",
-          pool,
-          token0,
-          token1,
-          fee: identity.fee,
-          owner,
-          tickLower,
-          tickUpper,
-          liquidity: position.liquidity,
-          tokensOwed0: position.tokensOwed0,
-          tokensOwed1: position.tokensOwed1,
-        })
-      }
+        fee: identity.fee,
+        owner,
+        tickLower,
+        tickUpper,
+        liquidity: position.liquidity,
+        tokensOwed0: position.tokensOwed0,
+        tokensOwed1: position.tokensOwed1,
+      })
     }
   }
   /* eslint-enable no-await-in-loop */
@@ -851,6 +900,7 @@ export function createEthersExternalStbtcReader(
   const getHistoricalLogs = async (
     cacheKey: string,
     filter: Filter,
+    fromBlock = anchors.STBTC_DEPLOYMENT_BLOCK,
   ): Promise<Log[]> => {
     await verifyHistoryBoundary()
     if (history) {
@@ -860,14 +910,46 @@ export function createEthersExternalStbtcReader(
         cacheKey,
         filter,
         blockNumber,
+        fromBlock,
       )
     }
-    return getLogsInChunks(
-      provider,
-      filter,
-      anchors.STBTC_DEPLOYMENT_BLOCK,
-      blockNumber,
-    )
+    return getLogsInChunks(provider, filter, fromBlock, blockNumber)
+  }
+
+  // Factory discovery starts at genesis: a pool can be created before
+  // stBTC itself has code. Share the result across owners at this hash and
+  // retain its raw logs across convergence passes using a distinct cache key.
+  let poolCreationLogs: Promise<Log[]> | undefined
+  const getStbtcPoolCreationLogs = (): Promise<Log[]> => {
+    if (!poolCreationLogs) {
+      poolCreationLogs = (async () => {
+        const token0Logs = await getHistoricalLogs(
+          "uniswap-stbtc-pools:token0",
+          {
+            address: anchors.UNISWAP_V3_FACTORY,
+            topics: [
+              UNISWAP_V3_POOL_CREATED_TOPIC,
+              paddedAddress(stbtcAddress),
+            ],
+          },
+          0,
+        )
+        const token1Logs = await getHistoricalLogs(
+          "uniswap-stbtc-pools:token1",
+          {
+            address: anchors.UNISWAP_V3_FACTORY,
+            topics: [
+              UNISWAP_V3_POOL_CREATED_TOPIC,
+              null,
+              paddedAddress(stbtcAddress),
+            ],
+          },
+          0,
+        )
+        return [...token0Logs, ...token1Logs]
+      })()
+    }
+    return poolCreationLogs
   }
 
   let protocolIdentityCheck: Promise<void> | undefined
@@ -1280,7 +1362,7 @@ export function createEthersExternalStbtcReader(
 
       // Direct (non-NFT) core positions: see enumerateDirectCorePositions.
       // The Mint query carries no pool address on purpose — every canonical
-      // stBTC pool is in scope, and the emitter is classified afterwards.
+      // stBTC pool is in scope; factory history authenticates each emitter.
       const corePositions = await enumerateDirectCorePositions(
         depositor,
         stbtcAddress,
@@ -1289,6 +1371,7 @@ export function createEthersExternalStbtcReader(
             getHistoricalLogs(`uniswap-core-mint:${canonicalAddress(owner)}`, {
               topics: [UNISWAP_V3_MINT_TOPIC, paddedAddress(owner)],
             }),
+          getStbtcPoolCreationLogs,
           getPoolIdentity: readPoolIdentity,
           getRegisteredPool: async (token0, token1, fee) =>
             canonicalAddress(

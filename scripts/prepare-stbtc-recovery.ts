@@ -8,6 +8,7 @@ import {
   evaluateExternalStbtcGate,
   getLogsInChunks,
   screenExternalStbtcHoldings,
+  verifyPortalSinkIdentity,
 } from "../helpers/external-stbtc"
 import * as anchors from "../helpers/recovery-anchors"
 import {
@@ -34,6 +35,7 @@ import {
   pinnedBlockContext,
   projectSettlementOutcome,
   projectedFeeOwed,
+  readLiveSettlementOwners,
   recomputeActiveReceiptDebt,
 } from "../helpers/recovery-preflight"
 import {
@@ -251,12 +253,20 @@ async function main() {
     anchors.IMPLEMENTATION_RUNTIME_HASH,
   )
 
+  const portal = new ethers.Contract(
+    addresses.portal,
+    [
+      "function tbtcToken() view returns (address)",
+      "function feeInfo(address) view returns (uint96 totalMinted,uint32 lastFeeUpdateAt,uint88 feeIntegral,uint8 annualFee,uint8 mintCap,address receiptToken,uint96 feeCollected)",
+      "function deposits(address,address,uint256) view returns (uint96 balance,uint32 unlockAt,uint96 receiptMinted,uint96 feeOwed,uint88 lastFeeIntegral,uint8 tbtcMigrationState,bool autoBridgingOptOut)",
+    ],
+    ethers.provider,
+  )
+
   // The execute-only external screen is the long pole: its first pass reads
-  // complete history from stBTC deployment. Run it before every mutable live
-  // gate, retain the raw logs, and catch up only missing tail ranges until the
-  // evaluated block remains latest. All core checks below are then pinned to
-  // that converged block. A late head check before serialization closes the
-  // shorter window occupied by those core checks.
+  // complete history. Establish the live settlement owners at each candidate
+  // hash, retain raw logs, and catch up missing tail ranges until the evaluated
+  // block is fresh. All remaining core checks use that converged block.
   let externalStbtcReview: unknown = {
     requiredAtStage: "execute",
     status: "not run during prepare stage",
@@ -264,13 +274,11 @@ async function main() {
   let externalStbtcFailure: string | undefined
   let block: Block
   if (STAGE === "execute") {
-    const depositors = Array.from(
-      new Set(
-        manifest.settlements.map((settlement) =>
-          ethers.getAddress(settlement.depositor),
-        ),
-      ),
-    )
+    const selectedEntries = manifest.settlements.map((settlement) => ({
+      depositor: settlement.depositor,
+      depositId: BigInt(settlement.depositId),
+      amountWei: BigInt(settlement.amountWei),
+    }))
     const history = createExternalStbtcLogHistory(
       addresses.tbtc,
       addresses.stbtc,
@@ -279,8 +287,34 @@ async function main() {
       const converged = await evaluateAtConvergedLatest<
         ExternalStbtcScreenReport,
         Block
-      >(ethers.provider, async (candidate) =>
-        screenExternalStbtcHoldings(
+      >(ethers.provider, async (candidate) => {
+        const { callOverrides: candidateOverrides } = pinnedBlockContext(
+          candidate.number,
+          candidate.hash,
+        )
+        // The reviewed Portal cannot re-mint debt into selected ids. Only
+        // this identity makes excluding permanently skipped owners safe.
+        await verifyPortalSinkIdentity(
+          ethers.provider,
+          candidateOverrides.blockTag,
+        )
+        const depositors = await readLiveSettlementOwners(
+          selectedEntries,
+          async (depositor, depositId) => {
+            const deposit = await portal.deposits(
+              depositor,
+              addresses.tbtc,
+              depositId,
+              candidateOverrides,
+            )
+            return {
+              balanceWei: BigInt(deposit.balance),
+              receiptMintedWei: BigInt(deposit.receiptMinted),
+              migrating: Number(deposit.tbtcMigrationState) !== 0,
+            }
+          },
+        )
+        return screenExternalStbtcHoldings(
           depositors,
           createEthersExternalStbtcReader(
             ethers.provider,
@@ -290,8 +324,8 @@ async function main() {
             candidate.hash,
             history,
           ),
-        ),
-      )
+        )
+      })
       block = converged.block
       const externalGate = evaluateExternalStbtcGate(
         converged.result,
@@ -400,15 +434,6 @@ async function main() {
     manifest.implementationRuntimeHash,
   )
 
-  const portal = new ethers.Contract(
-    addresses.portal,
-    [
-      "function tbtcToken() view returns (address)",
-      "function feeInfo(address) view returns (uint96 totalMinted,uint32 lastFeeUpdateAt,uint88 feeIntegral,uint8 annualFee,uint8 mintCap,address receiptToken,uint96 feeCollected)",
-      "function deposits(address,address,uint256) view returns (uint96 balance,uint32 unlockAt,uint96 receiptMinted,uint96 feeOwed,uint88 lastFeeIntegral,uint8 tbtcMigrationState,bool autoBridgingOptOut)",
-    ],
-    ethers.provider,
-  )
   const proxyAdminContract = new ethers.Contract(
     addresses.proxyAdmin,
     ["function owner() view returns (address)"],

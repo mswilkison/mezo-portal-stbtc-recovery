@@ -92,10 +92,11 @@ measure. This is precisely the case that matters: Threshold's own stranded
 balance came from exiting that Curve pool, so a selected depositor with a
 pool position is exactly the party this recovery could strand. Screening for
 it is therefore a mandatory review step, not something the contract can
-enforce. `npm run check:external-stbtc` replays every settled depositor's
-stBTC transfer history, reports where their receipt tokens went, and fails
-closed on a detected claim. An unreadable claim balance remains explicitly
-UNRESOLVED rather than being reset to zero and always blocks, even when the
+enforce. `npm run check:external-stbtc` replays the stBTC transfer history of
+each owner with a positive live settlement upper bound, reports where their
+receipt tokens went, and fails closed on a detected claim. An unreadable
+claim balance remains explicitly UNRESOLVED rather than being reset to zero
+and always blocks, even when the
 manual-review attestation is present. The reviewed Curve Router v1.1 and
 Uniswap V3 tBTC/stBTC destinations are handled by narrow protocol adapters:
 the former verifies its exact runtime/version and reconciles each stBTC input
@@ -103,13 +104,17 @@ transaction to a tBTC output returned to the same depositor, while the latter
 verifies the canonical factory, pool, and position-manager identities and
 re-reads every currently wallet-owned stBTC position NFT. It also enumerates
 every direct core `Mint` credited to each depositor in any pool (the query
-carries no pool address), classifies each emitting pool at the pinned block,
-requires any pool holding stBTC to be registered by the canonical factory,
-and re-reads every direct core position range, because Uniswap V3 does not
-require liquidity to be represented by an NFT and a third party can mint a
-core range directly to a depositor in any stBTC pool. Any nonzero position
-liquidity or uncollected amount blocks; an stBTC-holding emitter that cannot
-be classified as a canonical pool is UNRESOLVED. The persistent one-wei
+carries no pool address), authenticates emitters against the canonical
+factory's stBTC `PoolCreated` history, then verifies each pool's identity and
+registration at the pinned block and re-reads every direct core position
+range. Uniswap V3 does not require liquidity to be represented by an NFT and
+a third party can mint a core range directly to a depositor in any stBTC
+pool. Any nonzero position
+liquidity or uncollected amount blocks. Unauthenticated Mint emitters are
+ignored by this adapter; unrelated logs do not establish an stBTC claim.
+Unreadable authenticated pools remain UNRESOLVED. Factory discovery covers
+both token orderings from genesis, including pools created before stBTC
+deployment, and shares the incremental history cache. The persistent one-wei
 balances at those two contracts are therefore
 resolved by protocol evidence, never by a generic dust exception; code drift,
 receipt mismatch, or an unreadable position remains UNRESOLVED.
@@ -300,15 +305,22 @@ the endpoint after all dependent reads and requires its canonical hash to
 match.
 
 Execute adds a freshness phase around its longer external-position work. Its
-first pass scans complete raw Transfer, NFT ownership, and direct Uniswap Mint
-history from stBTC deployment through an initial head. If that scan outlives
+first pass verifies the Portal identity and reads selected deposits at the
+candidate hash. Only owners with a positive live settlement upper bound enter
+the external gate: fully repaid, withdrawn, or migrating selected deposits
+cannot settle, while temporary fee or wallet-capacity skips do not remove an
+owner. The standalone check applies the same scope at its evaluated block.
+It scans complete raw Transfer, NFT ownership, and direct Uniswap Mint
+history from stBTC deployment, plus canonical pool creation history from
+genesis, through an initial head. If that scan outlives
 the head, the preflight keeps the raw history and reruns the complete external
-evaluation at the newer hash while querying only each missing numeric tail.
+evaluation, including the live owner scope, at the newer hash while querying
+only each missing numeric tail.
 It accepts at most five passes and only when the evaluated block is still
 canonical and the head is at most one block past it immediately after a pass;
 a reorged committed boundary, head regression/replacement, incomplete query,
-or failure to converge is blocking. Only then does it read the Portal
-implementation and configuration, roles, balances, allowance, pause state,
+or failure to converge is blocking. It then performs the remaining core
+checks, including Portal configuration, roles, balances, allowance, pause state,
 deposits, fees, deployed recovery bytecode, and timelock operation at that
 same block hash. Immediately before serialization it revalidates the manifest
 snapshot and operational hash again and requires the head to be at most three

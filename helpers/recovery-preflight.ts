@@ -388,16 +388,22 @@ export function assertExactActiveDepositIds(
   }
 }
 
-export type SettlementProjectionInput = {
+export type SettlementRequest = {
   depositor: string
   depositId: bigint
   amountWei: bigint
+}
+
+export type LiveSettlementInput = SettlementRequest & {
   deposit: {
     balanceWei: bigint
     receiptMintedWei: bigint
     migrating: boolean
-    projectedFeeWei: bigint
   }
+}
+
+export type SettlementProjectionInput = LiveSettlementInput & {
+  deposit: { projectedFeeWei: bigint }
 }
 
 export type ProjectedSettlement = {
@@ -423,7 +429,7 @@ export type ProjectedSettlement = {
 // because a fee boundary or owner balance currently causes a live entry to
 // be skipped or clamped.
 export function maximumSettlementFromLiveDebt(
-  entries: readonly SettlementProjectionInput[],
+  entries: readonly LiveSettlementInput[],
 ): bigint {
   const remainingDeposit = new Map<string, bigint>()
   let maximumTotalWei = 0n
@@ -449,6 +455,39 @@ export function maximumSettlementFromLiveDebt(
   })
 
   return maximumTotalWei
+}
+
+// Only owners with a positive live upper bound can have debt settled by this
+// round. Re-read all selected ids at each evaluated block; fee projections
+// and wallet capacity must not exclude owners whose debt is still live.
+export async function readLiveSettlementOwners(
+  entries: readonly SettlementRequest[],
+  readDeposit: (
+    depositor: string,
+    depositId: bigint,
+  ) => Promise<LiveSettlementInput["deposit"]>,
+): Promise<string[]> {
+  const liveEntries = await Promise.all(
+    entries.map(async (entry) => {
+      const depositor = ethers.getAddress(entry.depositor)
+      return {
+        ...entry,
+        depositor,
+        deposit: await readDeposit(depositor, entry.depositId),
+      }
+    }),
+  )
+  const byOwner = new Map<string, LiveSettlementInput[]>()
+  liveEntries.forEach((entry) => {
+    const ownerEntries = byOwner.get(entry.depositor) ?? []
+    ownerEntries.push(entry)
+    byOwner.set(entry.depositor, ownerEntries)
+  })
+  return Array.from(byOwner.entries())
+    .filter(
+      ([, ownerEntries]) => maximumSettlementFromLiveDebt(ownerEntries) > 0n,
+    )
+    .map(([owner]) => owner)
 }
 
 // Execute-stage abort gates must still terminate nonzero, but only after the

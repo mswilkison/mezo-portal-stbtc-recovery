@@ -4,12 +4,18 @@ import {
   createEthersExternalStbtcReader,
   evaluateExternalStbtcGate,
   screenExternalStbtcHoldings,
+  verifyPortalSinkIdentity,
 } from "../helpers/external-stbtc"
+import * as anchors from "../helpers/recovery-anchors"
 import {
   assertManifestSnapshotCanonical,
   loadRecoveryManifest,
 } from "../helpers/recovery-manifest"
-import { assertPinnedBlockHashUnchanged } from "../helpers/recovery-preflight"
+import {
+  assertPinnedBlockHashUnchanged,
+  pinnedBlockContext,
+  readLiveSettlementOwners,
+} from "../helpers/recovery-preflight"
 
 // Produces the automated half of the selected-depositor external-stBTC
 // review. Transfer history can find direct recipient venues, but it cannot
@@ -22,8 +28,9 @@ import { assertPinnedBlockHashUnchanged } from "../helpers/recovery-preflight"
 //   RECOVERY_EXTERNAL_STBTC_REVIEW=I_CONFIRM_NO_EXTERNAL_STBTC_CLAIMS \
 //   npm run check:external-stbtc
 //
-// Set the confirmation only after manually checking every selected
-// depositor's controlled addresses and all LP/share/gauge/vault positions.
+// Set the confirmation only after manually checking every screened owner's
+// controlled addresses and all LP/share/gauge/vault positions. Owners whose
+// selected deposits can no longer settle are outside this round's gate.
 // If ownership or protocol coverage cannot be established, exclude that
 // depositor or reduce its settlement instead of attesting.
 
@@ -39,8 +46,34 @@ async function main() {
   }
   const blockNumber = block.number
   const stbtcAddress = manifest.addresses.stbtc
-  const depositors = Array.from(
-    new Set(manifest.settlements.map((s) => ethers.getAddress(s.depositor))),
+  const { callOverrides } = pinnedBlockContext(blockNumber, block.hash)
+  await verifyPortalSinkIdentity(ethers.provider, callOverrides.blockTag)
+  const portal = new ethers.Contract(
+    anchors.PORTAL,
+    [
+      "function deposits(address,address,uint256) view returns (uint96 balance,uint32 unlockAt,uint96 receiptMinted,uint96 feeOwed,uint88 lastFeeIntegral,uint8 tbtcMigrationState,bool autoBridgingOptOut)",
+    ],
+    ethers.provider,
+  )
+  const depositors = await readLiveSettlementOwners(
+    manifest.settlements.map((settlement) => ({
+      depositor: settlement.depositor,
+      depositId: BigInt(settlement.depositId),
+      amountWei: BigInt(settlement.amountWei),
+    })),
+    async (depositor, depositId) => {
+      const deposit = await portal.deposits(
+        depositor,
+        manifest.addresses.tbtc,
+        depositId,
+        callOverrides,
+      )
+      return {
+        balanceWei: BigInt(deposit.balance),
+        receiptMintedWei: BigInt(deposit.receiptMinted),
+        migrating: Number(deposit.tbtcMigrationState) !== 0,
+      }
+    },
   )
   const reader = createEthersExternalStbtcReader(
     ethers.provider,
@@ -67,7 +100,9 @@ async function main() {
     `stBTC external-holdings screen at block ${blockNumber} (${block.hash}, ` +
       "canonical hash revalidated after scan)",
   )
-  print(`token ${stbtcAddress}, ${depositors.length} settled depositors\n`)
+  print(
+    `token ${stbtcAddress}, ${depositors.length} owners with live selected debt\n`,
+  )
 
   report.depositors.forEach((depositor) => {
     print(depositor.depositor)

@@ -1,6 +1,7 @@
 import { expect } from "chai"
 import {
   Filter,
+  Interface,
   Log,
   Provider,
   getAddress,
@@ -45,6 +46,7 @@ import {
   pinnedBlockContext,
   projectSettlementOutcome,
   projectedFeeOwed,
+  readLiveSettlementOwners,
   recomputeActiveReceiptDebt,
 } from "../helpers/recovery-preflight"
 
@@ -394,6 +396,186 @@ describe("recovery preflight helpers", () => {
         evaluateExternalStbtcGate(report, EXTERNAL_STBTC_REVIEW_CONFIRMATION)
           .passed,
       ).to.equal(true)
+    })
+
+    ;[
+      {
+        state: "repaid",
+        balanceWei: 100n,
+        receiptMintedWei: 0n,
+        migrating: false,
+      },
+      {
+        state: "withdrawn",
+        balanceWei: 0n,
+        receiptMintedWei: 0n,
+        migrating: false,
+      },
+      {
+        state: "migrating",
+        balanceWei: 100n,
+        receiptMintedWei: 100n,
+        migrating: true,
+      },
+    ].forEach(({ state, ...inactiveDeposit }) => {
+      it(`does not gate the remaining round on a ${state} owner's external holdings`, async () => {
+        const activeOwner = "0x0000000000000000000000000000000000000003"
+        const entries = [depositor, activeOwner].map((owner) => ({
+          depositor: owner,
+          depositId: 1n,
+          amountWei: 100n,
+        }))
+        const owners = await readLiveSettlementOwners(entries, async (owner) =>
+          owner === depositor
+            ? inactiveDeposit
+            : {
+                balanceWei: 100n,
+                receiptMintedWei: 100n,
+                migrating: false,
+              },
+        )
+        expect(owners).to.deep.equal([activeOwner])
+        const checkedOwners: string[] = []
+        const report = await screenExternalStbtcHoldings(
+          owners,
+          reader({
+            getUniswapV3Positions: async (owner) => {
+              checkedOwners.push(owner)
+              if (owner === depositor) {
+                throw new Error("retired owner's venue is unreadable")
+              }
+              return []
+            },
+          }),
+        )
+        expect(checkedOwners).to.deep.equal([activeOwner])
+        expect(
+          evaluateExternalStbtcGate(report, EXTERNAL_STBTC_REVIEW_CONFIRMATION)
+            .passed,
+        ).to.equal(true)
+      })
+    })
+
+    it("keeps mixed-deposit owners in scope despite zero fee or wallet-capacity projections", async () => {
+      const entries = [1n, 2n].map((depositId) => ({
+        depositor,
+        depositId,
+        amountWei: 100n,
+        deposit: {
+          balanceWei: 100n,
+          receiptMintedWei: depositId === 1n ? 0n : 100n,
+          migrating: false,
+          projectedFeeWei: 10n,
+        },
+      }))
+      expect(
+        projectSettlementOutcome(entries, new Map([[depositor, 100n]]))
+          .projectedTotalWei,
+      ).to.equal(0n)
+      expect(
+        projectSettlementOutcome(
+          entries.map((entry) => ({
+            ...entry,
+            deposit: { ...entry.deposit, projectedFeeWei: 0n },
+          })),
+          new Map([[depositor, 0n]]),
+        ).projectedTotalWei,
+      ).to.equal(0n)
+      const owners = await readLiveSettlementOwners(
+        entries,
+        async (_, depositId) => entries[Number(depositId) - 1].deposit,
+      )
+      expect(owners).to.deep.equal([depositor])
+      const report = await screenExternalStbtcHoldings(
+        owners,
+        reader({
+          getSentTransfers: async () => [{ destination: venue, amountWei: 1n }],
+          getCode: async () => "0x01",
+          getTokenBalance: async () => 7n,
+        }),
+      )
+      expect(report.detectedClaimReasons).to.have.length(1)
+      expect(
+        evaluateExternalStbtcGate(report, EXTERNAL_STBTC_REVIEW_CONFIRMATION)
+          .passed,
+      ).to.equal(false)
+    })
+
+    it("recomputes live owner scope at each convergence candidate", async () => {
+      const activeOwner = "0x0000000000000000000000000000000000000003"
+      const entries = [depositor, activeOwner].map((owner) => ({
+        depositor: owner,
+        depositId: 1n,
+        amountWei: 100n,
+      }))
+      const block = (number: number) => ({
+        number,
+        hash: `0x${number.toString(16).padStart(64, "0")}`,
+      })
+      let latestReads = 0
+      const provider = {
+        getBlock: async (tag: number | "latest") => {
+          if (tag !== "latest") {
+            return block(tag)
+          }
+          latestReads += 1
+          return block(latestReads === 1 ? 10 : 12)
+        },
+      }
+      const evaluated: { hash: string; owners: string[] }[] = []
+      const converged = await evaluateAtConvergedLatest(
+        provider,
+        async (candidate) => {
+          const { callOverrides } = pinnedBlockContext(
+            candidate.number,
+            candidate.hash,
+          )
+          const owners = await readLiveSettlementOwners(
+            entries,
+            async (owner) => ({
+              balanceWei: 100n,
+              receiptMintedWei:
+                owner === depositor && callOverrides.blockTag === block(12).hash
+                  ? 0n
+                  : 100n,
+              migrating: false,
+            }),
+          )
+          evaluated.push({ hash: callOverrides.blockTag, owners })
+          return screenExternalStbtcHoldings(
+            owners,
+            reader({
+              getUniswapV3Positions: async (owner) => {
+                if (owner === depositor) {
+                  throw new Error("venue is unreadable")
+                }
+                return []
+              },
+            }),
+          )
+        },
+      )
+      expect(evaluated).to.deep.equal([
+        { hash: block(10).hash, owners: [depositor, activeOwner] },
+        { hash: block(12).hash, owners: [activeOwner] },
+      ])
+      expect(
+        evaluateExternalStbtcGate(
+          converged.result,
+          EXTERNAL_STBTC_REVIEW_CONFIRMATION,
+        ).passed,
+      ).to.equal(true)
+    })
+
+    it("does not exclude an owner whose selected debt cannot be read", async () => {
+      await expect(
+        readLiveSettlementOwners(
+          [{ depositor, depositId: 1n, amountWei: 100n }],
+          async () => {
+            throw new Error("deposit read unavailable")
+          },
+        ),
+      ).to.be.rejectedWith("deposit read unavailable")
     })
 
     it("blocks when Transfer history does not reconcile to the pinned balance", async () => {
@@ -781,11 +963,33 @@ describe("recovery preflight helpers", () => {
           fee: 500,
         },
       }
+      const factoryInterface = new Interface([
+        "event PoolCreated(address indexed token0,address indexed token1,uint24 indexed fee,int24 tickSpacing,address pool)",
+      ])
+      const poolCreationLog = (pool: string): Log => {
+        const identity = identities[pool]
+        const event = factoryInterface.getEvent("PoolCreated")
+        if (!event) {
+          throw new Error("missing PoolCreated event")
+        }
+        return {
+          address: anchors.UNISWAP_V3_FACTORY,
+          ...factoryInterface.encodeEventLog(event, [
+            identity.token0,
+            identity.token1,
+            identity.fee,
+            10,
+            pool,
+          ]),
+        } as unknown as Log
+      }
       const coreReader = (
         logs: Log[],
         overrides: Partial<UniswapV3CoreReader> = {},
       ): UniswapV3CoreReader => ({
         getDirectMintLogs: async () => logs,
+        getStbtcPoolCreationLogs: async () =>
+          Object.keys(identities).map(poolCreationLog),
         getPoolIdentity: async (pool) => {
           const identity = identities[pool]
           if (!identity) {
@@ -857,20 +1061,17 @@ describe("recovery preflight helpers", () => {
         expect(positions).to.deep.equal([])
       })
 
-      it("fails closed on an stBTC pool the canonical factory did not register", async () => {
-        const forkPool = getAddress(
-          "0x0000000000000000000000000000000000000f0f",
-        )
+      it("fails closed when authenticated pool registration or identity disagrees", async () => {
         await expect(
           enumerateDirectCorePositions(
             depositor,
             stbtc,
-            coreReader([mintLog(forkPool, -1, 1, 5)], {
-              getPoolIdentity: async () => identities[otherStbtcPool],
+            coreReader([mintLog(otherStbtcPool, -1, 1, 5)], {
+              getRegisteredPool: async () => anchoredPool,
             }),
           ),
         ).to.be.rejectedWith(
-          `stBTC pool ${forkPool} holding a direct position for ${getAddress(
+          `stBTC pool ${otherStbtcPool} holding a direct position for ${getAddress(
             depositor,
           )} is not the canonical factory's`,
         )
@@ -878,7 +1079,7 @@ describe("recovery preflight helpers", () => {
           enumerateDirectCorePositions(
             depositor,
             stbtc,
-            coreReader([mintLog(forkPool, -1, 1, 6)], {
+            coreReader([mintLog(otherStbtcPool, -1, 1, 6)], {
               getPoolIdentity: async () => ({
                 ...identities[otherStbtcPool],
                 factory: "0x000000000000000000000000000000000000dEaD",
@@ -886,21 +1087,103 @@ describe("recovery preflight helpers", () => {
             }),
           ),
         ).to.be.rejectedWith("reports non-canonical factory")
-      })
-
-      it("fails closed on an unclassifiable Mint emitter", async () => {
-        const emitter = getAddress("0x0000000000000000000000000000000000000e0e")
         await expect(
           enumerateDirectCorePositions(
             depositor,
             stbtc,
-            coreReader([mintLog(emitter, -1, 1, 7)]),
+            coreReader([mintLog(otherStbtcPool, -1, 1, 6)], {
+              getPoolIdentity: async () => identities[unrelatedPool],
+            }),
           ),
-        ).to.be.rejectedWith(
-          `Uniswap V3 Mint emitter ${emitter} credited ${getAddress(
-            depositor,
-          )} with a direct position but cannot be classified as a pool`,
+        ).to.be.rejectedWith("identity disagrees with PoolCreated")
+      })
+
+      it("ignores unauthenticated emitters before parsing logs or reading identity", async () => {
+        const emitter = getAddress("0x0000000000000000000000000000000000000e0e")
+        let identityReads = 0
+        const positions = await enumerateDirectCorePositions(
+          depositor,
+          stbtc,
+          coreReader(
+            [
+              mintLog(emitter, -1, 1, 7),
+              {
+                ...mintLog(emitter, -1, 1, 8),
+                topics: [mintTopic],
+              } as unknown as Log,
+              mintLog(unrelatedPool, -1, 1, 9),
+            ],
+            {
+              getPoolIdentity: async () => {
+                identityReads += 1
+                throw new Error("token0 unavailable")
+              },
+            },
+          ),
         )
+        expect(identityReads).to.equal(0)
+        expect(positions).to.deep.equal([])
+        const report = await screenExternalStbtcHoldings(
+          [depositor],
+          reader({ getUniswapV3Positions: async () => positions }),
+        )
+        expect(
+          evaluateExternalStbtcGate(report, EXTERNAL_STBTC_REVIEW_CONFIRMATION)
+            .passed,
+        ).to.equal(true)
+      })
+
+      it("keeps authenticated catalog, identity and position failures blocking", async () => {
+        const unavailable = async (): Promise<never> => {
+          throw new Error("canonical read unavailable")
+        }
+        const overrides: Partial<UniswapV3CoreReader>[] = [
+          { getStbtcPoolCreationLogs: unavailable },
+          { getPoolIdentity: unavailable },
+          { getRegisteredPool: unavailable },
+          { getCorePosition: unavailable },
+        ]
+        await Promise.all(
+          overrides.map(async (override) => {
+            const report = await screenExternalStbtcHoldings(
+              [depositor],
+              reader({
+                getUniswapV3Positions: () =>
+                  enumerateDirectCorePositions(
+                    depositor,
+                    stbtc,
+                    coreReader([mintLog(otherStbtcPool, -1, 1, 7)], override),
+                  ),
+              }),
+            )
+            expect(report.unverifiableReasons[0]).to.include(
+              "canonical read unavailable",
+            )
+            expect(
+              evaluateExternalStbtcGate(
+                report,
+                EXTERNAL_STBTC_REVIEW_CONFIRMATION,
+              ).passed,
+            ).to.equal(false)
+          }),
+        )
+      })
+
+      it("rejects pool creation evidence from an unrelated factory", async () => {
+        await expect(
+          enumerateDirectCorePositions(
+            depositor,
+            stbtc,
+            coreReader([mintLog(otherStbtcPool, -1, 1, 7)], {
+              getStbtcPoolCreationLogs: async () => [
+                {
+                  ...poolCreationLog(otherStbtcPool),
+                  address: unrelatedPool,
+                } as Log,
+              ],
+            }),
+          ),
+        ).to.be.rejectedWith("non-canonical factory")
       })
 
       it("rejects Mint logs that are not credited to the depositor", async () => {
@@ -1013,6 +1296,50 @@ describe("recovery preflight helpers", () => {
           16,
         ),
       ).to.be.rejectedWith("changed filters")
+    })
+
+    it("retains pre-deployment factory history and binds its starting block", async () => {
+      const ranges: number[][] = []
+      const provider = {
+        getLogs: async (filter: Filter) => {
+          ranges.push([Number(filter.fromBlock), Number(filter.toBlock)])
+          return Number(filter.fromBlock) === 0
+            ? [
+                {
+                  blockNumber: 5,
+                  transactionHash: `0x${"12".repeat(32)}`,
+                  index: 0,
+                } as Log,
+              ]
+            : []
+        },
+      }
+      const history = createExternalStbtcLogHistory(depositor, venue, 10)
+      const filter = { address: anchors.UNISWAP_V3_FACTORY }
+      await extendExternalStbtcLogHistory(
+        provider,
+        history,
+        "factory",
+        filter,
+        12,
+        0,
+      )
+      const refreshed = await extendExternalStbtcLogHistory(
+        provider,
+        history,
+        "factory",
+        filter,
+        15,
+        0,
+      )
+      expect(ranges).to.deep.equal([
+        [0, 12],
+        [13, 15],
+      ])
+      expect(refreshed.map((log) => log.blockNumber)).to.deep.equal([5])
+      await expect(
+        extendExternalStbtcLogHistory(provider, history, "factory", filter, 15),
+      ).to.be.rejectedWith("changed start block")
     })
 
     it("pins the Portal sink to the reviewed implementation", async () => {
