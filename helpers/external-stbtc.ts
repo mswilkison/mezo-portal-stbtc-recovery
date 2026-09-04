@@ -77,6 +77,10 @@ export type ExternalStbtcNftPositionReport = {
 
 export type ExternalStbtcCorePositionReport = {
   adapter: "uniswap-v3-core"
+  pool: string
+  token0: string
+  token1: string
+  fee: number
   owner: string
   tickLower: number
   tickUpper: number
@@ -464,7 +468,8 @@ export async function screenExternalStbtcHoldings(
           const positionId =
             position.adapter === "uniswap-v3-nft"
               ? `NFT ${position.tokenId.toString()}`
-              : `core range ${position.tickLower}/${position.tickUpper}`
+              : `core range ${position.tickLower}/${position.tickUpper} ` +
+                `in pool ${position.pool}`
           detectedClaimReasons.push(
             `${depositor} owns Uniswap V3 ${positionId} ` +
               `with liquidity ${position.liquidity.toString()} and owed ` +
@@ -568,6 +573,157 @@ function requireRuntimeHash(
 
 function addressFromStorageWord(word: string): string {
   return canonicalAddress(`0x${word.slice(-40)}`)
+}
+
+export type UniswapV3PoolIdentity = {
+  factory: string
+  token0: string
+  token1: string
+  fee: number
+}
+
+export type UniswapV3CorePositionState = {
+  liquidity: bigint
+  tokensOwed0: bigint
+  tokensOwed1: bigint
+}
+
+// Pinned-block primitives behind the direct core-position scan, separated
+// from the ethers wiring so the classification rules can be tested without
+// an archive RPC.
+export type UniswapV3CoreReader = {
+  // Every `Mint` log whose indexed owner is the depositor, from ANY emitting
+  // contract, over the complete stBTC history range.
+  getDirectMintLogs(owner: string): Promise<Log[]>
+  // factory()/token0()/token1()/fee() of an emitting contract; must throw
+  // when the emitter does not answer like a Uniswap V3 pool.
+  getPoolIdentity(pool: string): Promise<UniswapV3PoolIdentity>
+  // Canonical factory registration for a pair and fee tier.
+  getRegisteredPool(
+    token0: string,
+    token1: string,
+    fee: number,
+  ): Promise<string>
+  getCorePosition(
+    pool: string,
+    key: string,
+  ): Promise<UniswapV3CorePositionState>
+}
+
+// Uniswap V3 core lets any contract mint a position to an arbitrary owner
+// without the canonical NFT manager, and the owner is indexed in every pool's
+// Mint event. Enumerate every range ever minted to the depositor in ANY pool
+// (an address-less log query), classify each emitting pool at the pinned
+// block, and re-read the live position key for every range in a pool that
+// holds stBTC. Restricting the query to the one anchored tBTC/stBTC pool
+// would miss a range in any other stBTC pool — including one somebody else
+// funded, which the depositor's own stBTC transfer history cannot discover
+// either. An stBTC-holding emitter that is not a canonical-factory pool, or
+// an emitter that cannot be classified at all, is an unclassifiable claim
+// and fails closed (throws, so the screen reports UNRESOLVED) rather than
+// being skipped.
+export async function enumerateDirectCorePositions(
+  depositor: string,
+  stbtcAddress: string,
+  reader: UniswapV3CoreReader,
+): Promise<ExternalStbtcCorePositionReport[]> {
+  const owner = canonicalAddress(depositor)
+  const mintLogs = await reader.getDirectMintLogs(owner)
+  const rangesByPool = new Map<
+    string,
+    Map<string, { tickLower: number; tickUpper: number }>
+  >()
+  mintLogs.forEach((log) => {
+    const logId = `${log.transactionHash}:${log.index}`
+    if (log.topics.length < 4 || log.topics[0] !== UNISWAP_V3_MINT_TOPIC) {
+      throw new Error(`malformed Uniswap V3 Mint log ${logId}`)
+    }
+    if (!sameAddress(addressFromTopic(log.topics[1]), owner)) {
+      throw new Error(
+        `Uniswap V3 Mint log ${logId} is not credited to ${owner}`,
+      )
+    }
+    const pool = canonicalAddress(log.address)
+    const tickLower = signedInt24(log.topics[2])
+    const tickUpper = signedInt24(log.topics[3])
+    const ranges =
+      rangesByPool.get(pool) ??
+      new Map<string, { tickLower: number; tickUpper: number }>()
+    ranges.set(`${tickLower}:${tickUpper}`, { tickLower, tickUpper })
+    rangesByPool.set(pool, ranges)
+  })
+
+  const reports: ExternalStbtcCorePositionReport[] = []
+  const pools = Array.from(rangesByPool.entries()).sort(([left], [right]) => {
+    if (left === right) {
+      return 0
+    }
+    return left < right ? -1 : 1
+  })
+  // Sequential and sorted: deterministic report order and bounded fan-out
+  // against rate-limited archive providers.
+  /* eslint-disable no-await-in-loop */
+  // eslint-disable-next-line no-restricted-syntax
+  for (const [pool, ranges] of pools) {
+    let identity: UniswapV3PoolIdentity
+    try {
+      identity = await reader.getPoolIdentity(pool)
+    } catch (error) {
+      throw new Error(
+        `Uniswap V3 Mint emitter ${pool} credited ${owner} with a direct ` +
+          `position but cannot be classified as a pool: ${errorMessage(error)}`,
+      )
+    }
+    const token0 = canonicalAddress(identity.token0)
+    const token1 = canonicalAddress(identity.token1)
+    // A direct position in a pool without stBTC is not an stBTC claim.
+    if (
+      sameAddress(token0, stbtcAddress) ||
+      sameAddress(token1, stbtcAddress)
+    ) {
+      if (!sameAddress(identity.factory, anchors.UNISWAP_V3_FACTORY)) {
+        throw new Error(
+          `stBTC pool ${pool} holding a direct position for ${owner} ` +
+            `reports non-canonical factory ${identity.factory}`,
+        )
+      }
+      const registeredPool = await reader.getRegisteredPool(
+        token0,
+        token1,
+        identity.fee,
+      )
+      if (!sameAddress(registeredPool, pool)) {
+        throw new Error(
+          `stBTC pool ${pool} holding a direct position for ${owner} is ` +
+            `not the canonical factory's ${token0}/${token1}/${identity.fee} ` +
+            `pool (${registeredPool})`,
+        )
+      }
+      // eslint-disable-next-line no-restricted-syntax
+      for (const { tickLower, tickUpper } of ranges.values()) {
+        const key = solidityPackedKeccak256(
+          ["address", "int24", "int24"],
+          [owner, tickLower, tickUpper],
+        )
+        const position = await reader.getCorePosition(pool, key)
+        reports.push({
+          adapter: "uniswap-v3-core",
+          pool,
+          token0,
+          token1,
+          fee: identity.fee,
+          owner,
+          tickLower,
+          tickUpper,
+          liquidity: position.liquidity,
+          tokensOwed0: position.tokensOwed0,
+          tokensOwed1: position.tokensOwed1,
+        })
+      }
+    }
+  }
+  /* eslint-enable no-await-in-loop */
+  return reports
 }
 
 // The Portal is an intentional terminal sink for stBTC: repayReceipt pulls
@@ -881,6 +1037,33 @@ export function createEthersExternalStbtcReader(
     }
   }
 
+  // Pool identities are immutable, so one read per emitting contract serves
+  // every depositor screened through this reader.
+  const poolIdentities = new Map<string, Promise<UniswapV3PoolIdentity>>()
+  const readPoolIdentity = (pool: string): Promise<UniswapV3PoolIdentity> => {
+    const key = canonicalAddress(pool)
+    let pending = poolIdentities.get(key)
+    if (!pending) {
+      pending = (async () => {
+        const contract = new Contract(key, UNISWAP_V3_POOL_ABI, provider)
+        const [factory, token0, token1, fee] = await Promise.all([
+          contract.factory(callOverrides),
+          contract.token0(callOverrides),
+          contract.token1(callOverrides),
+          contract.fee(callOverrides),
+        ])
+        return {
+          factory: canonicalAddress(factory),
+          token0: canonicalAddress(token0),
+          token1: canonicalAddress(token1),
+          fee: Number(fee),
+        }
+      })()
+      poolIdentities.set(key, pending)
+    }
+    return pending
+  }
+
   return {
     async getSentTransfers(depositor) {
       const logs = await getHistoricalLogs(
@@ -1095,53 +1278,35 @@ export function createEthersExternalStbtcReader(
           position !== undefined,
       )
 
-      // Uniswap V3 core permits callers to own positions directly, without
-      // the canonical NFT manager. The owner is indexed in every pool Mint
-      // event, so enumerate every range ever minted to this depositor and
-      // read the live position key at the same pinned block. This also finds
-      // positions funded by somebody else, which stBTC transfer history from
-      // the depositor alone cannot discover.
-      const directMintLogs = await getHistoricalLogs(
-        `uniswap-core-mint:${canonicalAddress(depositor)}`,
+      // Direct (non-NFT) core positions: see enumerateDirectCorePositions.
+      // The Mint query carries no pool address on purpose — every canonical
+      // stBTC pool is in scope, and the emitter is classified afterwards.
+      const corePositions = await enumerateDirectCorePositions(
+        depositor,
+        stbtcAddress,
         {
-          address: anchors.UNISWAP_V3_TBTC_STBTC_POOL,
-          topics: [UNISWAP_V3_MINT_TOPIC, paddedAddress(depositor)],
-        },
-      )
-      const directRanges = new Map<
-        string,
-        { tickLower: number; tickUpper: number }
-      >()
-      directMintLogs.forEach((log) => {
-        if (log.topics.length < 4) {
-          throw new Error(`malformed Uniswap V3 Mint log ${log.index}`)
-        }
-        const tickLower = signedInt24(log.topics[2])
-        const tickUpper = signedInt24(log.topics[3])
-        directRanges.set(`${tickLower}:${tickUpper}`, {
-          tickLower,
-          tickUpper,
-        })
-      })
-      const corePositions = await Promise.all(
-        Array.from(directRanges.values()).map(
-          async ({ tickLower, tickUpper }) => {
-            const key = solidityPackedKeccak256(
-              ["address", "int24", "int24"],
-              [depositor, tickLower, tickUpper],
-            )
-            const position = await uniswapPool.positions(key, callOverrides)
+          getDirectMintLogs: (owner) =>
+            getHistoricalLogs(`uniswap-core-mint:${canonicalAddress(owner)}`, {
+              topics: [UNISWAP_V3_MINT_TOPIC, paddedAddress(owner)],
+            }),
+          getPoolIdentity: readPoolIdentity,
+          getRegisteredPool: async (token0, token1, fee) =>
+            canonicalAddress(
+              await uniswapFactory.getPool(token0, token1, fee, callOverrides),
+            ),
+          getCorePosition: async (pool, key) => {
+            const position = await new Contract(
+              pool,
+              UNISWAP_V3_POOL_ABI,
+              provider,
+            ).positions(key, callOverrides)
             return {
-              adapter: "uniswap-v3-core" as const,
-              owner: canonicalAddress(depositor),
-              tickLower,
-              tickUpper,
               liquidity: BigInt(position[0]),
               tokensOwed0: BigInt(position[3]),
               tokensOwed1: BigInt(position[4]),
             }
           },
-        ),
+        },
       )
       return [...filteredNftPositions, ...corePositions]
     },

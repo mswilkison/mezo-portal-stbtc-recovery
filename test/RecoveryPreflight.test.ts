@@ -1,12 +1,23 @@
 import { expect } from "chai"
-import { Filter, Log, Provider, zeroPadValue } from "ethers"
+import {
+  Filter,
+  Log,
+  Provider,
+  getAddress,
+  id,
+  toBeHex,
+  zeroPadValue,
+} from "ethers"
 import { readFileSync } from "fs"
 import { artifacts } from "hardhat"
 import { join } from "path"
 import {
   EXTERNAL_STBTC_REVIEW_CONFIRMATION,
   ExternalStbtcReader,
+  UniswapV3CoreReader,
+  UniswapV3PoolIdentity,
   createExternalStbtcLogHistory,
+  enumerateDirectCorePositions,
   evaluateExternalStbtcGate,
   extendExternalStbtcLogHistory,
   getLogsInChunks,
@@ -201,6 +212,36 @@ describe("recovery preflight helpers", () => {
     )
   })
 
+  it("rejects settlement active-deposit ids that are not decimal strings", () => {
+    const valid = loadRecoveryManifest()
+    const settlement = valid.settlements[0]
+    // BigInt() would coerce "" to 0 and accept hex, so calldata could carry
+    // an id governance never reviewed; hold these to the exclusion-list rule.
+    const malformedIds: unknown[] = ["", " 77", "0x4d", "77.0", "-1", 77]
+    malformedIds.forEach((depositId) => {
+      expect(() =>
+        validateManifestShape({
+          ...valid,
+          settlements: [
+            {
+              ...settlement,
+              depositorActiveDepositIds: [depositId, settlement.depositId],
+            },
+          ],
+        } as unknown as RecoveryManifest),
+      ).to.throw(
+        "settlements[0].depositorActiveDepositIds[0] must be a decimal wei string",
+      )
+    })
+    expect(() =>
+      validateManifestShape({
+        ...valid,
+        settlements: [{ ...settlement, depositor: 42 }],
+      } as unknown as RecoveryManifest),
+    ).to.throw("settlements[0].depositor must be a string")
+    expect(() => validateManifestShape(valid)).not.to.throw()
+  })
+
   it("keeps manifest generation independent of the current pin", () => {
     const generatorSource = readFileSync(
       join(__dirname, "..", "scripts", "generate-stbtc-recovery-manifest.ts"),
@@ -254,6 +295,47 @@ describe("recovery preflight helpers", () => {
     expect(operationGate).to.be.greaterThan(-1)
     expect(operationBlock).to.include("appendDeferredFailure")
     expect(operationBlock).not.to.include("fail(")
+
+    // Funding/receipt-debt sufficiency and the deployed-implementation
+    // verification run after deferred failures may already be recorded and
+    // before the output is emitted, so they must defer too — otherwise a
+    // scheduled batch whose funding or implementation moved would abort
+    // with a bare stack trace and no cancel calldata.
+    const sufficiencyGate = preflightSource.indexOf(
+      "const sufficiencyProblems: string[] = []",
+    )
+    const driftReport = preflightSource.indexOf(
+      "if (driftMessages.length > 0)",
+      sufficiencyGate,
+    )
+    const sufficiencyBlock = preflightSource.slice(sufficiencyGate, driftReport)
+    expect(sufficiencyGate).to.be.greaterThan(allowanceGate)
+    expect(driftReport).to.be.greaterThan(sufficiencyGate)
+    expect(sufficiencyBlock).to.include("appendDeferredFailure")
+    expect(sufficiencyBlock).not.to.include("fail(")
+
+    const deployedVerification = preflightSource.indexOf(
+      "const recoveryProblems: string[] = []",
+    )
+    const deployedBlock = preflightSource.slice(
+      deployedVerification,
+      operationGate,
+    )
+    expect(deployedVerification).to.be.greaterThan(sufficiencyGate)
+    expect(deployedVerification).to.be.lessThan(operationGate)
+    expect(deployedBlock).to.include("appendDeferredFailure")
+    expect(deployedBlock).to.include("verifyRecoveryBytecode(")
+    expect(deployedBlock).not.to.include("fail(")
+
+    // The execute stage must demand RECOVERY_IMPLEMENTATION before the
+    // deployment-to-head archive scan, not after it.
+    const implementationGuard = preflightSource.indexOf(
+      "RECOVERY_STAGE=execute requires RECOVERY_IMPLEMENTATION",
+    )
+    expect(implementationGuard).to.be.greaterThan(-1)
+    expect(implementationGuard).to.be.lessThan(
+      preflightSource.indexOf("await evaluateAtConvergedLatest"),
+    )
 
     const finalStatus = preflightSource.indexOf(
       "output.preflightPassed =",
@@ -575,6 +657,10 @@ describe("recovery preflight helpers", () => {
           getUniswapV3Positions: async () => [
             {
               adapter: "uniswap-v3-core",
+              pool: "0x0000000000000000000000000000000000000005",
+              token0: "0x0000000000000000000000000000000000000003",
+              token1: "0x0000000000000000000000000000000000000004",
+              fee: 3000,
               owner: depositor,
               tickLower: -200,
               tickUpper: 200,
@@ -591,6 +677,9 @@ describe("recovery preflight helpers", () => {
           .passed,
       ).to.equal(false)
       expect(report.detectedClaimReasons[0]).to.include("core range -200/200")
+      expect(report.detectedClaimReasons[0]).to.include(
+        "in pool 0x0000000000000000000000000000000000000005",
+      )
     })
 
     it("accepts a fully collected canonical Uniswap V3 stBTC position", async () => {
@@ -636,6 +725,193 @@ describe("recovery preflight helpers", () => {
       expect(report.unverifiableReasons[0]).to.include(
         "position manager code drift",
       )
+    })
+
+    describe("direct Uniswap V3 core positions", () => {
+      const stbtc = getAddress("0x00000000000000000000000000000000000000aa")
+      const tbtc = getAddress("0x00000000000000000000000000000000000000bb")
+      const wbtc = getAddress("0x00000000000000000000000000000000000000cc")
+      const anchoredPool = anchors.UNISWAP_V3_TBTC_STBTC_POOL
+      const otherStbtcPool = getAddress(
+        "0x0000000000000000000000000000000000000b0b",
+      )
+      const unrelatedPool = getAddress(
+        "0x0000000000000000000000000000000000000c0c",
+      )
+      const mintTopic = id(
+        "Mint(address,address,int24,int24,uint128,uint256,uint256)",
+      )
+      const tick = (value: number) =>
+        toBeHex(BigInt.asUintN(256, BigInt(value)), 32)
+      const mintLog = (
+        pool: string,
+        tickLower: number,
+        tickUpper: number,
+        index: number,
+        owner = depositor,
+      ): Log =>
+        ({
+          address: pool,
+          topics: [
+            mintTopic,
+            zeroPadValue(owner, 32),
+            tick(tickLower),
+            tick(tickUpper),
+          ],
+          transactionHash: `0x${index.toString(16).padStart(64, "0")}`,
+          index,
+        }) as unknown as Log
+      const identities: Record<string, UniswapV3PoolIdentity> = {
+        [anchoredPool]: {
+          factory: anchors.UNISWAP_V3_FACTORY,
+          token0: tbtc,
+          token1: stbtc,
+          fee: 10000,
+        },
+        [otherStbtcPool]: {
+          factory: anchors.UNISWAP_V3_FACTORY,
+          token0: stbtc,
+          token1: wbtc,
+          fee: 3000,
+        },
+        [unrelatedPool]: {
+          factory: anchors.UNISWAP_V3_FACTORY,
+          token0: tbtc,
+          token1: wbtc,
+          fee: 500,
+        },
+      }
+      const coreReader = (
+        logs: Log[],
+        overrides: Partial<UniswapV3CoreReader> = {},
+      ): UniswapV3CoreReader => ({
+        getDirectMintLogs: async () => logs,
+        getPoolIdentity: async (pool) => {
+          const identity = identities[pool]
+          if (!identity) {
+            throw new Error(`no token0() at ${pool}`)
+          }
+          return identity
+        },
+        getRegisteredPool: async (token0, token1, fee) =>
+          Object.entries(identities).find(
+            ([, identity]) =>
+              identity.token0 === token0 &&
+              identity.token1 === token1 &&
+              identity.fee === fee,
+          )?.[0] ?? "0x0000000000000000000000000000000000000000",
+        getCorePosition: async () => ({
+          liquidity: 7n,
+          tokensOwed0: 0n,
+          tokensOwed1: 0n,
+        }),
+        ...overrides,
+      })
+
+      it("finds a range in a non-anchored canonical stBTC pool", async () => {
+        const positions = await enumerateDirectCorePositions(
+          depositor,
+          stbtc,
+          coreReader([
+            mintLog(anchoredPool, -100, 100, 1),
+            mintLog(otherStbtcPool, -200, 200, 2),
+            // A repeated mint into the same range is one position key.
+            mintLog(otherStbtcPool, -200, 200, 3),
+          ]),
+        )
+
+        expect(
+          positions.map((position) => [
+            position.pool,
+            position.tickLower,
+            position.tickUpper,
+            position.fee,
+            position.liquidity,
+          ]),
+        ).to.deep.equal([
+          [otherStbtcPool, -200, 200, 3000, 7n],
+          [anchoredPool, -100, 100, 10000, 7n],
+        ])
+        expect(positions[0].token0).to.equal(stbtc)
+        expect(positions[0].owner).to.equal(getAddress(depositor))
+
+        const report = await screenExternalStbtcHoldings(
+          [depositor],
+          reader({ getUniswapV3Positions: async () => positions }),
+        )
+        expect(
+          evaluateExternalStbtcGate(report, EXTERNAL_STBTC_REVIEW_CONFIRMATION)
+            .passed,
+        ).to.equal(false)
+        expect(report.detectedClaimReasons[0]).to.include(
+          `core range -200/200 in pool ${otherStbtcPool}`,
+        )
+      })
+
+      it("ignores direct ranges in pools without stBTC", async () => {
+        const positions = await enumerateDirectCorePositions(
+          depositor,
+          stbtc,
+          coreReader([mintLog(unrelatedPool, -10, 10, 4)]),
+        )
+        expect(positions).to.deep.equal([])
+      })
+
+      it("fails closed on an stBTC pool the canonical factory did not register", async () => {
+        const forkPool = getAddress(
+          "0x0000000000000000000000000000000000000f0f",
+        )
+        await expect(
+          enumerateDirectCorePositions(
+            depositor,
+            stbtc,
+            coreReader([mintLog(forkPool, -1, 1, 5)], {
+              getPoolIdentity: async () => identities[otherStbtcPool],
+            }),
+          ),
+        ).to.be.rejectedWith(
+          `stBTC pool ${forkPool} holding a direct position for ${getAddress(
+            depositor,
+          )} is not the canonical factory's`,
+        )
+        await expect(
+          enumerateDirectCorePositions(
+            depositor,
+            stbtc,
+            coreReader([mintLog(forkPool, -1, 1, 6)], {
+              getPoolIdentity: async () => ({
+                ...identities[otherStbtcPool],
+                factory: "0x000000000000000000000000000000000000dEaD",
+              }),
+            }),
+          ),
+        ).to.be.rejectedWith("reports non-canonical factory")
+      })
+
+      it("fails closed on an unclassifiable Mint emitter", async () => {
+        const emitter = getAddress("0x0000000000000000000000000000000000000e0e")
+        await expect(
+          enumerateDirectCorePositions(
+            depositor,
+            stbtc,
+            coreReader([mintLog(emitter, -1, 1, 7)]),
+          ),
+        ).to.be.rejectedWith(
+          `Uniswap V3 Mint emitter ${emitter} credited ${getAddress(
+            depositor,
+          )} with a direct position but cannot be classified as a pool`,
+        )
+      })
+
+      it("rejects Mint logs that are not credited to the depositor", async () => {
+        await expect(
+          enumerateDirectCorePositions(
+            depositor,
+            stbtc,
+            coreReader([mintLog(otherStbtcPool, -1, 1, 8, venue)]),
+          ),
+        ).to.be.rejectedWith("is not credited to")
+      })
     })
 
     it("adapts capped archive log ranges without gaps", async () => {
@@ -835,9 +1111,11 @@ describe("recovery preflight helpers", () => {
     })
     const canonical = new Map([
       [10, block(10)],
-      [11, block(11)],
+      [12, block(12)],
     ])
-    const latest = [block(10), block(11), block(11)]
+    // Two blocks arrive during the first pass: beyond the one-block
+    // convergence tolerance, so the scan must be refreshed at the new head.
+    const latest = [block(10), block(12), block(12)]
     let latestRead = 0
     const provider = {
       getBlock: async (blockTag: number | "latest") => {
@@ -863,14 +1141,64 @@ describe("recovery preflight helpers", () => {
       3,
     )
 
-    expect(evaluated).to.deep.equal([10, 11])
+    expect(evaluated).to.deep.equal([10, 12])
     expect(converged.initialBlock.number).to.equal(10)
-    expect(converged.block.number).to.equal(11)
+    expect(converged.block.number).to.equal(12)
     expect(converged.passes).to.equal(2)
+    expect(converged.headLagBlocks).to.equal(0)
     expect(converged.result).to.deep.equal({
-      walletBalanceWei: 11n,
-      externalTransferCount: 2,
+      walletBalanceWei: 12n,
+      externalTransferCount: 3,
     })
+  })
+
+  it("accepts a converged pass at most one block behind the head", async () => {
+    const block = (number: number) => ({
+      number,
+      hash: `0x${number.toString(16).padStart(64, "0")}`,
+    })
+    const latest = [block(10), block(11)]
+    let latestRead = 0
+    const provider = {
+      getBlock: async (blockTag: number | "latest") => {
+        if (blockTag === "latest") {
+          const resolved = latest[latestRead] ?? latest[latest.length - 1]
+          latestRead += 1
+          return resolved
+        }
+        return block(blockTag)
+      },
+    }
+    const evaluated: number[] = []
+
+    const converged = await evaluateAtConvergedLatest(
+      provider,
+      async (candidate) => {
+        evaluated.push(candidate.number)
+        return candidate.number
+      },
+      3,
+    )
+    expect(evaluated).to.deep.equal([10])
+    expect(converged.block.number).to.equal(10)
+    expect(converged.passes).to.equal(1)
+    expect(converged.headLagBlocks).to.equal(1)
+
+    // Exact convergence remains available to callers that ask for it.
+    latestRead = 0
+    evaluated.length = 0
+    const exact = await evaluateAtConvergedLatest(
+      provider,
+      async (candidate) => {
+        evaluated.push(candidate.number)
+        return candidate.number
+      },
+      3,
+      0,
+    )
+    expect(evaluated).to.deep.equal([10, 11])
+    expect(exact.block.number).to.equal(11)
+    expect(exact.headLagBlocks).to.equal(0)
   })
 
   it("fails closed when latest-state evaluation cannot converge", async () => {
@@ -878,7 +1206,9 @@ describe("recovery preflight helpers", () => {
       number,
       hash: `0x${number.toString(16).padStart(64, "0")}`,
     })
-    const latest = [block(20), block(21), block(22), block(23)]
+    // Each pass falls two blocks behind: never within the convergence
+    // tolerance, so the bounded loop must give up.
+    const latest = [block(20), block(22), block(24), block(26)]
     let latestRead = 0
     const provider = {
       getBlock: async (blockTag: number | "latest") => {
@@ -902,7 +1232,7 @@ describe("recovery preflight helpers", () => {
         3,
       ),
     ).to.be.rejectedWith("advanced during all 3 state evaluation passes")
-    expect(evaluated).to.deep.equal([20, 21, 22])
+    expect(evaluated).to.deep.equal([20, 22, 24])
   })
 
   it("rejects a reorged history boundary before scanning another tail", async () => {
@@ -915,7 +1245,7 @@ describe("recovery preflight helpers", () => {
       hash: `0x${"31".repeat(32)}`,
     }
     const next = {
-      number: 31,
+      number: 32,
       hash: `0x${"32".repeat(32)}`,
     }
     let heightThirtyReads = 0
@@ -944,28 +1274,54 @@ describe("recovery preflight helpers", () => {
     expect(evaluated).to.deep.equal([30])
   })
 
-  it("rejects state that stopped being latest before serialization", async () => {
+  it("bounds execute-stage head lag instead of requiring the exact latest block", async () => {
     const initialHash = `0x${"11".repeat(32)}`
     const replacementHash = `0x${"22".repeat(32)}`
+    const headHash = `0x${"33".repeat(32)}`
+    const provider = (
+      latestNumber: number,
+      canonicalAtHeight = initialHash,
+    ) => ({
+      getBlock: async (blockTag: number | "latest") => {
+        if (blockTag === "latest") {
+          return {
+            number: latestNumber,
+            hash: latestNumber === 100 ? canonicalAtHeight : headHash,
+          }
+        }
+        return { number: blockTag, hash: canonicalAtHeight }
+      },
+    })
 
+    expect(
+      await assertStillLatestBlock(provider(100), 100, initialHash),
+    ).to.deep.equal({ latestBlockNumber: 100, headLagBlocks: 0 })
+    expect(
+      await assertStillLatestBlock(provider(103), 100, initialHash),
+    ).to.deep.equal({ latestBlockNumber: 103, headLagBlocks: 3 })
     await expect(
-      assertStillLatestBlock(
-        {
-          getBlock: async () => ({ number: 100, hash: initialHash }),
-        },
-        100,
-        initialHash,
-      ),
-    ).not.to.be.rejected
+      assertStillLatestBlock(provider(104), 100, initialHash),
+    ).to.be.rejectedWith(
+      "state became stale before preflight completion: validated block 100",
+    )
     await expect(
-      assertStillLatestBlock(
-        {
-          getBlock: async () => ({ number: 101, hash: replacementHash }),
-        },
-        100,
-        initialHash,
-      ),
-    ).to.be.rejectedWith("state became stale before preflight completion")
+      assertStillLatestBlock(provider(104), 100, initialHash),
+    ).to.be.rejectedWith("4 blocks ahead of the 3-block freshness budget")
+    await expect(
+      assertStillLatestBlock(provider(101), 100, initialHash, 0),
+    ).to.be.rejectedWith("1 blocks ahead of the 0-block freshness budget")
+    await expect(
+      assertStillLatestBlock(provider(100, replacementHash), 100, initialHash),
+    ).to.be.rejectedWith("replaced at the same height")
+    await expect(
+      assertStillLatestBlock(provider(101, replacementHash), 100, initialHash),
+    ).to.be.rejectedWith("pinned block 100 was reorged during the scan")
+    await expect(
+      assertStillLatestBlock(provider(99), 100, initialHash),
+    ).to.be.rejectedWith("head regressed to 99")
+    await expect(
+      assertStillLatestBlock(provider(100), 100, null),
+    ).to.be.rejectedWith("validated block 100 has no hash")
   })
 
   it("rechecks every number-pinned workflow before accepting its output", () => {

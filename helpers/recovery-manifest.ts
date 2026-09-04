@@ -193,12 +193,26 @@ export function validateManifestShape(manifest: RecoveryManifest): void {
         `${at}.preState.migrationState`,
         settlement.preState?.migrationState,
       )
+      if (typeof settlement.depositor !== "string") {
+        problems.push(`${at}.depositor must be a string`)
+      }
       if (
         !Array.isArray(settlement.depositorActiveDepositIds) ||
         settlement.depositorActiveDepositIds.length === 0
       ) {
         problems.push(
           `${at}.depositorActiveDepositIds must be a non-empty array`,
+        )
+      } else {
+        // These ids are encoded into DepositorContext calldata with BigInt(),
+        // so an empty, padded, or hex element would coerce into an id that
+        // governance never reviewed. Held to the same rule as the exclusion
+        // id lists.
+        settlement.depositorActiveDepositIds.forEach((depositId, idIndex) =>
+          requireDecimalString(
+            `${at}.depositorActiveDepositIds[${idIndex}]`,
+            depositId,
+          ),
         )
       }
     })

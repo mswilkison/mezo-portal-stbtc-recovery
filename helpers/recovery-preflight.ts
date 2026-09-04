@@ -101,13 +101,35 @@ function sameBlockIdentity(
   )
 }
 
+// Execute-stage freshness is a bounded-staleness rule, not exact-head
+// equality. Every execute-stage read is pinned to one evaluated block; a
+// green result requires that block to still be canonical and the head to be
+// at most this many blocks past it (about 36 seconds on mainnet) when the
+// final check runs. Exact-head equality bought nothing beyond this — state
+// can change after the last RPC read either way — while a 12-second block
+// time made the ~20 dependent round trips of the core checks fail
+// nondeterministically, and every retry is a fresh process that re-scans
+// stBTC history from deployment.
+export const MAX_EXECUTE_HEAD_LAG_BLOCKS = 3
+
+// The converged external scan accepts a smaller lag so most of the budget
+// above is left for the hash-pinned core checks that follow it.
+export const MAX_CONVERGENCE_HEAD_LAG_BLOCKS = 1
+
+function requireHeadLagBudget(maxLagBlocks: number, label: string): void {
+  if (!Number.isSafeInteger(maxLagBlocks) || maxLagBlocks < 0) {
+    throw new Error(`${label} must be a non-negative integer`)
+  }
+}
+
 // A deployment-to-head archive scan can span several new blocks. Re-run its
 // caller-supplied evaluation at successively newer heads until the evaluated
-// block is still `latest` immediately afterward. The caller may retain a
-// canonical history cache between passes, making every pass after the first
-// an incremental tail scan. Each committed boundary is revalidated before it
-// is reused, and the loop is bounded so an advancing or inconsistent RPC
-// fails closed rather than hanging an execute-stage preflight forever.
+// block is `latest`, or at most `maxLagBlocks` behind it, immediately
+// afterward. The caller may retain a canonical history cache between passes,
+// making every pass after the first an incremental tail scan. Each committed
+// boundary is revalidated before it is reused, and the loop is bounded so an
+// advancing or inconsistent RPC fails closed rather than hanging an
+// execute-stage preflight forever.
 export async function evaluateAtConvergedLatest<
   T,
   B extends RecoveryBlockIdentity,
@@ -115,15 +137,18 @@ export async function evaluateAtConvergedLatest<
   provider: BlockIdentityProvider,
   evaluateAtBlock: (block: B & { hash: string }) => Promise<T>,
   maxPasses = 5,
+  maxLagBlocks = MAX_CONVERGENCE_HEAD_LAG_BLOCKS,
 ): Promise<{
   initialBlock: B & { hash: string }
   block: B & { hash: string }
   result: T
   passes: number
+  headLagBlocks: number
 }> {
   if (!Number.isSafeInteger(maxPasses) || maxPasses <= 0) {
     throw new Error("latest-state convergence pass limit must be positive")
   }
+  requireHeadLagBudget(maxLagBlocks, "latest-state convergence head lag budget")
 
   const initialCandidate = (await provider.getBlock("latest")) as B | null
   requireBlockIdentity(initialCandidate, "latest block")
@@ -155,7 +180,13 @@ export async function evaluateAtConvergedLatest<
     requireBlockIdentity(resolvedLatest, "latest block after state evaluation")
     const latest = resolvedLatest as B & { hash: string }
     if (sameBlockIdentity(candidate, latest)) {
-      return { initialBlock, block: candidate, result, passes: pass }
+      return {
+        initialBlock,
+        block: candidate,
+        result,
+        passes: pass,
+        headLagBlocks: 0,
+      }
     }
     if (latest.number <= candidate.number) {
       throw new Error(
@@ -163,6 +194,19 @@ export async function evaluateAtConvergedLatest<
           `evaluated ${candidate.number} (${candidate.hash}), resolved ` +
           `${latest.number} (${latest.hash}) afterward`,
       )
+    }
+    // The candidate was just re-fetched canonical at its own height; a head
+    // within the lag budget is fresh enough, and the next pass would only
+    // race the same block cadence again.
+    const headLagBlocks = latest.number - candidate.number
+    if (headLagBlocks <= maxLagBlocks) {
+      return {
+        initialBlock,
+        block: candidate,
+        result,
+        passes: pass,
+        headLagBlocks,
+      }
     }
 
     committedBlock = candidate
@@ -176,28 +220,51 @@ export async function evaluateAtConvergedLatest<
 }
 
 // Execute-stage state checks may themselves outlive the converged archive
-// tail scan. A green result is emitted only if no newer head appeared while
-// those final hash-pinned checks were running.
+// tail scan. A green result is emitted only if the evaluated block is still
+// canonical and the head has moved at most `maxLagBlocks` past it while
+// those final hash-pinned checks were running. Returns the observed lag so
+// the preflight output can report it.
 export async function assertStillLatestBlock(
   provider: BlockIdentityProvider,
   expectedBlockNumber: number,
   expectedBlockHash: string | null,
-): Promise<void> {
+  maxLagBlocks = MAX_EXECUTE_HEAD_LAG_BLOCKS,
+): Promise<{ latestBlockNumber: number; headLagBlocks: number }> {
+  requireHeadLagBudget(maxLagBlocks, "execute-stage head lag budget")
   if (expectedBlockHash === null) {
     throw new Error(`validated block ${expectedBlockNumber} has no hash`)
   }
   const latest = await provider.getBlock("latest")
   requireBlockIdentity(latest, "latest block at preflight completion")
-  if (
-    latest.number !== expectedBlockNumber ||
-    latest.hash.toLowerCase() !== expectedBlockHash.toLowerCase()
-  ) {
-    throw new Error(
+  const stale = (detail: string): Error =>
+    new Error(
       "execute-stage state became stale before preflight completion: " +
-        `validated block ${expectedBlockNumber} (${expectedBlockHash}), ` +
-        `latest is ${latest.number} (${latest.hash})`,
+        `validated block ${expectedBlockNumber} (${expectedBlockHash}), ${detail}`,
+    )
+  if (latest.number < expectedBlockNumber) {
+    throw stale(`but the head regressed to ${latest.number} (${latest.hash})`)
+  }
+  const headLagBlocks = latest.number - expectedBlockNumber
+  if (headLagBlocks > maxLagBlocks) {
+    throw stale(
+      `latest is ${latest.number} (${latest.hash}), ${headLagBlocks} blocks ` +
+        `ahead of the ${maxLagBlocks}-block freshness budget`,
     )
   }
+  if (headLagBlocks === 0) {
+    if (latest.hash.toLowerCase() !== expectedBlockHash.toLowerCase()) {
+      throw stale(`replaced at the same height by ${latest.hash}`)
+    }
+  } else {
+    // A newer head says nothing about this height; require the evaluated
+    // hash to still be the canonical block there.
+    await assertPinnedBlockHashUnchanged(
+      provider,
+      expectedBlockNumber,
+      expectedBlockHash,
+    )
+  }
+  return { latestBlockNumber: latest.number, headLagBlocks }
 }
 
 export function hasExactRecoveryAllowance(

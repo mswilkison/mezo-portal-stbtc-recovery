@@ -108,7 +108,7 @@ async function main() {
       const positionId =
         position.adapter === "uniswap-v3-nft"
           ? `NFT ${position.tokenId.toString()}`
-          : `core ${position.tickLower}/${position.tickUpper}`
+          : `core ${position.tickLower}/${position.tickUpper} in pool ${position.pool}`
       print(
         `    Uniswap V3 ${positionId}: liquidity ` +
           `${position.liquidity.toString()}, owed ` +

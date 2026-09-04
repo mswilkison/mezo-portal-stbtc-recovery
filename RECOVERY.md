@@ -102,10 +102,15 @@ the former verifies its exact runtime/version and reconciles each stBTC input
 transaction to a tBTC output returned to the same depositor, while the latter
 verifies the canonical factory, pool, and position-manager identities and
 re-reads every currently wallet-owned stBTC position NFT. It also enumerates
-the pool's indexed Mint history for each depositor and re-reads every direct
-core position range, because Uniswap V3 does not require liquidity to be
-represented by an NFT. Any nonzero position liquidity or uncollected amount
-blocks. The persistent one-wei balances at those two contracts are therefore
+every direct core `Mint` credited to each depositor in any pool (the query
+carries no pool address), classifies each emitting pool at the pinned block,
+requires any pool holding stBTC to be registered by the canonical factory,
+and re-reads every direct core position range, because Uniswap V3 does not
+require liquidity to be represented by an NFT and a third party can mint a
+core range directly to a depositor in any stBTC pool. Any nonzero position
+liquidity or uncollected amount blocks; an stBTC-holding emitter that cannot
+be classified as a canonical pool is UNRESOLVED. The persistent one-wei
+balances at those two contracts are therefore
 resolved by protocol evidence, never by a generic dust exception; code drift,
 receipt mismatch, or an unreadable position remains UNRESOLVED.
 
@@ -299,18 +304,24 @@ first pass scans complete raw Transfer, NFT ownership, and direct Uniswap Mint
 history from stBTC deployment through an initial head. If that scan outlives
 the head, the preflight keeps the raw history and reruns the complete external
 evaluation at the newer hash while querying only each missing numeric tail.
-It accepts at most five passes and only when the evaluated block is still the
-exact latest block immediately after a pass; a reorged committed boundary,
-head regression/replacement, incomplete query, or failure to converge is
-blocking. Only then does it read the Portal implementation and configuration,
-roles, balances, allowance, deposits, fees, deployed recovery bytecode, and
-timelock operation at that same block hash. Immediately before serialization
-it revalidates the manifest snapshot and operational hash again and requires
-the operational block still to be latest. A pass reports
+It accepts at most five passes and only when the evaluated block is still
+canonical and the head is at most one block past it immediately after a pass;
+a reorged committed boundary, head regression/replacement, incomplete query,
+or failure to converge is blocking. Only then does it read the Portal
+implementation and configuration, roles, balances, allowance, pause state,
+deposits, fees, deployed recovery bytecode, and timelock operation at that
+same block hash. Immediately before serialization it revalidates the manifest
+snapshot and operational hash again and requires the head to be at most three
+blocks (`MAX_EXECUTE_HEAD_LAG_BLOCKS`, about 36 seconds) past the operational
+block. Freshness is therefore bounded staleness, not exact-head equality:
+exact equality certified nothing more (state can change after the last RPC
+read either way) while failing nondeterministically against a 12-second block
+time, and every retry re-scans history from stBTC deployment. A pass reports
 `verifiedAt.blockHashRevalidated: true`,
-`verifiedAt.latestHeadRevalidated: true`, and the external review's
-`historyScan` boundaries/pass count. A head that advances during the final
-live checks produces `preflightPassed: false` instead of certifying old state.
+`verifiedAt.latestHeadRevalidated: true`, `verifiedAt.headLagBlocks`, and the
+external review's `historyScan` boundaries/pass count. A head that advances
+past the budget during the final live checks produces
+`preflightPassed: false` instead of certifying old state.
 
 These checks are a fresh point-in-time observation, not a transaction lock. A
 new block or transaction can still land after the final RPC response; the
@@ -389,7 +400,9 @@ independent-provider comparison in step 4 remains mandatory.
    against the expected constructor value; getter readbacks alone are not
    sufficient. It then reports the timelock operation's state and prints the
    exact Threshold approval plus Timelock schedule, execute, and cancel
-   calldata.
+   calldata. Record `governanceBatch.salt` and `governanceBatch.operationId`
+   from this output: the execute-stage rerun in step 10 must be given that
+   salt, and the cancel path needs that id.
 8. Mezo governance schedules the printed two-call batch. From this point
    until execution or cancellation, no other governance action may touch the
    Portal, its ProxyAdmin, or the timelock's Portal-related roles: the
@@ -400,30 +413,41 @@ independent-provider comparison in step 4 remains mandatory.
    freeze is process-enforced: the execute-stage preflight re-verifies the
    live implementation immediately before `executeBatch`, and executors must
    not skip or race it. If anything must change, cancel first (calldata is
-   printed in step 7), then re-pin.
+   printed in step 7), then re-pin. Commit the manifest before scheduling and
+   do not edit it afterwards: the operation id commits to the manifest's JSON
+   content, so a value change produces a different id (formatting-only
+   changes do not).
 9. After the configured delay elapses, Threshold approves the Portal—not
    Thesis or the recovery implementation—for exactly the recovery amount.
    Approving before or during the delay would leave a standing allowance to
    an upgradeable proxy for longer than necessary.
 10. Immediately before `executeBatch`, governance repeats the manual review
-    from step 4 and reruns the preflight with both
-    `RECOVERY_STAGE=execute` and
-    `RECOVERY_EXTERNAL_STBTC_REVIEW=I_CONFIRM_NO_EXTERNAL_STBTC_CLAIMS`.
+    from step 4 and reruns the preflight with `RECOVERY_STAGE=execute`,
+    `RECOVERY_IMPLEMENTATION`, `RECOVERY_SALT=<the salt recorded in step 7>`,
+    and `RECOVERY_EXTERNAL_STBTC_REVIEW=I_CONFIRM_NO_EXTERNAL_STBTC_CLAIMS`.
+    `RECOVERY_IMPLEMENTATION` is validated before the archive scan starts, so
+    a missing value fails in seconds rather than after minutes of scanning.
     The execute preflight first performs the full automated external-position
     scan. If new blocks arrive, it extends the cached raw history only across
     the missing tails and reruns all live external reads until that evaluated
-    block remains latest. It then runs every Portal, token, recovery
-    implementation, projection, role, allowance, and operation-state check at
-    that same hash and requires the hash still to be the exact latest head just
-    before output. A failed convergence, final freshness/canonicality check,
-    detected claim, unreadable relevant `balanceOf`, protocol
-    identity/transaction mismatch, active or uncollected Uniswap V3 NFT/core
-    position, missing manual confirmation, stale allowance, unready operation,
+    block is the head or at most one block behind it. It then runs every
+    Portal, token, recovery implementation, projection, role, allowance,
+    pause-state, and operation-state check at that same hash and requires the
+    head to be at most three blocks past it just before output. A failed
+    convergence, final freshness/canonicality check, detected claim,
+    unreadable relevant `balanceOf`, protocol identity/transaction mismatch,
+    active or uncollected Uniswap V3 NFT/core position, missing manual
+    confirmation, stale allowance, paused stBTC, unready operation,
+    insufficient funding or receipt debt, unverified deployed implementation,
     zero projection, or unaccepted material reduction prints the verified
-    cancellation calldata and exits nonzero. Only submit the batch immediately
-    after this run reports `preflightPassed: true`; rerun after any delay. The
-    final head comparison narrows but cannot eliminate the transaction-submission
-    race described above.
+    cancellation calldata and exits nonzero. Two exceptions are deliberate: an
+    operation id that is not scheduled under the computed salt gets no cancel
+    calldata (cancelling it would revert while the real operation stayed
+    pending — supply the recorded salt instead), and an implementation that
+    fails verification gets no schedule/execute calldata. Only submit the
+    batch immediately after this run reports `preflightPassed: true`; rerun
+    after any delay. The final head comparison narrows but cannot eliminate
+    the transaction-submission race described above.
 11. Verify the `StbtcRecoveryCompleted` event and any
     `ReceiptDebtSettlementSkipped` events, the Threshold Safe tBTC increase,
     the stBTC burn, debt and collateral changes, and restoration of
@@ -441,10 +465,15 @@ If the attempt is abandoned at any point after scheduling: cancel the
 timelock operation (step 7 prints the calldata — operations never expire on
 their own, and a stale batch would re-install the old implementation if
 executed after an unrelated Portal upgrade), and revoke any approval already
-granted. The default operation salt commits to the manifest file's hash, so a
-corrected manifest automatically produces a fresh operation id that cannot
-collide with the cancelled one. `RECOVERY_SALT` accepts either a 32-byte hex
-value (used verbatim) or any other string (hashed with `ethers.id`).
+granted. The default operation salt commits to the manifest's JSON content
+(whitespace- and line-ending-insensitive), so a corrected manifest
+automatically produces a fresh operation id that cannot collide with the
+cancelled one, while a prettier reflow does not move the id away from the
+scheduled batch. `RECOVERY_SALT` accepts either a 32-byte hex value (used
+verbatim) or any other string (hashed with `ethers.id`); pass the salt printed
+at scheduling to every later run, and if a run ever reports the operation as
+`unset`, take the scheduled id from the timelock's `CallScheduled` event
+rather than trusting a recomputed one.
 
 Example commands, using Node 18:
 
@@ -464,9 +493,11 @@ MAINNET_RPC_URL=https://your-archive-rpc.example \
 RECOVERY_IMPLEMENTATION=0xDeployedRecoveryImplementation \
   npm run preflight:recovery
 
-# Immediately before executeBatch:
+# Immediately before executeBatch (RECOVERY_SALT = governanceBatch.salt
+# printed by the run whose scheduleTransaction was submitted):
 MAINNET_RPC_URL=https://your-archive-rpc.example \
 RECOVERY_IMPLEMENTATION=0xDeployedRecoveryImplementation \
+RECOVERY_SALT=0xSaltPrintedAtScheduling \
 RECOVERY_STAGE=execute \
 RECOVERY_EXTERNAL_STBTC_REVIEW=I_CONFIRM_NO_EXTERNAL_STBTC_CLAIMS \
   npm run preflight:recovery

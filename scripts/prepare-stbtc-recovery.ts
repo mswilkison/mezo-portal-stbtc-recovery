@@ -18,6 +18,8 @@ import {
 import {
   ADMIN_SLOT,
   IMPLEMENTATION_SLOT,
+  MAX_CONVERGENCE_HEAD_LAG_BLOCKS,
+  MAX_EXECUTE_HEAD_LAG_BLOCKS,
   SettlementProjectionInput,
   assertExactActiveDepositIds,
   assertPinnedBlockHashUnchanged,
@@ -35,6 +37,7 @@ import {
   recomputeActiveReceiptDebt,
 } from "../helpers/recovery-preflight"
 import {
+  RecoveryBytecodeVerification,
   RecoveryImmutableValues,
   verifyRecoveryBytecode,
 } from "../helpers/verify-recovery-bytecode"
@@ -62,9 +65,9 @@ const FEE_DRIFT_PAD_SECONDS = 3600n
 // third parties a process-level veto the contract itself does not have.
 // RECOVERY_STAGE=execute is the mandatory rerun immediately before
 // `executeBatch`: it always runs against latest state and additionally
-// requires the exact stBTC allowance, a ready timelock operation, a nonzero
-// projected settlement, and the latest-state external-holdings screen plus
-// its explicit manual review confirmation.
+// requires the exact stBTC allowance, an unpaused stBTC, a ready timelock
+// operation, a nonzero projected settlement, and the latest-state
+// external-holdings screen plus its explicit manual review confirmation.
 const STAGE = process.env.RECOVERY_STAGE ?? "prepare"
 
 function fail(message: string): never {
@@ -117,20 +120,26 @@ async function storageAt(
   return ethers.provider.send("eth_getStorageAt", [address, slot, blockTag])
 }
 
-// The default operation salt commits to the exact manifest bytes, so every
+// The default operation salt commits to the manifest's JSON content, so every
 // re-pinned manifest automatically produces a distinct timelock operation id
-// and a stale, cancelled attempt can never collide with a corrected one.
-// RECOVERY_SALT overrides it: a 32-byte hex string is used verbatim, any
-// other value is hashed with ethers.id().
-function operationSalt(manifestHash: string): {
+// and a stale, cancelled attempt can never collide with a corrected one. It
+// deliberately does NOT commit to the file's exact bytes: a prettier reflow
+// or line-ending change between scheduling and the execute-stage rerun must
+// not move the operation id away from the scheduled one, or the rerun would
+// report an unrelated id as "unset" and print cancel calldata for an
+// operation that was never scheduled. RECOVERY_SALT overrides it: a 32-byte
+// hex string is used verbatim, any other value is hashed with ethers.id().
+function operationSalt(manifestContentHash: string): {
   salt: string
   derivation: string
 } {
   const raw = process.env.RECOVERY_SALT
   if (!raw) {
     return {
-      salt: ethers.id(`threshold-stbtc-recovery:${manifestHash}`),
-      derivation: `ethers.id("threshold-stbtc-recovery:<keccak256 of ${recoveryManifestPath}>")`,
+      salt: ethers.id(`threshold-stbtc-recovery:${manifestContentHash}`),
+      derivation:
+        'ethers.id("threshold-stbtc-recovery:<keccak256 of the canonical ' +
+        `(whitespace-insensitive) JSON content of ${recoveryManifestPath}>")`,
     }
   }
 
@@ -158,6 +167,25 @@ async function main() {
     fail(
       "RECOVERY_STAGE=execute must validate latest state; unset RECOVERY_BLOCK",
     )
+  }
+  // The execute stage cannot build the governance batch, verify the deployed
+  // implementation, or derive the timelock operation id without the deployed
+  // recovery address, so demand it before the deployment-to-head archive
+  // scan rather than after it (that scan is minutes on a capped provider).
+  const recoveryImplementationInput = process.env.RECOVERY_IMPLEMENTATION
+  if (STAGE === "execute" && !recoveryImplementationInput) {
+    fail("RECOVERY_STAGE=execute requires RECOVERY_IMPLEMENTATION")
+  }
+  let recoveryImplementation: string | undefined
+  if (recoveryImplementationInput) {
+    try {
+      recoveryImplementation = ethers.getAddress(recoveryImplementationInput)
+    } catch {
+      fail(
+        `RECOVERY_IMPLEMENTATION "${recoveryImplementationInput}" is not a ` +
+          "valid address",
+      )
+    }
   }
   // Full EIP-55 checksum validation. The manifest must carry checksummed
   // addresses; a single corrupted character (collateralRecipient is the one
@@ -279,6 +307,8 @@ async function main() {
           passes: converged.passes,
           incrementalPasses: converged.passes - 1,
           completeThroughBlock: block.number,
+          headLagBlocks: converged.headLagBlocks,
+          maxHeadLagBlocks: MAX_CONVERGENCE_HEAD_LAG_BLOCKS,
         },
       }
       if (!externalGate.passed) {
@@ -409,6 +439,7 @@ async function main() {
       "function allowance(address,address) view returns (uint256)",
       "function currentDebt(address) view returns (uint256)",
       "function decimals() view returns (uint8)",
+      "function paused() view returns (bool)",
     ],
     ethers.provider,
   )
@@ -427,6 +458,7 @@ async function main() {
     senderHasProposerRole,
     senderHasExecutorRole,
     senderHasCancellerRole,
+    stbtcPaused,
   ] = await Promise.all([
     portal.tbtcToken(callOverrides),
     portal.feeInfo(addresses.tbtc, callOverrides),
@@ -441,6 +473,14 @@ async function main() {
     timelock.hasRole(PROPOSER_ROLE, addresses.portalLogicOwner, callOverrides),
     timelock.hasRole(EXECUTOR_ROLE, addresses.portalLogicOwner, callOverrides),
     timelock.hasRole(CANCELLER_ROLE, addresses.portalLogicOwner, callOverrides),
+    stbtc.paused(callOverrides).catch((error: unknown) => {
+      throw new Error(
+        "stBTC paused() could not be read; the receipt burn path is " +
+          `pause-gated, so this read is required: ${
+            error instanceof Error ? error.message : `${error}`
+          }`,
+      )
+    }),
   ])
 
   expectEqual("configured tBTC", configuredTbtc, addresses.tbtc)
@@ -538,6 +578,26 @@ async function main() {
       failureAfterOutput,
       externalStbtcFailure,
     )
+  }
+
+  // stBTC's receipt burn (burnReceipt) is gated by Acre's pause while
+  // transferFrom is not, so against a paused stBTC recoverTbtc would pull
+  // the shares and then revert the whole batch with EnforcedPause, leaving
+  // Threshold's exact allowance outstanding to the proxy. Nothing here
+  // controls that pause; the gate can only refuse to certify an executeBatch
+  // that cannot succeed.
+  if (stbtcPaused) {
+    const message =
+      "stBTC is paused (Acre's pause admin); burnReceipt reverts with " +
+      "EnforcedPause, so executeBatch would revert. Wait for the unpause " +
+      "and rerun"
+    if (STAGE === "execute") {
+      failureAfterOutput = appendDeferredFailure(failureAfterOutput, message)
+    } else {
+      warn(
+        `${message} (a pause at the prepare stage does not block scheduling)`,
+      )
+    }
   }
 
   // Sufficiency checks live after the projection inputs are assembled. Token
@@ -990,28 +1050,39 @@ async function main() {
   // that make the projection a lower bound. Under the verified Portal, debt
   // cannot be re-minted into these reviewed deposit ids, so this is the true
   // maximum recoverTbtc can pull, burn, and release after this pinned read.
+  //
+  // Deferred rather than thrown: funding that moved after scheduling is
+  // exactly the case where the operator needs the operation id and cancel
+  // calldata below, and the output is emitted with preflightPassed: false.
+  const sufficiencyProblems: string[] = []
   if (BigInt(portalTbtcBalance) < liveSettlementUpperBoundWei) {
-    fail(
+    sufficiencyProblems.push(
       `Portal holds ${portalTbtcBalance.toString()} tBTC, below the live ` +
         `settlement upper bound ${liveSettlementUpperBoundWei.toString()}`,
     )
   }
   if (BigInt(receiptPayerBalance) < liveSettlementUpperBoundWei) {
-    fail(
+    sufficiencyProblems.push(
       `receipt payer holds ${receiptPayerBalance.toString()} stBTC, below the ` +
         `live settlement upper bound ${liveSettlementUpperBoundWei.toString()}`,
     )
   }
   if (BigInt(portalStbtcDebt) < liveSettlementUpperBoundWei) {
-    fail(
+    sufficiencyProblems.push(
       `Portal stBTC debt ${portalStbtcDebt.toString()} is below the maximum ` +
         `live settlement ${liveSettlementUpperBoundWei.toString()}`,
     )
   }
   if (BigInt(fee.totalMinted) < liveSettlementUpperBoundWei) {
-    fail(
+    sufficiencyProblems.push(
       `tBTC-specific receipt debt ${fee.totalMinted.toString()} is below the ` +
         `maximum live settlement ${liveSettlementUpperBoundWei.toString()}`,
+    )
+  }
+  if (sufficiencyProblems.length > 0) {
+    failureAfterOutput = appendDeferredFailure(
+      failureAfterOutput,
+      `funding/receipt-debt sufficiency failed: ${sufficiencyProblems.join("; ")}`,
     )
   }
 
@@ -1110,14 +1181,25 @@ async function main() {
     "function approve(address spender,uint256 amount) returns (bool)",
   ]).encodeFunctionData("approve", [addresses.portal, roundAmount])
 
-  const manifestHash = ethers.keccak256(readFileSync(recoveryManifestPath))
+  const manifestBytes = readFileSync(recoveryManifestPath)
+  const manifestHash = ethers.keccak256(manifestBytes)
+  // Salt input: the JSON content, independent of whitespace and line endings
+  // (see operationSalt). Any value change — a re-pin — still changes it.
+  const manifestContentHash = ethers.keccak256(
+    ethers.toUtf8Bytes(
+      JSON.stringify(JSON.parse(manifestBytes.toString("utf8"))),
+    ),
+  )
 
-  const verifiedAt = {
+  const verifiedAt: Record<string, unknown> = {
     blockNumber: block.number,
     blockHash: block.hash,
     blockTimestamp: block.timestamp,
     blockHashRevalidated: false,
     latestHeadRevalidated: STAGE === "prepare" ? "not required" : false,
+    headLagBlocks: STAGE === "prepare" ? "not required" : undefined,
+    maxHeadLagBlocks:
+      STAGE === "prepare" ? "not required" : MAX_EXECUTE_HEAD_LAG_BLOCKS,
   }
   const output: Record<string, unknown> = {
     stage: STAGE,
@@ -1127,6 +1209,7 @@ async function main() {
     provenance: {
       manifestPath: recoveryManifestPath,
       manifestHash,
+      manifestContentHash,
       compiledPortalRuntimeHash: compiledPortalHash,
     },
     state: {
@@ -1154,6 +1237,7 @@ async function main() {
       effectiveFeeIntegral,
       receiptPayerStbtcBalanceWei: receiptPayerBalance,
       receiptPayerAllowanceWei: receiptPayerAllowance,
+      stbtcPaused,
     },
     settlementProjection: {
       manifestTotalWei: manifestTotal,
@@ -1183,60 +1267,34 @@ async function main() {
     settlements: checkedSettlements,
   }
 
-  const recoveryImplementation = process.env.RECOVERY_IMPLEMENTATION
-  if (STAGE === "execute" && !recoveryImplementation) {
-    fail("RECOVERY_STAGE=execute requires RECOVERY_IMPLEMENTATION")
-  }
   if (recoveryImplementation) {
-    const recoveryAddress = ethers.getAddress(recoveryImplementation)
+    const recoveryAddress = recoveryImplementation
+    // Every deployed-implementation problem below is deferred rather than
+    // thrown. The batch payloads, operation id, and cancel calldata depend
+    // only on the reviewed addresses and this address, and a scheduled batch
+    // whose implementation no longer verifies is precisely the case where
+    // the operator needs the cancel calldata printed. Schedule/execute
+    // calldata is withheld instead, so an unverified implementation is never
+    // handed out as a batch to sign.
+    const recoveryProblems: string[] = []
+    const expectDeployed = (
+      label: string,
+      actual: bigint | number | string,
+      expected: bigint | number | string,
+    ): void => {
+      if (
+        actual.toString().toLowerCase() !== expected.toString().toLowerCase()
+      ) {
+        recoveryProblems.push(
+          `${label}: expected ${expected.toString()}, got ${actual.toString()}`,
+        )
+      }
+    }
     const recoveryCode = await ethers.provider.getCode(
       recoveryAddress,
       callOverrides.blockTag,
     )
-    if (recoveryCode === "0x") {
-      fail(`no code at RECOVERY_IMPLEMENTATION ${recoveryAddress}`)
-    }
 
-    const configuredRecovery = new ethers.Contract(
-      recoveryAddress,
-      recoveryFactory.interface,
-      ethers.provider,
-    )
-    const [
-      deployedPortal,
-      deployedAuthority,
-      deployedPayer,
-      deployedRecipient,
-      deployedTbtc,
-      deployedReceiptToken,
-      deployedMaxAmount,
-    ] = await Promise.all([
-      configuredRecovery.EXPECTED_PORTAL(callOverrides),
-      configuredRecovery.RECOVERY_AUTHORITY(callOverrides),
-      configuredRecovery.RECEIPT_PAYER(callOverrides),
-      configuredRecovery.COLLATERAL_RECIPIENT(callOverrides),
-      configuredRecovery.EXPECTED_TBTC(callOverrides),
-      configuredRecovery.EXPECTED_RECEIPT_TOKEN(callOverrides),
-      configuredRecovery.EXPECTED_MAX_RECOVERY_AMOUNT(callOverrides),
-    ])
-    expectEqual("recovery EXPECTED_PORTAL", deployedPortal, addresses.portal)
-    expectEqual(
-      "recovery RECOVERY_AUTHORITY",
-      deployedAuthority,
-      addresses.proxyAdmin,
-    )
-    expectEqual("recovery RECEIPT_PAYER", deployedPayer, addresses.receiptPayer)
-    expectEqual(
-      "recovery COLLATERAL_RECIPIENT",
-      deployedRecipient,
-      addresses.collateralRecipient,
-    )
-    expectEqual("recovery EXPECTED_TBTC", deployedTbtc, addresses.tbtc)
-    expectEqual(
-      "recovery EXPECTED_RECEIPT_TOKEN",
-      deployedReceiptToken,
-      addresses.stbtc,
-    )
     // The immutable is an upper bound so a residual round can reuse this
     // deployed, reviewed implementation with a smaller fresh manifest. It
     // must be anchored externally, never to the deployed contract's own
@@ -1248,46 +1306,120 @@ async function main() {
       ? BigInt(process.env.RECOVERY_DEPLOYED_MAX_WEI)
       : manifestTotal
     if (expectedMaxAmount < manifestTotal) {
-      fail(
+      recoveryProblems.push(
         `RECOVERY_DEPLOYED_MAX_WEI ${expectedMaxAmount.toString()} is below ` +
           `this round's settlement total ${manifestTotal.toString()}`,
       )
     }
-    expectEqual(
-      "recovery EXPECTED_MAX_RECOVERY_AMOUNT (set RECOVERY_DEPLOYED_MAX_WEI " +
-        "for a residual round reusing the original deployment)",
-      deployedMaxAmount,
-      expectedMaxAmount,
-    )
-    if (expectedMaxAmount > manifestTotal) {
-      warn(
-        `deployed EXPECTED_MAX_RECOVERY_AMOUNT ${deployedMaxAmount} exceeds ` +
-          `this round's total ${manifestTotal.toString()} (expected for a ` +
-          "residual round reusing the original deployment)",
+
+    let deployedMaxAmount: bigint | undefined
+    let bytecodeVerification: RecoveryBytecodeVerification | undefined
+    if (recoveryCode === "0x") {
+      recoveryProblems.push(
+        `no code at RECOVERY_IMPLEMENTATION ${recoveryAddress}`,
+      )
+    } else {
+      try {
+        const configuredRecovery = new ethers.Contract(
+          recoveryAddress,
+          recoveryFactory.interface,
+          ethers.provider,
+        )
+        const [
+          deployedPortal,
+          deployedAuthority,
+          deployedPayer,
+          deployedRecipient,
+          deployedTbtc,
+          deployedReceiptToken,
+          deployedMax,
+        ] = await Promise.all([
+          configuredRecovery.EXPECTED_PORTAL(callOverrides),
+          configuredRecovery.RECOVERY_AUTHORITY(callOverrides),
+          configuredRecovery.RECEIPT_PAYER(callOverrides),
+          configuredRecovery.COLLATERAL_RECIPIENT(callOverrides),
+          configuredRecovery.EXPECTED_TBTC(callOverrides),
+          configuredRecovery.EXPECTED_RECEIPT_TOKEN(callOverrides),
+          configuredRecovery.EXPECTED_MAX_RECOVERY_AMOUNT(callOverrides),
+        ])
+        deployedMaxAmount = BigInt(deployedMax)
+        expectDeployed(
+          "recovery EXPECTED_PORTAL",
+          deployedPortal,
+          addresses.portal,
+        )
+        expectDeployed(
+          "recovery RECOVERY_AUTHORITY",
+          deployedAuthority,
+          addresses.proxyAdmin,
+        )
+        expectDeployed(
+          "recovery RECEIPT_PAYER",
+          deployedPayer,
+          addresses.receiptPayer,
+        )
+        expectDeployed(
+          "recovery COLLATERAL_RECIPIENT",
+          deployedRecipient,
+          addresses.collateralRecipient,
+        )
+        expectDeployed("recovery EXPECTED_TBTC", deployedTbtc, addresses.tbtc)
+        expectDeployed(
+          "recovery EXPECTED_RECEIPT_TOKEN",
+          deployedReceiptToken,
+          addresses.stbtc,
+        )
+        expectDeployed(
+          "recovery EXPECTED_MAX_RECOVERY_AMOUNT (set " +
+            "RECOVERY_DEPLOYED_MAX_WEI for a residual round reusing the " +
+            "original deployment)",
+          deployedMaxAmount,
+          expectedMaxAmount,
+        )
+        if (expectedMaxAmount > manifestTotal) {
+          warn(
+            `deployed EXPECTED_MAX_RECOVERY_AMOUNT ${deployedMaxAmount} ` +
+              `exceeds this round's total ${manifestTotal.toString()} ` +
+              "(expected for a residual round reusing the original " +
+              "deployment)",
+          )
+        }
+
+        // The deployed implementation must be byte-for-byte the compiled
+        // local artifact. Every immutable occurrence is checked against the
+        // externally anchored expected values before the ranges are masked
+        // for the remaining-code comparison; checking only the seven getters
+        // is insufficient because custom initcode can patch separate
+        // occurrences differently.
+        const expectedRecoveryImmutables: RecoveryImmutableValues = {
+          EXPECTED_PORTAL: addresses.portal,
+          RECOVERY_AUTHORITY: addresses.proxyAdmin,
+          RECEIPT_PAYER: addresses.receiptPayer,
+          COLLATERAL_RECIPIENT: addresses.collateralRecipient,
+          EXPECTED_TBTC: addresses.tbtc,
+          EXPECTED_RECEIPT_TOKEN: addresses.stbtc,
+          EXPECTED_MAX_RECOVERY_AMOUNT: expectedMaxAmount,
+        }
+        bytecodeVerification = await verifyRecoveryBytecode(
+          ethers.provider,
+          recoveryAddress,
+          expectedRecoveryImmutables,
+          callOverrides.blockTag,
+        )
+      } catch (error) {
+        recoveryProblems.push(
+          error instanceof Error ? error.message : `${error}`,
+        )
+      }
+    }
+    const bytecodeVerified = recoveryProblems.length === 0
+    if (!bytecodeVerified) {
+      failureAfterOutput = appendDeferredFailure(
+        failureAfterOutput,
+        `deployed recovery implementation ${recoveryAddress} failed ` +
+          `verification: ${recoveryProblems.join("; ")}`,
       )
     }
-
-    // The deployed implementation must be byte-for-byte the compiled local
-    // artifact. Every immutable occurrence is checked against the externally
-    // anchored expected values before the ranges are masked for the
-    // remaining-code comparison; checking only the seven getters is
-    // insufficient because custom initcode can patch separate occurrences
-    // differently.
-    const expectedRecoveryImmutables: RecoveryImmutableValues = {
-      EXPECTED_PORTAL: addresses.portal,
-      RECOVERY_AUTHORITY: addresses.proxyAdmin,
-      RECEIPT_PAYER: addresses.receiptPayer,
-      COLLATERAL_RECIPIENT: addresses.collateralRecipient,
-      EXPECTED_TBTC: addresses.tbtc,
-      EXPECTED_RECEIPT_TOKEN: addresses.stbtc,
-      EXPECTED_MAX_RECOVERY_AMOUNT: expectedMaxAmount,
-    }
-    const bytecodeVerification = await verifyRecoveryBytecode(
-      ethers.provider,
-      recoveryAddress,
-      expectedRecoveryImmutables,
-      callOverrides.blockTag,
-    )
 
     const misdirectedAllowance = BigInt(
       await stbtc.allowance(
@@ -1313,7 +1445,7 @@ async function main() {
       recoverCalldata: recoveryCall,
     })
     const predecessor = ethers.ZeroHash
-    const { salt, derivation } = operationSalt(manifestHash)
+    const { salt, derivation } = operationSalt(manifestContentHash)
     const operationId = await timelock.hashOperationBatch(
       targets,
       values,
@@ -1340,12 +1472,29 @@ async function main() {
       operationState = "waiting"
     }
 
+    if (STAGE === "execute" && process.env.RECOVERY_SALT === undefined) {
+      warn(
+        "RECOVERY_SALT is unset, so the operation id was re-derived from the " +
+          "manifest content; pass the salt recorded from the scheduling " +
+          "run's governanceBatch.salt so a manifest edit cannot point this " +
+          "run at a different operation id",
+      )
+    }
     if (STAGE === "execute" && operationState !== "ready") {
+      const unscheduledGuidance =
+        operationState === "unset"
+          ? ". Nothing is scheduled under this id: if the batch was " +
+            "scheduled by an earlier run, the manifest content or " +
+            "RECOVERY_SALT differs from that run — rerun with " +
+            "RECOVERY_SALT=<the salt it printed>, or take the scheduled id " +
+            "from the timelock's CallScheduled event. No cancel calldata is " +
+            "printed for an unscheduled id"
+          : ""
       failureAfterOutput = appendDeferredFailure(
         failureAfterOutput,
         `timelock operation ${operationId} is "${operationState}" ` +
           `(timestamp ${operationTimestamp.toString()}); executeBatch ` +
-          "requires it to be ready",
+          `requires it to be ready${unscheduledGuidance}`,
       )
     }
     if (STAGE === "prepare" && operationState !== "unset") {
@@ -1362,13 +1511,19 @@ async function main() {
       "function cancel(bytes32 id)",
     ])
 
+    const withheld = (reason: string) => ({ withheld: true, reason })
+    const unverifiedBatch =
+      "the deployed recovery implementation failed verification; this " +
+      "batch must not be signed"
     output.governanceBatch = {
       recoveryImplementation: recoveryAddress,
       recoveryImplementationRuntimeHash:
-        bytecodeVerification.deployedRuntimeHash,
-      recoveryArtifactRuntimeHash: bytecodeVerification.artifactRuntimeHash,
-      recoveryMaxAmountWei: deployedMaxAmount,
-      bytecodeVerified: true,
+        bytecodeVerification?.deployedRuntimeHash ??
+        ethers.keccak256(recoveryCode),
+      recoveryArtifactRuntimeHash:
+        bytecodeVerification?.artifactRuntimeHash ?? "not verified",
+      recoveryMaxAmountWei: deployedMaxAmount ?? "unreadable",
+      bytecodeVerified,
       operationId,
       operationState,
       operationTimestamp,
@@ -1379,42 +1534,59 @@ async function main() {
       salt,
       saltDerivation: derivation,
       minimumDelay,
-      scheduleTransaction: {
-        target: addresses.proxyAdminOwnerTimelock,
-        value: "0",
-        calldata: timelockInterface.encodeFunctionData("scheduleBatch", [
-          targets,
-          values,
-          payloads,
-          predecessor,
-          salt,
-          minimumDelay,
-        ]),
-      },
-      executeTransaction: {
-        target: addresses.proxyAdminOwnerTimelock,
-        value: "0",
-        calldata: timelockInterface.encodeFunctionData("executeBatch", [
-          targets,
-          values,
-          payloads,
-          predecessor,
-          salt,
-        ]),
-      },
-      cancelTransaction: {
-        target: addresses.proxyAdminOwnerTimelock,
-        value: "0",
-        calldata: timelockInterface.encodeFunctionData("cancel", [operationId]),
-      },
+      scheduleTransaction: bytecodeVerified
+        ? {
+            target: addresses.proxyAdminOwnerTimelock,
+            value: "0",
+            calldata: timelockInterface.encodeFunctionData("scheduleBatch", [
+              targets,
+              values,
+              payloads,
+              predecessor,
+              salt,
+              minimumDelay,
+            ]),
+          }
+        : withheld(unverifiedBatch),
+      executeTransaction: bytecodeVerified
+        ? {
+            target: addresses.proxyAdminOwnerTimelock,
+            value: "0",
+            calldata: timelockInterface.encodeFunctionData("executeBatch", [
+              targets,
+              values,
+              payloads,
+              predecessor,
+              salt,
+            ]),
+          }
+        : withheld(unverifiedBatch),
+      // Cancel calldata is the abort path and is printed even for an
+      // unverified implementation — but never for an id that is not
+      // scheduled, because cancelling it would revert while the real
+      // operation stayed pending.
+      cancelTransaction:
+        STAGE === "execute" && operationState === "unset"
+          ? withheld(
+              `operation ${operationId} is not scheduled under salt ${salt}; ` +
+                "cancel with the salt/id recorded at scheduling",
+            )
+          : {
+              target: addresses.proxyAdminOwnerTimelock,
+              value: "0",
+              calldata: timelockInterface.encodeFunctionData("cancel", [
+                operationId,
+              ]),
+            },
     }
   }
 
   // Range scans cannot use a block-hash endpoint. Re-fetch the pinned height
   // and the manifest's generating snapshot only after every dependent read is
-  // complete. Execute also requires this exact evaluated block to remain the
-  // latest head. Fail closed before a result can be emitted as passing if any
-  // of those identities changed.
+  // complete. Execute also requires the head to be at most
+  // MAX_EXECUTE_HEAD_LAG_BLOCKS past the evaluated block, which must still
+  // be canonical. Fail closed before a result can be emitted as passing if
+  // any of those identities changed.
   try {
     await assertManifestSnapshotCanonical(ethers.provider, manifest)
     await assertPinnedBlockHashUnchanged(
@@ -1424,8 +1596,13 @@ async function main() {
     )
     verifiedAt.blockHashRevalidated = true
     if (STAGE === "execute") {
-      await assertStillLatestBlock(ethers.provider, block.number, block.hash)
+      const { headLagBlocks } = await assertStillLatestBlock(
+        ethers.provider,
+        block.number,
+        block.hash,
+      )
       verifiedAt.latestHeadRevalidated = true
+      verifiedAt.headLagBlocks = headLagBlocks
     }
   } catch (error) {
     const detail = error instanceof Error ? error.message : `${error}`
