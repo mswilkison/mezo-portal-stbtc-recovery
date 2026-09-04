@@ -7,6 +7,16 @@ import "hardhat-deploy"
 import "hardhat-contract-sizer"
 import "hardhat-gas-reporter"
 import dotenv from "dotenv-safer"
+import { tryLoadRecoveryManifest } from "./helpers/recovery-manifest"
+
+// dotenv-safer throws if any key present in the example file is absent from
+// .env, and it runs before hardhat parses anything — so adding a key to the
+// example would break EVERY hardhat invocation for anyone with an older
+// .env, including `npx hardhat run` and `npm run build`, which do not go
+// through the prepare:env npm script. Reconcile .env here so the guarantee
+// holds no matter how hardhat was invoked.
+// eslint-disable-next-line @typescript-eslint/no-var-requires, global-require
+require("./scripts/prepare-env")
 
 dotenv.config({
   allowEmptyValues: true,
@@ -20,6 +30,35 @@ const MAINNET_RPC_URL = process.env.MAINNET_RPC_URL
 const MAINNET_PRIVATE_KEY = process.env.MAINNET_PRIVATE_KEY
   ? [process.env.MAINNET_PRIVATE_KEY]
   : []
+
+const RECOVERY_FORK_ENABLED = process.env.NODE_ENV === "recovery-fork-test"
+// When the fork mode is explicitly requested, refuse to half-honor it: a
+// missing RPC URL would silently boot an unforked local chain and the fork
+// test's first assertion would then blame the wrong variable.
+if (RECOVERY_FORK_ENABLED && MAINNET_RPC_URL.length === 0) {
+  throw new Error(
+    "NODE_ENV=recovery-fork-test requires MAINNET_RPC_URL (an archive RPC); " +
+      "set it in .env before running the recovery fork test",
+  )
+}
+
+// The recovery fork test pins to the reviewed manifest's snapshot block by
+// default so a stale .env cannot silently fork a different block after a
+// re-pin. MAINNET_FORK_BLOCK_NUMBER remains as an explicit override only.
+// The manifest is loaded leniently: a broken pin must not take down every
+// hardhat command (including the generator needed to fix it), so it only
+// fails here when the fork actually needs the block.
+const pinnedManifest = tryLoadRecoveryManifest()
+const forkBlockNumber = process.env.MAINNET_FORK_BLOCK_NUMBER
+  ? Number(process.env.MAINNET_FORK_BLOCK_NUMBER)
+  : pinnedManifest?.snapshotBlock
+if (RECOVERY_FORK_ENABLED && forkBlockNumber === undefined) {
+  throw new Error(
+    "the recovery fork needs a pinned block: fix the manifest pin in " +
+      "helpers/recovery-manifest.ts or set MAINNET_FORK_BLOCK_NUMBER",
+  )
+}
+const MAINNET_FORK_BLOCK_NUMBER = forkBlockNumber ?? 0
 
 const SEPOLIA_RPC_URL = process.env.SEPOLIA_RPC_URL
   ? process.env.SEPOLIA_RPC_URL
@@ -49,6 +88,10 @@ const config: HardhatUserConfig = {
         enabled: true,
         runs: 10000,
       },
+      // The live Portal implementation was compiled for the paris EVM
+      // (see UPSTREAM.md). Without this, solc 0.8.24 defaults to shanghai
+      // and the build can never reproduce the pinned runtime bytecode hash.
+      evmVersion: "paris",
     },
   },
   typechain: {
@@ -80,14 +123,23 @@ const config: HardhatUserConfig = {
       accounts: {
         count: 100,
       },
+      ...(RECOVERY_FORK_ENABLED
+        ? {
+            forking: {
+              url: MAINNET_RPC_URL,
+              blockNumber: MAINNET_FORK_BLOCK_NUMBER,
+            },
+          }
+        : {}),
     },
+    // NOTE: this is an HTTP network entry, so hardhat ignores any `forking`
+    // configuration here (forking is only honored by the in-process
+    // `hardhat` network). Tests on this network query the RPC's live state;
+    // the pinned recovery fork test runs on the `hardhat` network via
+    // `npm run test:recovery:fork` instead.
     mainnet_fork: {
       url: MAINNET_RPC_URL,
       chainId: 1,
-      forking: {
-        url: MAINNET_RPC_URL,
-        blockNumber: 20612408, // solidity/v0.2.0
-      },
     },
   },
   external: {

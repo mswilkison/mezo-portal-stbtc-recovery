@@ -1,0 +1,3 @@
+# Written and rewritten by @openzeppelin/hardhat-upgrades in its own style;
+# style-linting it turns every plugin interaction into a format-gate failure.
+.openzeppelin/

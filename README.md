@@ -1,4 +1,21 @@
-# mezo-portal Contracts
+# Mezo Portal stBTC recovery proposal
+
+This is a public review repository for recovering Threshold Network's
+`1.091038926395006521 stBTC` from the Ethereum mainnet Mezo Portal without an
+OTC sale. It reconstructs the pinned Portal source, adds a temporary
+recovery implementation, pins the proposed settlement manifest, and
+tests an atomic upgrade/recover/restore governance batch.
+
+Start with [RECOVERY.md](./RECOVERY.md). Upstream provenance and the byte-for-
+byte live implementation reconstruction are documented in
+[UPSTREAM.md](./UPSTREAM.md).
+
+> This repository is not Thesis's canonical private repository. Thesis must
+> rebase the complete recovery changes onto its canonical head, review the
+> settlement policy, rerun the current-state preflight and mainnet-fork test,
+> and complete its normal audit/governance process. Nothing here has been deployed.
+
+# Original mezo-portal contracts
 
 Smart contracts powering the bridge to Mezo
 
@@ -74,7 +91,10 @@ previews).
 
 ## Contract Addresses
 
-The official mainnet and testnet contract addresses are listed below.
+These address tables are retained from the upstream snapshot. The recovery
+uses the separately reviewed addresses in
+[`helpers/recovery-anchors.ts`](./helpers/recovery-anchors.ts) and verifies the
+live configuration through the [recovery preflight](./RECOVERY.md).
 
 ### Mainnet
 
@@ -85,8 +105,9 @@ The official mainnet and testnet contract addresses are listed below.
 | TBTCVault (tBTC)                | `0x9C070027cdC9dc8F82416B2e5314E11DFb4FE3CD` |
 | WBTC                            | `0x2260fac5e5542a773aa44fbcfedf7c193bc2c599` |
 | Portal Proxy                    | `0xAB13B8eecf5AA2460841d75da5d5D861fD5B8A39` |
-| Portal Implementation           | `0xD7097AF27b14e204564C057c636022fae346fE60` |
+| Portal Implementation           | `0xb3696cdDDEaa764FEF98Dc109ECe3dEfABaB64d8` |
 | Portal ProxyAdmin               | `0x260cA2abeF5d38181E2562F00FA92AD1DC681734` |
+| Portal ProxyAdmin Timelock      | `0x82f08041f1Bc1aa399320743F33f75CcA482b25a` |
 | BitcoinDepositor Proxy          | `0x1D50D75933b7b7C8AD94dbfb748B5756E3889C24` |
 | BitcoinDepositor Implementation | `0x04B94f55780682478c8D8329368AAAfD320F4D32` |
 | BitcoinDepositor ProxyAdmin     | `0x66cE24B68D9fEb092Bc8E6C47C0FA318e48F1267` |

@@ -8,5 +8,12 @@
     "target": "ES2020",
     "types": ["node", "mocha"]
   },
-  "include": ["deploy", "hardhat.config.ts", "helpers", "test", "types"]
+  "include": [
+    "deploy",
+    "hardhat.config.ts",
+    "helpers",
+    "scripts",
+    "test",
+    "types"
+  ]
 }

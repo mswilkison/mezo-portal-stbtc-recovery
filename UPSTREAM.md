@@ -2,7 +2,7 @@
 
 This repository is a reconstruction for review and cherry-picking. It is not
 the canonical Mezo Portal repository and must not be deployed without rebasing
-the recovery commit onto Thesis's canonical private head.
+the complete recovery changes onto Thesis's canonical private head.
 
 ## Published project snapshot
 
@@ -18,7 +18,8 @@ The initial commit is the unpacked public npm package
 ## Live implementation snapshot
 
 The second commit synchronizes the Portal implementation source with the
-verified contract currently used by the Ethereum mainnet proxy:
+verified implementation used by the Ethereum mainnet proxy at the recorded
+block:
 
 - Portal proxy: `0xAB13B8eecf5AA2460841d75da5d5D861fD5B8A39`
 - EIP-1967 implementation at Ethereum block `25849453`:

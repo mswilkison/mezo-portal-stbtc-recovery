@@ -1,3 +1,7 @@
+> Historical product-design notes retained from the upstream npm snapshot.
+> For the recovery proposal and operator instructions, use
+> [RECOVERY.md](../RECOVERY.md).
+
 stBTC is our prototype of "staked Bitcoin", allowing users to earn points now
 via [Mezo](https://mezo.org), separate points and principal via [Pendle](https://pendle.finance), and earn real yield in the future (via
 [Acre](https://acre.fi)).
