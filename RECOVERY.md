@@ -2,8 +2,8 @@
 
 ## The issue, in simple terms
 
-Threshold's address
-`0xd818B9f7Cb4090047D26C51e63C9CB1b5E12886a` holds exactly
+At the manifest snapshot (Ethereum block `25850299`), Threshold's address
+`0xd818B9f7Cb4090047D26C51e63C9CB1b5E12886a` held exactly
 `1.091038926395006521 stBTC`.
 
 The Bitcoin is not missing, and the wallet is not locked. The problem is that
@@ -65,7 +65,7 @@ back into Portal collateral is repaying the receipt debt of a deposit you
 own. A depositor left holding more stBTC than their remaining receipt debt
 would hold unredeemable stBTC — the exact stranded position this recovery
 exists to cure for Threshold, recreated for a non-consenting third party.
-This is not hypothetical: several Portal depositors currently hold stBTC
+At that snapshot, several Portal depositors held stBTC
 (some bought below par to repay their own debt), including one holding
 `0.3876 stBTC` against `0.3845 stBTC` of debt across four deposits.
 
@@ -96,9 +96,15 @@ enforce. `npm run check:external-stbtc` replays the stBTC transfer history of
 each owner with a positive live settlement upper bound, reports where their
 receipt tokens went, and fails closed on a detected claim. An unreadable
 claim balance remains explicitly UNRESOLVED rather than being reset to zero
-and always blocks, even when the
-manual-review attestation is present. The reviewed Curve Router v1.1 and
-Uniswap V3 tBTC/stBTC destinations are handled by narrow protocol adapters:
+and always blocks, even when the manual-review attestation is present.
+Self-transfers remain in both sides of the wallet's received/sent
+reconciliation but do not make the wallet an external venue to probe.
+Zero-value transfers also create no external destination. These exclusions
+leave independent Uniswap position checks and genuine external claims
+blocking.
+
+The reviewed Curve Router v1.1 and Uniswap V3 tBTC/stBTC destinations are
+handled by narrow protocol adapters:
 the former verifies its exact runtime/version and reconciles each stBTC input
 transaction to a tBTC output returned to the same depositor, while the latter
 verifies the canonical factory, pool, and position-manager identities and
@@ -109,16 +115,16 @@ factory's stBTC `PoolCreated` history, then verifies each pool's identity and
 registration at the pinned block and re-reads every direct core position
 range. Uniswap V3 does not require liquidity to be represented by an NFT and
 a third party can mint a core range directly to a depositor in any stBTC
-pool. Any nonzero position
-liquidity or uncollected amount blocks. Unauthenticated Mint emitters are
-ignored by this adapter; unrelated logs do not establish an stBTC claim.
+pool. Any nonzero position liquidity or uncollected amount blocks.
+Unauthenticated Mint emitters are ignored by this adapter; unrelated logs do
+not establish an stBTC claim.
 Unreadable authenticated pools remain UNRESOLVED. Factory discovery covers
 both token orderings from genesis, including pools created before stBTC
 deployment. NFT transfers in both directions and direct Mint events also
 start at genesis: a one-sided position can predate the token and later hold
-stBTC. All these queries share the incremental history cache. The persistent
-one-wei balances at those two contracts are therefore
-resolved by protocol evidence, never by a generic dust exception; code drift,
+stBTC. All these queries share the incremental history cache. The one-wei
+balances observed at those two contracts at the snapshot are therefore resolved
+by protocol evidence, never by a generic dust exception; code drift,
 receipt mismatch, or an unreadable position remains UNRESOLVED.
 
 That automated list is not exhaustive: an owner can receive LP tokens without
@@ -153,7 +159,7 @@ selection to block `25850299`, hash
 At that snapshot there were 87 active tBTC debt positions totaling
 `1.939721887006317423 tBTC`. The policy reaches Threshold's amount with ten
 settlements across six depositors — nine full and one partial — and excludes
-eight depositors that currently hold stBTC. Thesis/Mezo must explicitly
+eight depositors that held stBTC at that block. Thesis/Mezo must explicitly
 approve this policy before execution.
 
 ## Drift tolerance instead of a third-party veto
@@ -327,10 +333,10 @@ deposits, fees, deployed recovery bytecode, and timelock operation at that
 same block hash. Immediately before serialization it revalidates the manifest
 snapshot and operational hash again and requires the head to be at most three
 blocks (`MAX_EXECUTE_HEAD_LAG_BLOCKS`, about 36 seconds) past the operational
-block. Freshness is therefore bounded staleness, not exact-head equality:
-exact equality certified nothing more (state can change after the last RPC
-read either way) while failing nondeterministically against a 12-second block
-time, and every retry re-scans history from each query's starting block.
+block. This budget permits changes in up to three newer blocks to be absent
+from the evaluated state. The one-block convergence budget leaves time for
+the core checks before final output; a new process starts its history scans
+again from each query's starting block.
 A pass reports
 `verifiedAt.blockHashRevalidated: true`,
 `verifiedAt.latestHeadRevalidated: true`, `verifiedAt.headLagBlocks`, and the
@@ -347,8 +353,8 @@ after any operational delay. Because a numeric range response also cannot
 prove that an RPC never served a transient alternate fork, the
 independent-provider comparison in step 4 remains mandatory.
 
-1. Thesis rebases this feature commit onto the exact canonical commit backing
-   the live implementation. `npm run test:recovery` includes a provenance
+1. Thesis rebases the complete recovery changes onto the exact canonical
+   commit backing the live implementation. `npm run test:recovery` includes a provenance
    test asserting the reconstructed `Portal.sol` compiles byte-for-byte to
    the live runtime hash recorded in [UPSTREAM.md](./UPSTREAM.md) (this
    requires the `evmVersion: "paris"` compiler setting pinned in
@@ -369,8 +375,9 @@ independent-provider comparison in step 4 remains mandatory.
    (`npm run test:recovery` covers the first two — the storage-layout test
    is included there and is deliberately skipped by `npm run test:upgrades`,
    which runs against a remote network that cannot sign local deployments).
-4. Screen the selected depositors for externally held stBTC. First manually
-   verify every other address each depositor controls and every LP, share,
+4. Screen depositors whose selected deposits have a positive live settlement
+   upper bound for externally held stBTC. First manually verify every other
+   address each such depositor controls and every LP, share,
    gauge, vault, or locked position that can return stBTC — including tokens
    received without a direct stBTC transfer. Then run:
 
@@ -383,7 +390,7 @@ independent-provider comparison in step 4 remains mandatory.
 
    This is the review the on-chain guard structurally cannot perform. The
    confirmation is an operator attestation, not an automated proof; do not
-   persist it in `.env`. The scan reconciles each selected wallet's complete
+   persist it in `.env`. The scan reconciles each screened wallet's complete
    stBTC Transfer history against its pinned balance, reads archive logs in
    adaptive chunks, and recognizes the reviewed Portal sink only while its
    proxy points to the pinned implementation. Before reporting PASSED it
@@ -490,7 +497,7 @@ at scheduling to every later run, and if a run ever reports the operation as
 `unset`, take the scheduled id from the timelock's `CallScheduled` event
 rather than trusting a recomputed one.
 
-Example commands, using Node 18:
+Example commands:
 
 ```bash
 npm ci
@@ -524,9 +531,16 @@ MAINNET_RPC_URL=https://your-archive-rpc.example \
 
 ## Status and limitations
 
-- The live Portal source reconstruction (verified by the compiled-hash
-  provenance test), storage layout, local atomic batch, drift handling, and
-  failure rollback are tested.
+- At code commit `a66b2ce67cedfc6290f6dc92dc1e93574561d077`, all 113
+  focused recovery tests passed, covering the compiled Portal runtime hash,
+  storage layout, local atomic batch, drift handling,
+  external screening, and failure rollback. The pinned mainnet-fork test
+  also passed on 2026-09-04: one integration test at block `25850299` verified
+  exact recovery, balance/debt accounting, and atomic Portal restoration.
+  Gas reporting was disabled for both test runs.
+- The fork test validates the recovery transaction against the pinned
+  snapshot. The latest-state external-position scan, independent-provider
+  comparison, and manual ownership review remain required for execution.
 - The mainnet manifest is pinned to block `25850299`, hash
   `0x3ce97866ebf2413f71148da785efa3746e1208623d950e8910afa9e9cfe31ad5`,
   at `2026-08-28T00:57:59Z`; it is not perpetual authorization. Current-state

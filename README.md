@@ -1,9 +1,9 @@
 # Mezo Portal stBTC recovery proposal
 
-This is a private review repository for recovering Threshold Network's
+This is a public review repository for recovering Threshold Network's
 `1.091038926395006521 stBTC` from the Ethereum mainnet Mezo Portal without an
-OTC sale. It reconstructs the current live Portal source, adds a temporary
-one-use recovery implementation, pins the proposed settlement manifest, and
+OTC sale. It reconstructs the pinned Portal source, adds a temporary
+recovery implementation, pins the proposed settlement manifest, and
 tests an atomic upgrade/recover/restore governance batch.
 
 Start with [RECOVERY.md](./RECOVERY.md). Upstream provenance and the byte-for-
@@ -11,9 +11,9 @@ byte live implementation reconstruction are documented in
 [UPSTREAM.md](./UPSTREAM.md).
 
 > This repository is not Thesis's canonical private repository. Thesis must
-> rebase the recovery commit onto its canonical head, review the settlement
-> policy, rerun the current-state preflight and mainnet-fork test, and complete
-> its normal audit/governance process. Nothing here has been deployed.
+> rebase the complete recovery changes onto its canonical head, review the
+> settlement policy, rerun the current-state preflight and mainnet-fork test,
+> and complete its normal audit/governance process. Nothing here has been deployed.
 
 # Original mezo-portal contracts
 
@@ -91,7 +91,10 @@ previews).
 
 ## Contract Addresses
 
-The official mainnet and testnet contract addresses are listed below.
+These address tables are retained from the upstream snapshot. The recovery
+uses the separately reviewed addresses in
+[`helpers/recovery-anchors.ts`](./helpers/recovery-anchors.ts) and verifies the
+live configuration through the [recovery preflight](./RECOVERY.md).
 
 ### Mainnet
 
