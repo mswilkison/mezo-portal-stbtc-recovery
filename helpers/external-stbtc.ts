@@ -373,6 +373,11 @@ export async function screenExternalStbtcHoldings(
     const amountsByDestination = new Map<string, bigint>()
     nonzeroSentTransfers.forEach(({ destination, amountWei }) => {
       const normalized = getAddress(destination)
+      // Self-transfers count on both sides of reconciliation but create no
+      // claim outside the wallet. Do not probe the wallet as an LP/share venue.
+      if (normalized === depositor) {
+        return
+      }
       amountsByDestination.set(
         normalized,
         (amountsByDestination.get(normalized) ?? 0n) + amountWei,

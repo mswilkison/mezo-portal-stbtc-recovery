@@ -624,6 +624,143 @@ describe("recovery preflight helpers", () => {
       ).to.equal(true)
     })
 
+    describe("wallet self-transfers", () => {
+      const wallet = getAddress("0x00000000000000000000000000000000000000aa")
+      const selfTransfers = [
+        { destination: wallet.toLowerCase(), amountWei: 4n },
+        { destination: wallet, amountWei: 6n },
+      ]
+      const walletReader = (overrides: Partial<ExternalStbtcReader> = {}) =>
+        reader({
+          getSentTransfers: async () => selfTransfers,
+          getTotalReceivedWei: async () => 13n,
+          getStbtcBalance: async (address) =>
+            getAddress(address) === wallet ? 3n : 0n,
+          getCode: async () => "0x01",
+          getTokenBalance: async () => {
+            throw new Error("wallet does not implement balanceOf")
+          },
+          ...overrides,
+        })
+
+      it("reconciles self-transfers without probing the contract wallet as a venue", async () => {
+        const probedAddresses: string[] = []
+        let positionReads = 0
+        const report = await screenExternalStbtcHoldings(
+          [wallet.toLowerCase()],
+          walletReader({
+            getCode: async (address) => {
+              probedAddresses.push(address)
+              return "0x01"
+            },
+            getUniswapV3Positions: async () => {
+              positionReads += 1
+              return []
+            },
+          }),
+        )
+        expect(report.depositors[0]).to.include({
+          depositor: wallet,
+          totalReceivedWei: 13n,
+          totalSentWei: 10n,
+          walletBalanceWei: 3n,
+        })
+        expect(report.depositors[0].destinations).to.deep.equal([])
+        expect(probedAddresses).to.deep.equal([])
+        expect(positionReads).to.equal(1)
+        expect(report.unverifiableReasons).to.deep.equal([])
+        expect(
+          evaluateExternalStbtcGate(report, EXTERNAL_STBTC_REVIEW_CONFIRMATION)
+            .passed,
+        ).to.equal(true)
+        expect(evaluateExternalStbtcGate(report, undefined).passed).to.equal(
+          false,
+        )
+      })
+
+      ;["claim", "unreadable"].forEach((state) => {
+        it(`keeps a genuine external venue ${state} blocking alongside self-transfers`, async () => {
+          const probedTokens: string[] = []
+          const report = await screenExternalStbtcHoldings(
+            [wallet],
+            walletReader({
+              getSentTransfers: async () => [
+                ...selfTransfers,
+                { destination: venue, amountWei: 1n },
+                { destination: venue, amountWei: 3n },
+              ],
+              getTotalReceivedWei: async () => 17n,
+              getTokenBalance: async (token, holder) => {
+                probedTokens.push(token)
+                expect(holder).to.equal(wallet)
+                if (state === "unreadable") {
+                  throw new Error("external balance unavailable")
+                }
+                return 7n
+              },
+            }),
+          )
+          expect(report.depositors[0].totalSentWei).to.equal(14n)
+          expect(report.depositors[0].destinations).to.have.length(1)
+          expect(report.depositors[0].destinations[0]).to.include({
+            destination: venue,
+            amountSentWei: 4n,
+          })
+          expect(probedTokens).to.deep.equal([venue])
+          expect(report.detectedClaimReasons).to.have.length(
+            state === "claim" ? 1 : 0,
+          )
+          expect(report.unverifiableReasons).to.have.length(
+            state === "unreadable" ? 1 : 0,
+          )
+          expect(
+            evaluateExternalStbtcGate(
+              report,
+              EXTERNAL_STBTC_REVIEW_CONFIRMATION,
+            ).passed,
+          ).to.equal(false)
+        })
+      })
+
+      it("keeps self-transfer reconciliation failures blocking", async () => {
+        const report = await screenExternalStbtcHoldings(
+          [wallet],
+          walletReader({
+            getTotalReceivedWei: async () => 12n,
+          }),
+        )
+        expect(report.depositors[0].destinations).to.deep.equal([])
+        expect(report.unverifiableReasons).to.have.length(1)
+        expect(report.unverifiableReasons[0]).to.include(
+          "Transfer history does not reconcile",
+        )
+        expect(
+          evaluateExternalStbtcGate(report, EXTERNAL_STBTC_REVIEW_CONFIRMATION)
+            .passed,
+        ).to.equal(false)
+      })
+
+      it("keeps independent position checks blocking with only self-transfers", async () => {
+        const report = await screenExternalStbtcHoldings(
+          [wallet],
+          walletReader({
+            getUniswapV3Positions: async () => {
+              throw new Error("position state unavailable")
+            },
+          }),
+        )
+        expect(report.depositors[0].destinations).to.deep.equal([])
+        expect(report.unverifiableReasons).to.have.length(1)
+        expect(report.unverifiableReasons[0]).to.include(
+          "position state unavailable",
+        )
+        expect(
+          evaluateExternalStbtcGate(report, EXTERNAL_STBTC_REVIEW_CONFIRMATION)
+            .passed,
+        ).to.equal(false)
+      })
+    })
+
     it("accepts the reviewed Portal as a non-claim sink", async () => {
       const report = await screenExternalStbtcHoldings(
         [depositor],
