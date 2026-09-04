@@ -49,6 +49,7 @@ import {
   readLiveSettlementOwners,
   recomputeActiveReceiptDebt,
 } from "../helpers/recovery-preflight"
+import withExternalStbtcHistory from "./fixtures/externalStbtcHistory"
 
 describe("recovery preflight helpers", () => {
   it("rejects a malformed manifest before it can be shared", () => {
@@ -1340,6 +1341,155 @@ describe("recovery preflight helpers", () => {
       await expect(
         extendExternalStbtcLogHistory(provider, history, "factory", filter, 15),
       ).to.be.rejectedWith("changed start block")
+    })
+
+    describe("complete Uniswap position history", () => {
+      ;[false, true].forEach((cached) => {
+        it(`detects retained pre-deployment NFT and core claims with ${cached ? "cached" : "uncached"} reads`, async () => {
+          await withExternalStbtcHistory(async (fixture) => {
+            const report = await screenExternalStbtcHoldings(
+              [fixture.owner],
+              fixture.readAt(fixture.firstBlock, cached),
+            )
+            expect(report.unverifiableReasons).to.deep.equal([])
+            expect(
+              report.depositors[0].positions.map(
+                (position) => position.adapter,
+              ),
+            ).to.deep.equal(["uniswap-v3-nft", "uniswap-v3-core"])
+            expect(report.detectedClaimReasons).to.have.length(2)
+            expect(
+              evaluateExternalStbtcGate(
+                report,
+                EXTERNAL_STBTC_REVIEW_CONFIRMATION,
+              ).passed,
+            ).to.equal(false)
+            // Earlier transfers, burns, and a self-transfer must reconstruct
+            // current ownership correctly, not revive departed NFTs.
+            expect(fixture.ownerReads).to.deep.equal([11n])
+            expect(
+              fixture.callBlocks.every(
+                (tag) => tag === fixture.blockHash(fixture.firstBlock),
+              ),
+            ).to.equal(true)
+            const tokenQueries = fixture.queries.filter(
+              (query) => query.address === fixture.stbtc,
+            )
+            expect(tokenQueries.length).to.be.greaterThan(0)
+            expect(
+              Math.min(...tokenQueries.map((query) => Number(query.fromBlock))),
+            ).to.equal(anchors.STBTC_DEPLOYMENT_BLOCK)
+          })
+        })
+      })
+
+      it("retains old Mint evidence while applying new NFT ownership and pinned position state", async () => {
+        await withExternalStbtcHistory(async (fixture) => {
+          await screenExternalStbtcHoldings(
+            [fixture.owner],
+            fixture.readAt(fixture.firstBlock, true),
+          )
+          const queryCount = fixture.queries.length
+          const callCount = fixture.callBlocks.length
+          const report = await screenExternalStbtcHoldings(
+            [fixture.owner],
+            fixture.readAt(fixture.nextBlock, true),
+          )
+          expect(report.unverifiableReasons).to.deep.equal([])
+          expect(report.depositors[0].positions).to.have.length(1)
+          expect(report.depositors[0].positions[0]).to.include({
+            adapter: "uniswap-v3-core",
+            liquidity: 0n,
+            tokensOwed0: 2n,
+          })
+          expect(
+            evaluateExternalStbtcGate(
+              report,
+              EXTERNAL_STBTC_REVIEW_CONFIRMATION,
+            ).passed,
+          ).to.equal(false)
+          expect(fixture.ownerReads).to.deep.equal([11n])
+          const tailQueries = fixture.queries.slice(queryCount)
+          expect(tailQueries.length).to.be.greaterThan(0)
+          expect(
+            tailQueries.every(
+              (query) =>
+                Number(query.fromBlock) === fixture.firstBlock + 1 &&
+                Number(query.toBlock) === fixture.nextBlock,
+            ),
+          ).to.equal(true)
+          expect(
+            fixture.callBlocks
+              .slice(callCount)
+              .every((tag) => tag === fixture.blockHash(fixture.nextBlock)),
+          ).to.equal(true)
+        })
+      })
+
+      it("does not block fully collected pre-deployment positions", async () => {
+        await withExternalStbtcHistory(
+          async (fixture) => {
+            const report = await screenExternalStbtcHoldings(
+              [fixture.owner],
+              fixture.readAt(fixture.firstBlock, false),
+            )
+            expect(report.depositors[0].positions).to.have.length(2)
+            expect(
+              evaluateExternalStbtcGate(
+                report,
+                EXTERNAL_STBTC_REVIEW_CONFIRMATION,
+              ).passed,
+            ).to.equal(true)
+          },
+          { closedPositions: true },
+        )
+      })
+
+      ;(["nft", "core"] as const).forEach((unreadableHistory) => {
+        it(`blocks when pre-deployment ${unreadableHistory} history cannot be read`, async () => {
+          await withExternalStbtcHistory(
+            async (fixture) => {
+              const report = await screenExternalStbtcHoldings(
+                [fixture.owner],
+                fixture.readAt(fixture.firstBlock, true),
+              )
+              expect(report.unverifiableReasons[0]).to.include(
+                "pre-deployment position history unavailable",
+              )
+              expect(
+                evaluateExternalStbtcGate(
+                  report,
+                  EXTERNAL_STBTC_REVIEW_CONFIRMATION,
+                ).passed,
+              ).to.equal(false)
+            },
+            { unreadableHistory },
+          )
+        })
+      })
+
+      it("retains protocol code authentication with fixture trust roots", async () => {
+        const originalHash = anchors.UNISWAP_V3_FACTORY_RUNTIME_HASH
+        await withExternalStbtcHistory(
+          async (fixture) => {
+            const report = await screenExternalStbtcHoldings(
+              [fixture.owner],
+              fixture.readAt(fixture.firstBlock, false),
+            )
+            expect(report.unverifiableReasons[0]).to.include(
+              "Uniswap V3 factory runtime hash",
+            )
+            expect(
+              evaluateExternalStbtcGate(
+                report,
+                EXTERNAL_STBTC_REVIEW_CONFIRMATION,
+              ).passed,
+            ).to.equal(false)
+          },
+          { codeDrift: true },
+        )
+        expect(anchors.UNISWAP_V3_FACTORY_RUNTIME_HASH).to.equal(originalHash)
+      })
     })
 
     it("pins the Portal sink to the reviewed implementation", async () => {

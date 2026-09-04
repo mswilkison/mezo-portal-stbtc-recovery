@@ -27,10 +27,10 @@ export const RECEIPT_PAYER = "0xd818B9f7Cb4090047D26C51e63C9CB1b5E12886a"
 // The live Mezo Portal proxy.
 export const PORTAL = "0xAB13B8eecf5AA2460841d75da5d5D861fD5B8A39"
 
-// First block at which the stBTC contract has code. External-position scans
-// verify both sides of this boundary before using it, then query every log
-// range from here through their pinned block. This keeps the history complete
-// without asking capped archive providers to scan pre-deployment blocks.
+// First block at which the stBTC contract has code. Verify both sides of this
+// boundary before using it for the token's own Transfer history. Uniswap
+// pool creation, NFT ownership, and direct Mint history must start earlier:
+// positions can exist before stBTC is deployed and subsequently hold stBTC.
 export const STBTC_DEPLOYMENT_BLOCK = 20_235_467
 
 // The governance account whose Timelock roles the generated manifest and

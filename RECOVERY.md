@@ -114,8 +114,10 @@ liquidity or uncollected amount blocks. Unauthenticated Mint emitters are
 ignored by this adapter; unrelated logs do not establish an stBTC claim.
 Unreadable authenticated pools remain UNRESOLVED. Factory discovery covers
 both token orderings from genesis, including pools created before stBTC
-deployment, and shares the incremental history cache. The persistent one-wei
-balances at those two contracts are therefore
+deployment. NFT transfers in both directions and direct Mint events also
+start at genesis: a one-sided position can predate the token and later hold
+stBTC. All these queries share the incremental history cache. The persistent
+one-wei balances at those two contracts are therefore
 resolved by protocol evidence, never by a generic dust exception; code drift,
 receipt mismatch, or an unreadable position remains UNRESOLVED.
 
@@ -310,9 +312,9 @@ candidate hash. Only owners with a positive live settlement upper bound enter
 the external gate: fully repaid, withdrawn, or migrating selected deposits
 cannot settle, while temporary fee or wallet-capacity skips do not remove an
 owner. The standalone check applies the same scope at its evaluated block.
-It scans complete raw Transfer, NFT ownership, and direct Uniswap Mint
-history from stBTC deployment, plus canonical pool creation history from
-genesis, through an initial head. If that scan outlives
+It scans the token's raw Transfer history from stBTC deployment, and Uniswap
+NFT ownership, direct Mint, and canonical pool creation histories from
+genesis through an initial head. If that scan outlives
 the head, the preflight keeps the raw history and reruns the complete external
 evaluation, including the live owner scope, at the newer hash while querying
 only each missing numeric tail.
@@ -328,7 +330,8 @@ blocks (`MAX_EXECUTE_HEAD_LAG_BLOCKS`, about 36 seconds) past the operational
 block. Freshness is therefore bounded staleness, not exact-head equality:
 exact equality certified nothing more (state can change after the last RPC
 read either way) while failing nondeterministically against a 12-second block
-time, and every retry re-scans history from stBTC deployment. A pass reports
+time, and every retry re-scans history from each query's starting block.
+A pass reports
 `verifiedAt.blockHashRevalidated: true`,
 `verifiedAt.latestHeadRevalidated: true`, `verifiedAt.headLagBlocks`, and the
 external review's `historyScan` boundaries/pass count. A head that advances

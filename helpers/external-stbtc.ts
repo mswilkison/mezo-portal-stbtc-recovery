@@ -607,7 +607,7 @@ export type UniswapV3CorePositionState = {
 // an archive RPC.
 export type UniswapV3CoreReader = {
   // Every `Mint` log whose indexed owner is the depositor, from ANY emitting
-  // contract, over the complete stBTC history range.
+  // contract, including positions created before stBTC was deployed.
   getDirectMintLogs(owner: string): Promise<Log[]>
   // Complete canonical-factory PoolCreated history for stBTC in either
   // token slot, including pools created before the token was deployed.
@@ -900,7 +900,7 @@ export function createEthersExternalStbtcReader(
   const getHistoricalLogs = async (
     cacheKey: string,
     filter: Filter,
-    fromBlock = anchors.STBTC_DEPLOYMENT_BLOCK,
+    fromBlock: number,
   ): Promise<Log[]> => {
     await verifyHistoryBoundary()
     if (history) {
@@ -1154,6 +1154,7 @@ export function createEthersExternalStbtcReader(
           address: stbtcAddress,
           topics: [TRANSFER_TOPIC, paddedAddress(depositor)],
         },
+        anchors.STBTC_DEPLOYMENT_BLOCK,
       )
       return logs.map((log) => ({
         destination: addressFromTopic(log.topics[2]),
@@ -1171,6 +1172,7 @@ export function createEthersExternalStbtcReader(
           address: stbtcAddress,
           topics: [TRANSFER_TOPIC, null, paddedAddress(depositor)],
         },
+        anchors.STBTC_DEPLOYMENT_BLOCK,
       )
       return logs.reduce((total, log) => total + BigInt(log.data), 0n)
     },
@@ -1261,6 +1263,9 @@ export function createEthersExternalStbtcReader(
     },
     async getUniswapV3Positions(depositor) {
       await verifyProtocolIdentities()
+      // A one-sided position may precede stBTC deployment and later hold
+      // stBTC. Replay both NFT directions and direct Mints from genesis;
+      // only the token's own Transfer history starts at its deployment.
       const [incoming, outgoing] = await Promise.all([
         getHistoricalLogs(
           `uniswap-nft-received:${canonicalAddress(depositor)}`,
@@ -1268,11 +1273,16 @@ export function createEthersExternalStbtcReader(
             address: anchors.UNISWAP_V3_POSITION_MANAGER,
             topics: [TRANSFER_TOPIC, null, paddedAddress(depositor)],
           },
+          0,
         ),
-        getHistoricalLogs(`uniswap-nft-sent:${canonicalAddress(depositor)}`, {
-          address: anchors.UNISWAP_V3_POSITION_MANAGER,
-          topics: [TRANSFER_TOPIC, paddedAddress(depositor)],
-        }),
+        getHistoricalLogs(
+          `uniswap-nft-sent:${canonicalAddress(depositor)}`,
+          {
+            address: anchors.UNISWAP_V3_POSITION_MANAGER,
+            topics: [TRANSFER_TOPIC, paddedAddress(depositor)],
+          },
+          0,
+        ),
       ])
       // A self-transfer matches both queries. Deduplicate by log identity and
       // derive direction from the actual `to` topic so it cannot hide a live
@@ -1368,9 +1378,11 @@ export function createEthersExternalStbtcReader(
         stbtcAddress,
         {
           getDirectMintLogs: (owner) =>
-            getHistoricalLogs(`uniswap-core-mint:${canonicalAddress(owner)}`, {
-              topics: [UNISWAP_V3_MINT_TOPIC, paddedAddress(owner)],
-            }),
+            getHistoricalLogs(
+              `uniswap-core-mint:${canonicalAddress(owner)}`,
+              { topics: [UNISWAP_V3_MINT_TOPIC, paddedAddress(owner)] },
+              0,
+            ),
           getStbtcPoolCreationLogs,
           getPoolIdentity: readPoolIdentity,
           getRegisteredPool: async (token0, token1, fee) =>
